@@ -1,0 +1,4 @@
+include README.md AGENTS.md ARCHITECTURE.md VERIFICATION.md MCP_COVERAGE.md DEVELOPMENT_PLAN.md DEPLOYMENT.md CHANGELOG.md
+include bridge_runtime.py bridge_publisher.py fixture_mcp.py shared_fixture_mcp.py test_bridge.py field_test.py
+recursive-include win-bridge-mcp *.py *.json *.md
+recursive-include wsl-bridge-mcp *.py *.json *.md

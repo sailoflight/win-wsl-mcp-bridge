@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.log
+registry.json
+*.local.json
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+build/
+dist/
+*.egg-info/
+
+# --- local hygiene (sailoflight migration) ---
+.venv/
+__pycache__/
+*.pyc
+.cache/
+.claude/
+TESTWORKTREE/
+

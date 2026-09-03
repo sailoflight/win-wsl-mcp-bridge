@@ -1,0 +1,21 @@
+{
+  "servers": [
+    {
+      "id": "example-win-mcp",
+      "name": "Example Windows MCP",
+      "summary": "Replace this entry with a standard Windows stdio MCP command.",
+      "command": "python",
+      "args": ["-m", "your_mcp"],
+      "process": {
+        "multiProcessAllowed": null,
+        "enforcement": "unverified",
+        "note": "Set false for bridge-enforced shared JSON-RPC mode; true keeps dedicated byte-transparent processes."
+      },
+      "capabilityGroups": ["example"],
+      "artifactDelivery": {
+        "enabled": false,
+        "maxBytes": 536870912
+      }
+    }
+  ]
+}
