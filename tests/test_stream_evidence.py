@@ -76,7 +76,11 @@ def write_registry(
                         "cwd": str(ROOT),
                         "env": {
                             "FIXTURE_MCP_NAME": fixture_name,
-                            "FIXTURE_EXIT_AFTER_CALL": "1",
+                            # A successful call must not end the fixture before
+                            # the persistent connector observes stdin EOF: that
+                            # race legitimately replays initialize on a new stream
+                            # and adds two rows to the single-stream assertions.
+                            "FIXTURE_EXIT_AFTER_CALL": "0",
                         },
                         "token": "must-not-leak",
                         "process": {
@@ -688,6 +692,33 @@ def _latest_correlation_seq(journal_path: Path) -> int:
     """
     rows = _recent_correlation_rows(journal_path, limit=1)
     return rows[0]["seq"] if rows else 0
+
+
+class EvidenceFixtureLifetimeTest(unittest.TestCase):
+    def test_registered_fixture_stays_alive_after_a_successful_call(self) -> None:
+        # Exercise the registered fixture policy directly. An exit-after-call
+        # fixture deterministically loses the second response, independently
+        # of how quickly the persistent connector might otherwise reconnect.
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = Path(temporary) / "registry.sqlite3"
+            write_registry(registry, "win-echo", "windows-fixture-mcp",
+                           multi_process_allowed=True)
+            entry = json.loads(registry.with_name(registry.name + ".manifest.json")
+                               .read_text(encoding="utf-8"))["servers"][0]
+            messages = correlation_rpc_messages("first") + json.dumps({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": {"name": "echo", "arguments": {"value": "second"}},
+            }) + "\n"
+            result = subprocess.run(
+                [entry["command"], *entry["args"]], input=messages, text=True,
+                capture_output=True, timeout=10, cwd=ROOT,
+                env={**os.environ, **entry["env"], "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            responses = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual([response["id"] for response in responses], [1, 2, 3, 4])
+            self.assertEqual([response["result"]["structuredContent"]["value"]
+                              for response in responses[2:]], ["first", "second"])
 
 
 class EvidencePairCorrelationTest(unittest.TestCase):

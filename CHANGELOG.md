@@ -55,8 +55,8 @@ All notable changes to this project are recorded here.
   journal as accepted and a task-only client advertisement cannot falsely
   enable sampling/elicitation/roots flows). Each accepted/downgraded/rejected
   outcome records one metadata-only EventJournal row (target plus requested,
-  negotiated, and normalized backend versions; no payload), and the physical
-  backend initialize stays normalized at `2025-06-18` in every case. A
+  negotiated, and normalized backend versions; no payload). The physical backend
+  requests `2025-11-25` and records its actual verified legacy choice. A
   downgraded client's session continues safely (initialized notification,
   catalog, and calls).
 - Registration-driven exclusive client leases and fixed shared tool-view policy.

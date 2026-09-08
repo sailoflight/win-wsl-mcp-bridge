@@ -186,14 +186,20 @@ def _require_loopback(host: str, what: str) -> None:
             raise FacadeError(f"{what} host {host!r} is not an IP address")
 
 
-def _launcher_for_side(side: str) -> Path:
+def _launcher_command_for_side(side: str) -> list[str]:
     if side not in ("win", "wsl"):
         raise FacadeError(f"side must be 'win' or 'wsl', got {side!r}")
     root = Path(__file__).resolve().parent
     launcher = root / f"{side}-bridge-mcp" / "bridge.py"
-    if not launcher.is_file():
-        raise FacadeError(f"component launcher not found: {launcher}")
-    return launcher
+    if launcher.is_file():
+        return [sys.executable, str(launcher)]
+    # Wheels ship root modules, not the source component launcher directories.
+    # Use the same fixed callable as the installed console entry point under
+    # this interpreter; neither PATH nor a caller-supplied command selects it.
+    # Isolated mode keeps cwd/PYTHONPATH from shadowing the installed runtime.
+    entrypoint = {"win": "win_main", "wsl": "wsl_main"}[side]
+    return [sys.executable, "-I", "-c",
+            f"from bridge_runtime import {entrypoint}; raise SystemExit({entrypoint}())"]
 
 
 def default_backend_command(
@@ -201,14 +207,12 @@ def default_backend_command(
 ) -> list[str]:
     """The only backend the facade is allowed to launch by default.
 
-    ``bridge.py connect <target>`` against the *local* Bridge control socket:
+    ``connect <target>`` against the *local* Bridge control socket, through
+    either the source launcher or the installed runtime's fixed entry point:
     the peer never contributes argv, command, environment, or credentials.
     """
     _require_loopback(node_host, "bridge node")
-    launcher = _launcher_for_side(side)
-    return [
-        sys.executable,
-        str(launcher),
+    return _launcher_command_for_side(side) + [
         "connect",
         "--local-host",
         node_host,

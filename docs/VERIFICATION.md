@@ -54,10 +54,11 @@ The `test_bridge.py` suite verifies:
   accepted, a `2025-11-25` initialize is accepted at `2025-11-25` with its
   session continuing and without inventing the optional task surface
   (no `tasks` capability, no tool `execution.taskSupport`, physical profile
-  still empty `2025-06-18`), a future-shaped revision is negotiated down to
+  still empty), a future-shaped revision is negotiated down to
   `2025-11-25`, an unusable revision yields the structured diagnostic without
-  poisoning the backend, the physical backend initialize stays normalized at
-  `2025-06-18`, and each accepted/downgraded/rejected outcome is journaled
+  poisoning the backend, the physical backend requests `2025-11-25` and
+  records the verified legacy revision actually selected by the backend,
+  and each accepted/downgraded/rejected outcome is journaled
   metadata-only with requested/negotiated/backend versions and no payload;
 - lease transfer after explicit release and abnormal client disconnect;
 - backend crash and bridge restart cleanup of the fixture's owned child process,

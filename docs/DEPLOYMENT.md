@@ -19,8 +19,9 @@ python -m pip install build
 python -m build
 ```
 
-The wheel contains only `bridge_runtime.py`, `bridge_publisher.py`, and package
-metadata. Keep released wheels in an Operator-owned versions directory for
+The wheel contains the root runtime modules declared by `pyproject.toml` and
+package metadata; source-only component launchers and development tests are not
+installed. Keep released wheels in an Operator-owned versions directory for
 rollback. Do not build directly in the production checkout. The repository does
 not grant an external redistribution license; choose and record one before
 publishing artifacts outside the owner-controlled deployment.

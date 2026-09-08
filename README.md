@@ -212,9 +212,10 @@ looks like a path, an undeclared `file://` link, and arbitrary remote paths neve
 trigger transfer.
 
 See `docs/MCP_COVERAGE.md` for the capability/result coverage matrix and
-`docs/ARCHITECTURE.md` for the publisher and security contract. Unimplemented Bridge
-work, including the planned `2025-11-25` Legacy / `2026-07-28` Modern dual-era
-boundary, is tracked in `docs/DEVELOPMENT_PLAN.md`. General SDK-first advice for MCP
+`docs/ARCHITECTURE.md` for the publisher and security contract. Implemented dual-era
+protocol boundaries and their verification limits are recorded in
+`docs/IMPLEMENTATION_STATUS.md`; remaining work is tracked in
+`docs/DEVELOPMENT_PLAN.md`. General SDK-first advice for MCP
 server authors is kept separately at `../MCP_DEVELOPMENT_RECOMMENDATIONS.md` and
 is not a statement of current Bridge capability.
 

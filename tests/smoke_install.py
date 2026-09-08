@@ -52,8 +52,18 @@ def smoke_install(wheel: Path) -> dict[str, object]:
         runtime = json.loads(result.stdout)
         if not runtime["installed"] or not all(runtime["version"] in value for value in versions.values()):
             raise RuntimeError("installed runtime identity/version mismatch")
+        probe_environment = {key: value for key, value in environment.items()
+                             if not key.startswith("WIN_WSL_MCP_BRIDGE_")}
+        facade = subprocess.run(
+            [str(python), "-I", str(Path(__file__).with_name("facade_install_probe.py").resolve())],
+            cwd=root, env=probe_environment, capture_output=True, text=True, timeout=60,
+        )
+        if facade.returncode:
+            raise RuntimeError("installed facade proxy smoke failed: " + facade.stderr[-2000:])
+        facade_proxies = json.loads(facade.stdout)
         return {"ok": True, "isolatedInstall": True, "runtimeVersion": runtime["version"],
-                "entrypoints": versions, "temporaryEnvironmentRemovedOnReturn": True}
+                "entrypoints": versions, "facadeProxies": facade_proxies,
+                "temporaryEnvironmentRemovedOnReturn": True}
 
 
 def main() -> int:

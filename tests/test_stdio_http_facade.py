@@ -35,6 +35,7 @@ import ipaddress
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -43,6 +44,8 @@ import threading
 import time
 import types
 import unittest
+import venv
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -448,15 +451,56 @@ class _FacadeTestCase(unittest.TestCase):
 # Pure unit tests
 # --------------------------------------------------------------------------
 
+class InstalledFacadeTest(unittest.TestCase):
+    def test_default_proxies_work_without_source_launchers(self) -> None:
+        # Simulate the wheel's declared module inventory without installing a
+        # package: a disposable stdlib venv, no pip, source launchers or tests.
+        with tempfile.TemporaryDirectory(prefix="facade-installed-fixture-") as temporary:
+            root = Path(temporary)
+            environment = root / "venv"
+            venv.EnvBuilder(with_pip=False).create(environment)
+            scripts = environment / ("Scripts" if os.name == "nt" else "bin")
+            python = scripts / ("python.exe" if os.name == "nt" else "python")
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("WIN_WSL_MCP_BRIDGE_")}
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            purelib = subprocess.run(
+                [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                cwd=root, env=env, capture_output=True, text=True, timeout=15, check=True,
+            )
+            installed = Path(purelib.stdout.strip())
+            project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+            for module in project["tool"]["setuptools"]["py-modules"]:
+                shutil.copyfile(ROOT / (module + ".py"), installed / (module + ".py"))
+            self.assertFalse((installed / "win-bridge-mcp").exists())
+            self.assertFalse((installed / "wsl-bridge-mcp").exists())
+            # Ambient cwd/PYTHONPATH must not provide a different runtime to
+            # either the probe or the facade's child connector.
+            poison = "raise RuntimeError('ambient runtime imported')\n"
+            (root / "bridge_runtime.py").write_text(poison, encoding="utf-8")
+            env["PYTHONPATH"] = str(root)
+            result = subprocess.run(
+                [str(python), "-I", str(ROOT / "tests" / "facade_install_probe.py")],
+                cwd=root, env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [
+                {"side": side, "era": era, "proxyRoundTrip": True}
+                for side in ("win", "wsl") for era in ("legacy", "modern")
+            ])
+
+
 class PureFacadeTest(unittest.TestCase):
     def test_default_backend_command_is_local_connect_only(self) -> None:
-        argv = shf.default_backend_command("wsl", "127.0.0.1", 8769, "my-server")
-        self.assertEqual(argv[0], sys.executable)
-        self.assertTrue(argv[1].endswith(os.path.join("wsl-bridge-mcp", "bridge.py")))
-        self.assertEqual(argv[2:], ["connect", "--local-host", "127.0.0.1",
-                                    "--local-port", "8769", "my-server"])
-        self.assertNotIn("peer", argv)
-        self.assertTrue(all(isinstance(item, str) for item in argv))
+        for side in ("win", "wsl"):
+            with self.subTest(side=side):
+                argv = shf.default_backend_command(side, "127.0.0.1", 8769, "my-server")
+                self.assertEqual(argv[0], sys.executable)
+                self.assertTrue(argv[1].endswith(os.path.join(side + "-bridge-mcp", "bridge.py")))
+                self.assertEqual(argv[2:], ["connect", "--local-host", "127.0.0.1",
+                                            "--local-port", "8769", "my-server"])
+                self.assertNotIn("peer", argv)
+                self.assertTrue(all(isinstance(item, str) for item in argv))
 
     def test_loopback_refusals(self) -> None:
         for bad in ("0.0.0.0", "192.168.1.10", "example.com"):
