@@ -4,6 +4,11 @@
       "id": "example-win-mcp",
       "name": "Example Windows MCP",
       "summary": "Replace this entry with a standard Windows stdio MCP command.",
+      "transport": {"type": "stdio"},
+      "management": {
+        "ownership": "bridge-managed",
+        "agentControl": {"enabled": false, "allowedActions": []}
+      },
       "command": "python",
       "args": ["-m", "your_mcp"],
       "process": {
@@ -15,7 +20,49 @@
       "artifactDelivery": {
         "enabled": false,
         "maxBytes": 536870912
+      },
+      "inputDelivery": {
+        "enabled": false,
+        "maxBytes": 268435456
       }
+    },
+    {
+      "id": "example-http-win",
+      "name": "Example Windows Streamable HTTP MCP",
+      "summary": "Replace this entry with an owner-host loopback Streamable HTTP MCP. The endpoint and controlContract paths must point at the real service; the contract never names a command, service, container, or pid.",
+      "transport": {
+        "type": "streamable-http",
+        "endpoint": "http://127.0.0.1:9443/mcp",
+        "headers": {"Authorization": "Bearer replace-me"}
+      },
+      "management": {
+        "ownership": "external-controlled",
+        "agentControl": {"enabled": false, "allowedActions": []},
+        "controlContract": {
+          "restart": {
+            "method": "POST",
+            "path": "/control/restart",
+            "timeoutSeconds": 10,
+            "successStatuses": [200, 202],
+            "readiness": {
+              "method": "GET",
+              "path": "/ready",
+              "timeoutSeconds": 5,
+              "successStatuses": [200]
+            }
+          },
+          "stop": {
+            "method": "POST",
+            "path": "/control/stop",
+            "timeoutSeconds": 10,
+            "successStatuses": [200, 202]
+          }
+        }
+      },
+      "process": {"multiProcessAllowed": null, "enforcement": "unverified"},
+      "capabilityGroups": ["example", "http"],
+      "artifactDelivery": {"enabled": false},
+      "inputDelivery": {"enabled": false}
     }
   ]
 }

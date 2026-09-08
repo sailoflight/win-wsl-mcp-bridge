@@ -12,6 +12,8 @@ dist/
 
 # --- local hygiene (sailoflight migration) ---
 .venv/
+.venv-build/
+release-artifacts/
 __pycache__/
 *.pyc
 .cache/

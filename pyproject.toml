@@ -15,7 +15,20 @@ win-wsl-mcp-win = "bridge_runtime:win_main"
 win-wsl-mcp-wsl = "bridge_runtime:wsl_main"
 
 [tool.setuptools]
-py-modules = ["bridge_runtime", "bridge_publisher"]
+py-modules = [
+    "bridge_runtime",
+    "bridge_publisher",
+    "archive_profile",
+    "streamable_http_stdio",
+    "stdio_http_facade",
+    "connector_core",
+    "connector_engine",
+    "bridge_protocol",
+    "journal_maintenance",
+    "journal_evidence",
+    "legacy_modern_stdio",
+    "stream_evidence",
+]
 include-package-data = false
 
 [tool.setuptools.dynamic]

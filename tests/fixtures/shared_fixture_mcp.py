@@ -72,29 +72,39 @@ try:
             append(EVENT_LOG, f"cancel:{params.get('requestId')}")
             continue
         if method == "initialize":
-            append(EVENT_LOG, "initialize")
+            params = message.get("params") or {}
+            append(
+                EVENT_LOG,
+                "initialize:" + json.dumps(params, sort_keys=True, separators=(",", ":")),
+            )
             result = {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": True}},
                 "serverInfo": {"name": NAME, "version": "1.0.0"},
+                "instructions": "Synthetic shared-backend instructions.",
             }
         elif method == "tools/list":
-            result = {
-                "tools": [
-                    {"name": name, "description": name, "inputSchema": {"type": "object"}}
-                    for name in (
-                        "echo",
-                        "browser_start",
-                        "browser_session",
-                        "view_change",
-                        "notify",
-                        "server_roundtrip",
-                        "exit_after_response",
-                        "fail",
-                        "crash",
-                    )
-                ]
-            }
+            tools = [
+                {"name": name, "description": name, "inputSchema": {"type": "object"}}
+                for name in (
+                    "echo",
+                    "browser_start",
+                    "browser_session",
+                    "view_change",
+                    "notify",
+                    "server_roundtrip",
+                    "exit_after_response",
+                    "fail",
+                    "crash",
+                )
+            ]
+            cursor = (message.get("params") or {}).get("cursor")
+            if cursor is None:
+                result = {"tools": tools[:5], "nextCursor": "shared-page-2"}
+            elif cursor == "shared-page-2":
+                result = {"tools": tools[5:]}
+            else:
+                result = {"tools": []}
         elif method == "tools/call":
             params = message.get("params") or {}
             name = params.get("name")
@@ -171,6 +181,7 @@ try:
                 result = {
                     "structuredContent": {
                         "nestedResult": nested.get("result"),
+                        "nestedError": nested.get("error"),
                         "nestedId": nested.get("id"),
                     },
                     "content": [],

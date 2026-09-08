@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -61,6 +63,19 @@ for raw in sys.stdin:
                             "additionalProperties": False,
                         },
                     },
+                    {
+                        "name": "read_input",
+                        "description": (
+                            "Read one staged Agent-local input file by its local path and "
+                            "return its bytes and digest."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                            "additionalProperties": False,
+                        },
+                    },
                 ]
             }
         elif method == "tools/call":
@@ -104,6 +119,42 @@ for raw in sys.stdin:
                     "content": [published["artifact"]],
                     "structuredContent": {
                         "artifact": published["artifact"],
+                        "servedBy": NAME,
+                    },
+                }
+            elif tool_name == "read_input":
+                path = arguments.get("path")
+                if not isinstance(path, str) or not path:
+                    raise ValueError("read_input requires a path")
+                stage = os.environ.get("WIN_WSL_MCP_BRIDGE_INPUT_STAGE")
+                if not stage:
+                    raise ValueError("read_input has no bridge input stage configured")
+                target = Path(path).resolve()
+                stage_root = Path(stage).resolve()
+                if target == stage_root or not target.is_relative_to(stage_root):
+                    raise ValueError("read_input path is outside the staged input area")
+                if not target.is_file() or target.is_symlink():
+                    raise ValueError("read_input staged path is not a regular file")
+                payload = target.read_bytes()
+                digest = hashlib.sha256(payload).hexdigest()
+                result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "name": target.name,
+                                    "size": len(payload),
+                                    "sha256": digest,
+                                    "data": base64.b64encode(payload).decode("ascii"),
+                                },
+                                separators=(",", ":"),
+                            ),
+                        }
+                    ],
+                    "structuredContent": {
+                        "size": len(payload),
+                        "sha256": digest,
                         "servedBy": NAME,
                     },
                 }

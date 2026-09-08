@@ -18,11 +18,14 @@ import time
 import uuid
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from bridge_runtime import BridgeError, Registry, local_registry_query
 
-ROOT = Path(__file__).resolve().parent
 WSL_BRIDGE = ROOT / "wsl-bridge-mcp" / "bridge.py"
-FIXTURE = ROOT / "fixture_mcp.py"
+FIXTURE = ROOT / "tests" / "fixtures" / "fixture_mcp.py"
 
 
 def free_port() -> int:
@@ -198,7 +201,7 @@ def main() -> int:
     repo_windows = subprocess.check_output(
         ["wslpath", "-w", str(ROOT)], text=True, timeout=10
     ).strip()
-    fixture_windows = ntpath.join(repo_windows, "fixture_mcp.py")
+    fixture_windows = ntpath.join(repo_windows, "tests", "fixtures", "fixture_mcp.py")
     win_bridge = ntpath.join(repo_windows, "win-bridge-mcp", "bridge.py")
     win_py_command = subprocess.check_output(
         ["wslpath", "-w", str(windows_py)], text=True, timeout=10

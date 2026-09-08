@@ -8,11 +8,14 @@ Before work, run `apg context --target . --task <current-task> --format context`
 # Agent instructions
 
 This repository delivers one shared, bidirectional WIN-WSL MCP bridge. It has
-exactly two component directories: `win-bridge-mcp/` and `wsl-bridge-mcp/`.
-Do not add another component directory without an explicit architecture change.
+exactly two runtime component directories: `win-bridge-mcp/` and `wsl-bridge-mcp/`.
+`docs/` and `tests/` are non-runtime support directories, explicitly approved for
+project documentation and verification assets. Shared runtime modules stay at
+repository root; do not add another runtime component without an architecture change.
 
-Start with `README.md`, then read `ARCHITECTURE.md` for protocol or trust-boundary
-work and `VERIFICATION.md` for checks. Business MCPs remain ordinary stdio MCPs;
+Start with `README.md` and `docs/INDEX.md`, then read `docs/ARCHITECTURE.md` for
+protocol or trust-boundary work and `docs/VERIFICATION.md` for checks. Business MCPs
+remain ordinary stdio MCPs;
 do not add project-specific Onshape, Taobao, browser, credential, or cloud logic.
 
 Keep the runtime standard-library-only. Bind listeners to loopback, resolve only
@@ -35,6 +38,7 @@ false selects the generic bridge-owned shared JSON-RPC backend, ID routing,
 request serialization, lifecycle state machine, and optional registration-driven
 client lease; never add business-specific matching logic.
 
-Run tests with `PYTHONDONTWRITEBYTECODE=1` so verification does not create a
-third top-level directory. No production deployment, Windows service changes,
+Run tests from the repository root with `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest
+discover -s tests -t .` to avoid bytecode artifacts. No production deployment,
+Windows service changes,
 credentials, or real business MCP mutation are authorized by repository work.
