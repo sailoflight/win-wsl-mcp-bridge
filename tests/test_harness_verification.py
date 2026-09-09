@@ -224,6 +224,24 @@ class ProbeContractTests(unittest.TestCase):
         with self.assertRaises(hv.ProbeValidationError):
             session.validate(altered)
 
+    def test_later_request_model_exposure_is_valid_without_same_request_barrier(self):
+        session = Session()
+        session.bootstrap()
+        canary = session.send("tools/list")[-1]["result"]["tools"][0]
+        # A completed protocol refresh is not yet model exposure. The runner
+        # may still have an old request snapshot; this is unknown, not failure.
+        pending = session.validate()
+        self.assertEqual(pending["capabilities"]["modelExposure"], "unknown")
+        session.now += 30  # bounded later model step, not a new probe/replay
+        proof = canary["inputSchema"]["properties"]["proof"]["const"]
+        session.send("tools/call", {"name": canary["name"], "arguments": {"proof": proof}})
+        receipt = copy.deepcopy(session.fixture.receipt)
+        receipt["attestations"] = {"modelExposure": attestation(session, "canary-schema-visible-to-model")}
+        accepted = session.validate(receipt)
+        self.assertEqual(accepted["capabilities"]["toolsListChanged"], "supported")
+        self.assertEqual(accepted["capabilities"]["modelExposure"], "supported")
+        self.assertEqual(accepted["capabilities"]["nativeToolSearch"], "unknown")
+
     def test_model_attestation_is_separate_bounded_and_challenge_bound(self):
         session = Session()
         receipt = session.complete()

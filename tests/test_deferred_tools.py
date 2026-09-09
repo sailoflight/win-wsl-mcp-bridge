@@ -352,6 +352,104 @@ class DeferredToolsTests(unittest.TestCase):
         self.assertEqual(self.node.registry_queries, [{"op": "registry", "scope": "remote",
                          "action": "describe", "arguments": {"id": TARGET}}])
 
+    def test_view_switch_guides_next_turn_and_status_is_not_refresh_ack(self):
+        client = self.client()
+        initialized = client.initialize()["result"]
+        self.assertIn("subsequent model request", initialized["instructions"])
+        initial = client.request("tools/list")["result"]["tools"]
+        self.assertIn("subsequent model request", initial[0]["description"])
+        self.assertIn("not an acknowledgement", initial[0]["description"])
+        # A client may retain its already-built request snapshot until it
+        # processes list_changed. The facade cannot turn a status call into ack.
+        expanded = value(client.library("expand"))
+        self.assertIn("下一次请求", expanded["nextStep"])
+        self.assertEqual(expanded["addedTools"], [t["name"] for t in self.node.catalog])
+        self.assertEqual([t["name"] for t in initial], ["bridge_library"])
+        before_relist = value(client.library("status"))
+        self.assertFalse(before_relist["refreshRequested"])
+        client.notice()
+        next_turn = client.request("tools/list")["result"]["tools"]
+        self.assertEqual(next_turn[1:], self.node.catalog)
+        self.assertEqual(value(client.library("status")), before_relist)
+        collapsed = value(client.library("collapse"))
+        self.assertIn("下一次请求", collapsed["nextStep"])
+        self.assertIn("再次展开前不得调用", collapsed["nextStep"])
+        self.assertIn("bridge_library入口仍可用", collapsed["nextStep"])
+        self.assertIn("收起不表示任务无法完成", collapsed["nextStep"])
+        self.assertEqual(collapsed["removedTools"], expanded["addedTools"])
+        # Even an old request snapshot retaining schemas cannot authorize a
+        # hidden business call after the bridge has collapsed its directory.
+        count = len(self.node.requests("tools/call"))
+        refused = client.request("tools/call", {"name": self.node.catalog[0]["name"], "arguments": {}})
+        self.assertEqual(refused["error"]["message"], "tool_library_collapsed")
+        self.assertEqual(len(self.node.requests("tools/call")), count)
+        client.notice()
+        self.assertEqual([t["name"] for t in client.request("tools/list")["result"]["tools"]], ["bridge_library"])
+        self.assertFalse(value(client.library("status"))["refreshRequested"])
+        self.assertNotIn("nextStep", value(client.library("status")))
+
+    def test_name_deltas_are_visible_in_text_for_every_legacy_profile(self):
+        for version in bridge_protocol.LEGACY_PROTOCOL_VERSIONS:
+            with self.subTest(version=version):
+                self.node.version = version
+                self.node.catalog = [tool("first"), tool("second")]
+                client = self.client()
+                client.initialize(version)
+                result = client.library("expand")["result"]
+                body = json.loads(result["content"][0]["text"])
+                self.assertEqual(body["addedTools"], ["first", "second"])
+                self.assertNotIn("description", json.dumps(body))
+                self.assertNotIn("inputSchema", json.dumps(body))
+                self.assertNotIn("查看", body["nextStep"])
+                if version >= "2025-06-18":
+                    self.assertEqual(result["structuredContent"], body)
+                else:
+                    self.assertNotIn("structuredContent", result)
+                client.notice()
+                self.assertEqual(value(client.library("expand"))["addedTools"], [])
+                client.notice()
+                self.assertEqual(value(client.library("collapse"))["removedTools"], ["first", "second"])
+                client.notice()
+                self.assertEqual(value(client.library("collapse"))["removedTools"], [])
+                status = value(client.library("status"))
+                self.assertNotIn("addedTools", status)
+                self.assertNotIn("removedTools", status)
+                client.close()
+                self.clients.remove(client)
+
+    def test_collapse_reports_last_names_after_catalog_invalidation(self):
+        self.node.catalog = [tool("old")]
+        client = self.initialized()
+        client.library("expand")
+        client.notice()
+        self.node.broadcast()
+        client.notice()
+        self.assertEqual(value(client.library("status"))["state"], "unknown")
+        requests = len(self.node.requests("tools/list"))
+        self.assertEqual(value(client.library("collapse"))["removedTools"], ["old"])
+        self.assertEqual(len(self.node.requests("tools/list")), requests)
+        client.notice()
+        self.assertEqual(value(client.library("collapse"))["removedTools"], [])
+
+    def test_expanded_refresh_delta_tracks_replacements_and_relisted_names(self):
+        self.node.catalog = [tool("old"), tool("retained")]
+        client = self.initialized()
+        client.library("expand")
+        client.notice()
+        self.node.catalog = [tool("retained"), tool("new")]
+        self.node.broadcast()
+        client.notice()
+        refreshed = value(client.library("expand"))
+        self.assertEqual(refreshed["addedTools"], ["new"])
+        self.assertEqual(refreshed["removedTools"], ["old"])
+        client.notice()
+        self.node.catalog = [tool("latest")]
+        self.node.broadcast()
+        client.notice()
+        self.assertEqual(client.request("tools/list")["result"]["tools"][1:], self.node.catalog)
+        self.assertEqual(value(client.library("collapse"))["removedTools"], ["latest"])
+        client.notice()
+
     def test_expand_paging_exact_schema_and_exact_business_params(self):
         self.node.catalog = [tool("one"), tool("two"), tool("three")]
         client = self.initialized()

@@ -160,6 +160,22 @@ rules fails before any byte leaves the host, and the per-stream stage is removed
 on stream close. The bidirectional integration suite verifies real
 Windows-to-WSL and WSL-to-Windows input staging with byte and SHA-256 matches.
 
+## Harness tool-exposure compatibility
+
+The verified DSH Web/DS4F environment supports and has activated the legacy stdio
+bridge dynamic facade: user request snapshots show 54 -> 134 -> 54 definitions
+through Onshape expansion and collapse. Changes appear in subsequent model
+requests after client refresh, potentially later in the same turn. Native DSH
+tool-call representation remains compatible with this dynamic catalog.
+
+Claude Code and Codex retain complete discovery to use their native tool search;
+their exact installed dynamic-refresh behavior is not field-verified here.
+Other DSH profiles and unknown clients require their own evidence. Modern MCP
+and native HTTP routes are outside the legacy dynamic-facade contract. Keep
+expanded libraries stable across related work to avoid repeated cache rebuilds.
+See [the environment decision matrix and cache policy](MCP_TOOL_EXPOSURE.md)
+for the canonical evidence, activation scope and enrollment distinction.
+
 ## Remaining gaps and optional extensions
 
 `tests/field_test.py` now provides real Windows/WSL fixture evidence for both invocation

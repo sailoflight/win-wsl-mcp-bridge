@@ -41,8 +41,24 @@ PROFILE_NOTE = (
     "this target's tools, collapse to hide them, or status to inspect this connection. "
     "The view is connection-scoped: agents sharing this MCP process share its "
     "expansion state; it is not isolated per agent session. "
-    "Expansion requests a client tools/list refresh; it does not confirm the "
-    "client or model has installed the tools. Resources, prompts, subscriptions, "
+    "Expand only when needed, then keep the library expanded across related work "
+    "and follow-up turns. Do not collapse after each call or routinely at turn end. "
+    "Collapse only on user request or when a sustained context reduction is worth "
+    "the prompt-cache rebuild cost; consider other agents sharing the connection. "
+    "View changes can turn cached prefix tokens into uncached input. "
+    "Expand/collapse changes the bridge directory in this turn and requests client "
+    "re-listing. Added tools can be called in a subsequent model request after client refresh. "
+    "Removed tools cannot be called until re-exposed. The bridge_library entry remains "
+    "available: if the remaining task needs this library, expand it and then continue; "
+    "collapse does not make the task impossible. A later step of the same "
+    "conversation turn is sufficient; a new user message is not required. Never "
+    "batch a view switch with a downstream call or infer failure from the old "
+    "request's schema snapshot. "
+    "If definitions are still stale, report pending client refresh rather than "
+    "guessing tool names or repeatedly switching. Tool names remembered from "
+    "conversation history are not current callable definitions. refreshRequested describes this "
+    "response's notification request, not an acknowledgement of client/model readiness; "
+    "status and toolCount describe only the bridge. Resources, prompts, subscriptions, "
     "tasks, sampling, elicitation, and roots are not forwarded. Client cancellation "
     "notifications are not forwarded; a timeout does not prove execution stopped. "
     "A disconnected call has an unknown outcome and is never replayed automatically."
@@ -395,6 +411,9 @@ class DeferredSession:
         self.closed = False
         self.expanded = False
         self.catalog: list[dict[str, Any]] | None = None
+        # Last bridge-published names, retained across invalidation only for
+        # directory deltas. Never used to authorize calls or serve stale schemas.
+        self.view_names: tuple[str, ...] = ()
         self.epoch = 0
         self.revision = 0
         self.reason = "unobserved"
@@ -407,6 +426,7 @@ class DeferredSession:
         with self.lock:
             self.catalog = None
             self.expanded = False
+            self.view_names = ()
 
     def _notice(self) -> None:
         if self.client_ready and not self.closed:
@@ -500,9 +520,14 @@ class DeferredSession:
         assert self.metadata is not None
         description = (
             f"{self.metadata['name']}: {self.metadata['description']} "
-            "Expand or collapse this connection's tool list, or inspect status and revision. "
-            "All agents sharing this MCP connection share the view. "
-            "Expansion requests client re-listing; it does not confirm model readiness."
+            "Expand/collapse this connection's tool list now. Added tools can be called in a subsequent model "
+            "request after client refresh. A later step in the same "
+            "turn is sufficient. Do not batch a switch with downstream calls. "
+            "Shared across agents on this connection. Expand only when needed; keep "
+            "expanded for related work. Avoid routine collapse: switching can rebuild "
+            "the prompt cache and increase uncached input cost. History is not the callable list. "
+            "Status/toolCount are bridge state; refreshRequested is not an acknowledgement "
+            "of client/model readiness."
         )
         return {"name": LIBRARY_TOOL_NAME, "description": description.strip(),
                 "inputSchema": {"type": "object", "properties": {
@@ -554,6 +579,8 @@ class DeferredSession:
                 if self.epoch != epoch or peer.closed:
                     raise _Fault("catalog_changed_during_refresh", retryable=True)
                 self.catalog = tools
+                if self.expanded:
+                    self.view_names = tuple(tool["name"] for tool in tools)
                 self.revision += 1
                 self.state_revision += 1
                 self.reason = "verified"
@@ -581,6 +608,8 @@ class DeferredSession:
                 or args["action"] not in ("expand", "collapse", "status")):
             raise _Fault("invalid_library_action", code=-32602)
         action = args["action"]
+        with self.lock:
+            before_names = self.view_names
         if action == "expand":
             self._catalog()
             with self.lock:
@@ -589,6 +618,8 @@ class DeferredSession:
                 if not self.expanded:
                     self.state_revision += 1
                 self.expanded = True
+                after_names = tuple(tool["name"] for tool in self.catalog)
+                self.view_names = after_names
             self._notice()
         elif action == "collapse":
             with self.lock:
@@ -596,12 +627,33 @@ class DeferredSession:
                 if changed or self.catalog is not None or self.reason != "unobserved":
                     self.state_revision += 1
                 self.expanded = False
+                self.view_names = ()
                 self.catalog = None
                 self.reason = "unobserved"
                 self.epoch += 1
             if changed:
                 self._notice()
         value = self.status(refresh_requested=action == "expand" or (action == "collapse" and changed))
+        if action == "expand":
+            before_set, after_set = set(before_names), set(after_names)
+            value["addedTools"] = [name for name in after_names if name not in before_set]
+            removed = [name for name in before_names if name not in after_set]
+            if removed:
+                value["removedTools"] = removed
+            value["nextStep"] = (
+                "上述新增工具将在客户端刷新后的下一次请求可用，可直接调用以继续完成任务。"
+                if value["addedTools"] else
+                "本次没有新增工具；目录刷新后可继续使用已展开的工具完成任务。"
+            )
+            if removed:
+                value["nextStep"] += " removedTools 中的工具已移除，不得继续调用。"
+        elif action == "collapse":
+            value["removedTools"] = list(before_names)
+            value["nextStep"] = (
+                "上述工具已移除，再次展开前不得调用。"
+                "bridge_library入口仍可用；若剩余任务需要上述工具，请先调用入口的expand，"
+                "客户端刷新后的下一次请求即可继续使用。收起不表示任务无法完成。"
+            )
         result: dict[str, Any] = {"content": [{"type": "text", "text": _encode(value).decode("utf-8")}]}
         if self.version >= "2025-06-18":
             result["structuredContent"] = value

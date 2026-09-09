@@ -4,6 +4,43 @@ All notable changes to this project are recorded here.
 
 ## 0.4.0 - Unreleased
 
+### B′ name-delta guidance
+
+- Deferred view switches now return raw `addedTools` / `removedTools` names in
+  model-visible content text, without duplicating descriptions or full schemas.
+  The retained library entry explicitly offers re-expansion to finish the task;
+  B′ does not require a separate proactive definition-inspection step.
+- Preserve last-published names through invalidation for accurate withdrawal
+  guidance, without using them for execution or stale schema discovery. Status
+  remains metadata-only; unchanged actions have empty name deltas.
+- Recorded isolated DS4F A′/B′ evidence (six successes and 20 model requests per
+  arm; zero invalid calls) and the separate generic-efficiency roadmap requiring
+  real-task, harness-specific cost validation before production. Fixture wording
+  tests are not model acceptance of this exact runtime build; no restart,
+  deployment, plugin installation or new real-model run accompanies this change.
+
+### Corrected dynamic tool guidance
+
+- Revised Harness adaptation decisions: the verified DSH Web/DS4F legacy stdio
+  environment is approved/activated for dynamic exposure, while Claude/Codex
+  retain native discovery for host tool search and other profiles remain scoped
+  to their own verification. No product-name inference bypasses enrollment.
+- Added cache-aware Agent guidance: expand on demand, retain the view throughout
+  related work, and avoid per-call/end-of-turn collapse. The user's approximate
+  12.5 cached-round cost equivalence is documented as local billing context,
+  never hard-coded as a provider rate or automatic eviction threshold.
+
+- Deferred expand/collapse now instructs Agents to use a subsequent model request
+  after client refresh (a later step in the same turn is sufficient), with compact
+  `nextStep` guidance in switch responses. Status is bridge-local, and
+  `refreshRequested=false` is not a refresh acknowledgement. Historical tool
+  names are not current callable definitions.
+- Recorded user-observed DSH/DS4F request snapshots for a successful round trip:
+  54 -> 134 -> 54 tool definitions, +80/-80 Onshape tools, approximately
+  +16.3k/-16.3k tool-schema tokens. Taobao remained collapsed. Added regression
+  coverage for later-request acceptance and rejecting stale calls after collapse;
+  no automatic production verification receipt or database update is inferred.
+
 ### Added
 
 - Projection schema v4 persists explicit loopback relay and per-target converted
