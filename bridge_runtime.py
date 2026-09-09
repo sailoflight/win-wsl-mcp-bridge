@@ -12470,6 +12470,12 @@ def build_parser(default_side: str, default_local_port: int, default_link_mode: 
     compatibility.add_argument("target")
     compatibility.add_argument("--local-host", default="127.0.0.1")
     compatibility.add_argument("--local-port", type=int, default=default_local_port)
+    deferred = subparsers.add_parser(
+        "deferred-mcp", help="serve one registered stdio target with an opt-in legacy library view",
+    )
+    deferred.add_argument("target")
+    deferred.add_argument("--local-host", default="127.0.0.1")
+    deferred.add_argument("--local-port", type=int, default=default_local_port)
 
     trace = subparsers.add_parser("trace", help="manage bounded host-local development trace sessions")
     trace.add_argument("action", choices=["start", "recent", "records", "export", "compact"])
@@ -12609,6 +12615,24 @@ def build_parser(default_side: str, default_local_port: int, default_link_mode: 
         default="native",
     )
     enroll.add_argument("--confirm", action="store_true")
+
+    probe_client = projection_sub.add_parser(
+        "probe-client", help="prepare an isolated client capability probe for a Bridge Agent",
+    )
+    probe_client.add_argument("environment_id")
+    probe_client.add_argument("--projection")
+    probe_client.add_argument("--probe-file", required=True)
+    probe_client.add_argument("--dry-run", action="store_true")
+    probe_client.add_argument("--confirm", action="store_true")
+    record_client = projection_sub.add_parser(
+        "record-client-verification", help="validate a bound probe receipt and record Harness evidence",
+    )
+    record_client.add_argument("environment_id")
+    record_client.add_argument("--projection")
+    record_client.add_argument("--receipt", required=True)
+    record_client.add_argument("--tool-exposure", choices=["native", "auto", "deferred"], default="auto")
+    record_client.add_argument("--dry-run", action="store_true")
+    record_client.add_argument("--confirm", action="store_true")
 
     unenroll = projection_sub.add_parser(
         "unenroll",
@@ -12775,6 +12799,9 @@ def component_main(default_side: str, default_local_port: int, default_link_mode
         return control_mcp(
             args.local_host, args.local_port, protocol_era=args.protocol_era
         )
+    if args.command == "deferred-mcp":
+        from deferred_tools import run_deferred_mcp
+        return run_deferred_mcp(args.local_host, args.local_port, args.target)
     if args.command == "compatibility-mcp":
         return compatibility_mcp(args.local_host, args.local_port, args.target)
     if args.command == "trace":
@@ -12930,7 +12957,7 @@ BRIDGE_OWNED_ENV_KEY = "WIN_WSL_MCP_BRIDGE_OWNED"
 BRIDGE_OWNED_ENV_VALUE = "1"
 BRIDGE_SERVER_ENV_KEY = "WIN_WSL_MCP_BRIDGE_SERVER"
 
-PROJECTION_SCHEMA_VERSION = 4
+PROJECTION_SCHEMA_VERSION = 5
 PROJECTION_HISTORY_LIMIT = 200
 PROJECTION_SCAN_CANDIDATE_PREFIX = "cand-"
 PROJECTION_IDENTITY_HASH_LIMIT = 16 * 1024 * 1024
@@ -12973,6 +13000,8 @@ CREATE TABLE IF NOT EXISTS agent_environments (
     compatibility_route TEXT NOT NULL DEFAULT 'native',
     relay_base_url TEXT NOT NULL DEFAULT '',
     stdio_http_endpoints_json TEXT NOT NULL DEFAULT '',
+    tool_exposure TEXT NOT NULL DEFAULT 'native',
+    harness_verification_json TEXT NOT NULL DEFAULT '{}',
     confirmed_at_ns INTEGER NOT NULL,
     created_at_ns INTEGER NOT NULL,
     updated_at_ns INTEGER NOT NULL,
@@ -13105,20 +13134,22 @@ class ProjectionDatabase:
     SCHEMA_VERSION = PROJECTION_SCHEMA_VERSION
     SCHEMA = PROJECTION_SCHEMA
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, observe_only: bool = False):
         self.path = path
+        self.observe_only = observe_only
         if not path.is_file():
             raise BridgeError(
                 f"projection database does not exist: {path}; run projection scan or reconcile"
             )
-        if os.name != "nt":
+        if not observe_only and os.name != "nt":
             try:
                 path.chmod(0o600)
             except OSError as exc:
                 raise BridgeError(
                     f"projection database permissions could not be restricted: {path}"
                 ) from exc
-        with self._connect() as connection:
+        from contextlib import closing
+        with closing(self._connect()) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version != self.SCHEMA_VERSION:
                 raise BridgeError(
@@ -13142,10 +13173,18 @@ class ProjectionDatabase:
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = NORMAL")
+            # Serialize upgrades before observing their version. A waiting
+            # upgrader must see the preceding transaction's committed version.
+            connection.execute("BEGIN IMMEDIATE")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, 2, 3, cls.SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, 4, cls.SCHEMA_VERSION}:
                 raise BridgeError(f"cannot migrate projection schema version {version}")
-            connection.executescript(cls.SCHEMA)
+            # executescript implicitly commits an existing transaction. This
+            # schema contains plain DDL statements only; execute individually
+            # so table creation, all ALTERs and user_version commit together.
+            for statement in cls.SCHEMA.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
             if version == 1:
                 connection.execute(
                     "ALTER TABLE agent_environments ADD COLUMN "
@@ -13179,6 +13218,17 @@ class ProjectionDatabase:
                     "ALTER TABLE agent_environments ADD COLUMN "
                     "stdio_http_endpoints_json TEXT NOT NULL DEFAULT ''"
                 )
+            if version in (1, 2, 3, 4):
+                # Old environments retain complete catalogs and unknown client
+                # capabilities. A recorded probe, not client identity, opts in.
+                connection.execute(
+                    "ALTER TABLE agent_environments ADD COLUMN "
+                    "tool_exposure TEXT NOT NULL DEFAULT 'native'"
+                )
+                connection.execute(
+                    "ALTER TABLE agent_environments ADD COLUMN "
+                    "harness_verification_json TEXT NOT NULL DEFAULT '{}'"
+                )
             connection.execute(f"PRAGMA user_version = {cls.SCHEMA_VERSION}")
             connection.commit()
         finally:
@@ -13188,7 +13238,12 @@ class ProjectionDatabase:
                 os.umask(previous_umask)
 
     def _connect(self, *, write: bool = False) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5)
+        if write and self.observe_only:
+            raise BridgeError("read-only projection database cannot be written")
+        if self.observe_only:
+            connection = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        else:
+            connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
@@ -13317,12 +13372,15 @@ def _agent_connect_entry(
     launcher_args: list[str],
     server_id: str,
     compatibility: bool = False,
+    deferred: bool = False,
 ) -> dict[str, Any]:
     """Adapter-owned launch descriptor for one projected peer registration."""
+    if compatibility and deferred:
+        raise BridgeError("constant and deferred tool surfaces cannot be combined")
     return {
         "command": launcher_command,
         "args": launcher_args
-        + ["compatibility-mcp" if compatibility else "connect", server_id],
+        + ["deferred-mcp" if deferred else "compatibility-mcp" if compatibility else "connect", server_id],
         "env": {
             BRIDGE_OWNED_ENV_KEY: BRIDGE_OWNED_ENV_VALUE,
             BRIDGE_SERVER_ENV_KEY: server_id,
@@ -13526,6 +13584,62 @@ def _row_stdio_http_endpoints(row: Any) -> dict[str, str]:
     except ValueError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _harness_config_fingerprint(row: Any) -> str:
+    path = Path(row["config_path"])
+    if not path.is_file():
+        return _fingerprint({"configPath": str(path.resolve()), "state": "absent"})
+    if path.stat().st_size > min(PROJECTION_CONFIG_READ_LIMIT, PROJECTION_IDENTITY_HASH_LIMIT):
+        raise BridgeError("client configuration exceeds the verification fingerprint bound")
+    return _bounded_sha256(path)[0]
+
+
+def _row_harness_verification(row: Any) -> dict[str, Any]:
+    """Recorded probe evidence, never guessed from a client's product name."""
+    raw = _env_row_field(row, "harness_verification_json", "{}")
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        raise BridgeError("invalid recorded harness verification") from None
+    if not isinstance(value, dict):
+        raise BridgeError("invalid recorded harness verification")
+    return value
+
+
+def _effective_tool_exposure(row: Any) -> str:
+    mode = _env_row_field(row, "tool_exposure", "native")
+    if mode not in {"native", "auto", "deferred"}:
+        raise BridgeError("invalid recorded tool exposure mode")
+    if mode == "native":
+        return mode
+    evidence = _row_harness_verification(row)
+    capabilities = evidence.get("capabilities", {})
+    if not isinstance(capabilities, dict):
+        raise BridgeError("invalid recorded harness capabilities")
+    # An observation proves this exact environment only; no universal claim
+    # about the named Harness. Expired/absent evidence cannot enable deferral.
+    fresh = (
+        evidence.get("environmentId") == row["environment_id"]
+        and evidence.get("clientKind") == row["client_kind"]
+        and evidence.get("projectionConfigFingerprint", evidence.get("configFingerprint"))
+            == _harness_config_fingerprint(row)
+        and isinstance(evidence.get("validUntil"), (int, float))
+        and evidence["validUntil"] > time.time()
+    )
+    usable = (
+        fresh
+        and capabilities.get("toolsListChanged") == "supported"
+        and capabilities.get("modelExposure") == "supported"
+        and evidence.get("protocolVersion") in SHARED_COMPATIBLE_PROTOCOL_VERSIONS
+    )
+    if mode == "deferred":
+        if not usable:
+            raise BridgeError("deferred exposure requires fresh client refresh and model-exposure probe evidence")
+        return "deferred"
+    if not usable or capabilities.get("nativeToolSearch") != "unsupported":
+        return "native"
+    return "deferred"
 
 
 def _default_launcher(side: str) -> tuple[str, list[str]]:
@@ -13916,8 +14030,16 @@ def _looks_bridge_owned(
     args = entry.get("args")
     if not isinstance(command, str) or not isinstance(args, list):
         return False
-    prefix = launcher_args + ["connect"]
-    return command == launcher_command and args[: len(prefix)] == prefix
+    # DSH intentionally omits env markers. All per-target Bridge frontends
+    # therefore need launcher ownership recognition; persisted fingerprints
+    # still decide whether an observed entry is unchanged, drifted or removable.
+    modes = {"connect", "connect-http", "compatibility-mcp", "deferred-mcp"}
+    return (
+        command == launcher_command
+        and args[:len(launcher_args)] == launcher_args
+        and len(args) > len(launcher_args)
+        and args[len(launcher_args)] in modes
+    )
 
 
 def _resolve_adapter_mode(
@@ -14558,6 +14680,7 @@ def _adapter_apply(
     obsolete: list[dict[str, Any]],
     dry_run: bool,
     previous_entries: dict[str, dict[str, Any]] | None = None,
+    verified_transition: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply desired entries and verified obsolete removals to one config."""
     actions: list[dict[str, Any]] = []
@@ -14580,7 +14703,7 @@ def _adapter_apply(
             previous_entries=previous_entries or {},
         )
     if mode == ADAPTER_BRIDGE_FILE:
-        return _adapter_apply_file(kind, config_path, desired, obsolete)
+        return _adapter_apply_file(kind, config_path, desired, obsolete, verified_transition=verified_transition)
     raise BridgeError(f"no supported apply adapter for {mode}")
 
 
@@ -14661,6 +14784,7 @@ def _adapter_apply_file(
     config_path: Path,
     desired: list[dict[str, Any]],
     obsolete: list[dict[str, Any]],
+    *, verified_transition: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Rewrite a Bridge-owned configuration document atomically with rollback.
 
@@ -14931,6 +15055,8 @@ def _environment_summary(row: sqlite3.Row) -> dict[str, Any]:
         "fileMtimeNs": row["file_mtime_ns"],
         "transportCapabilities": json.loads(row["transport_capabilities_json"]),
         "compatibilityRoute": row["compatibility_route"],
+        "toolExposure": _env_row_field(row, "tool_exposure", "native"),
+        "harnessVerification": _row_harness_verification(row),
         "relayBaseUrl": _env_row_field(row, "relay_base_url", ""),
         "stdioHttpEndpoints": _row_stdio_http_endpoints(row),
         "confirmedAtNs": row["confirmed_at_ns"],
@@ -15132,6 +15258,131 @@ def projection_enroll(
     }
 
 
+def projection_probe_client(
+    *, projection: Path, environment_id: str, probe_file: Path,
+    confirm: bool = False, dry_run: bool = False,
+) -> dict[str, Any]:
+    """Prepare a bound harmless probe; the Bridge Agent owns target execution.
+
+    Preparing never invokes a model, changes a target client profile, or assumes
+    any client feature from its name. Only confirmed local challenge state is
+    written. The target runs the fixture in an explicitly authorized session.
+    """
+    from harness_verification import create_probe
+    if not dry_run and not confirm:
+        raise BridgeError("preparing client verification requires --confirm or --dry-run")
+    database = ProjectionDatabase(projection, observe_only=dry_run)
+    with database._connect() as connection:
+        row = database.environment_row(connection, environment_id)
+    if row is None or not row["enabled"]:
+        raise BridgeError("client verification requires an enabled enrolled environment")
+    fingerprint = _harness_config_fingerprint(row)
+    if not Path(row["config_path"]).is_file() and not _adapter_file_mode_supported(
+        row["client_kind"], Path(row["config_path"])
+    ):
+        raise BridgeError("missing client configuration is not a supported owned-file enrollment")
+    challenge = create_probe({
+        "environmentId": environment_id, "clientKind": row["client_kind"],
+        "configFingerprint": fingerprint,
+    })
+    probe_file = probe_file.expanduser().resolve()
+    if probe_file.exists():
+        raise BridgeError("probe destination already exists; choose a new file")
+    receipt_file = probe_file.with_name(probe_file.name + ".receipt.json")
+    if receipt_file.exists():
+        raise BridgeError("probe receipt destination already exists")
+    if not dry_run:
+        probe_file.parent.mkdir(parents=True, exist_ok=True)
+        with database._connect(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if _harness_config_fingerprint(row) != fingerprint:
+                raise BridgeError("client configuration changed while preparing verification")
+            # O_EXCL preserves any concurrently created local file. A failed
+            # database commit leaves an inert challenge, never a capability.
+            descriptor = os.open(probe_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(challenge, handle, ensure_ascii=False, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            database.set_meta(connection, "client_probe:" + environment_id, _canonical_json(challenge))
+            database.record_history(
+                connection, environment_id=environment_id,
+                revision=database.current_revision(connection), action="client_probe",
+                ok=True, detail="prepared bound client probe " + challenge["probeId"],
+            )
+    return {
+        "ok": True, "dryRun": dry_run, "environmentId": environment_id,
+        "probeId": challenge["probeId"], "probeFile": str(probe_file),
+        "receiptFile": str(receipt_file),
+        "fixture": {"command": sys.executable, "args": [
+            str(Path(__file__).resolve().with_name("harness_verification.py")),
+            "--probe", str(probe_file),
+            "--receipt", str(receipt_file),
+        ]},
+        "next": "Bridge Agent: run this harmless fixture in an authorized isolated target Harness session; observe model exposure and native search separately; then record-client-verification with the receipt. Preparation does not run the target or verify its capabilities.",
+    }
+
+
+def projection_record_client_verification(
+    *, projection: Path, environment_id: str, receipt_file: Path,
+    tool_exposure: str = "auto", confirm: bool = False, dry_run: bool = False,
+) -> dict[str, Any]:
+    """Validate and consume one probe receipt before recording client evidence."""
+    from harness_verification import validate_probe_receipt
+    if not dry_run and not confirm:
+        raise BridgeError("recording client verification requires --confirm or --dry-run")
+    if tool_exposure not in {"native", "auto", "deferred"}:
+        raise BridgeError("unknown tool exposure mode")
+    if not receipt_file.is_file() or receipt_file.stat().st_size > 1024 * 1024:
+        raise BridgeError("verification receipt must be a bounded regular file")
+    receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
+    database = ProjectionDatabase(projection, observe_only=dry_run)
+    with database._connect(write=not dry_run) as connection:
+        if not dry_run:
+            connection.execute("BEGIN IMMEDIATE")
+        row = database.environment_row(connection, environment_id)
+        if row is None or not row["enabled"]:
+            raise BridgeError("client verification requires an enabled enrolled environment")
+        raw = database.meta_value(connection, "client_probe:" + environment_id)
+        if raw is None:
+            raise BridgeError("no unconsumed client probe for this environment")
+        challenge = json.loads(raw)
+        evidence = validate_probe_receipt(challenge, receipt)
+        if (
+            evidence.get("environmentId") != environment_id
+            or evidence.get("clientKind") != row["client_kind"]
+            or evidence.get("configFingerprint") != _harness_config_fingerprint(row)
+        ):
+            raise BridgeError("verification does not match the current enrolled client configuration")
+        updated = dict(row)
+        updated["tool_exposure"] = tool_exposure
+        updated["harness_verification_json"] = _canonical_json(evidence)
+        effective = _effective_tool_exposure(updated)
+        if effective == "deferred" and (
+            row["compatibility_route"] != "native"
+            or not json.loads(row["transport_capabilities_json"]).get("stdio")
+        ):
+            if tool_exposure == "deferred":
+                raise BridgeError("deferred exposure requires the native stdio route")
+            effective = "native"
+        if not dry_run:
+            connection.execute(
+                "UPDATE agent_environments SET tool_exposure = ?, "
+                "harness_verification_json = ?, updated_at_ns = ? WHERE environment_id = ?",
+                (tool_exposure, updated["harness_verification_json"], time.time_ns(), environment_id),
+            )
+            connection.execute("DELETE FROM projection_meta WHERE key = ?", ("client_probe:" + environment_id,))
+            database.append_outbox(
+                connection, "enrollment_changed", environment_id=environment_id,
+                detail="recorded client probe " + evidence["probeId"],
+            )
+    return {
+        "ok": True, "dryRun": dry_run, "environmentId": environment_id,
+        "toolExposure": tool_exposure, "effectiveToolExposure": effective,
+        "verification": evidence, "configurationApplied": False,
+    }
+
+
 def projection_unenroll(
     *,
     projection: Path,
@@ -15325,6 +15576,15 @@ def _desired_entry_descriptors(
     launcher_args = json.loads(row["launcher_args_json"])
     capabilities = json.loads(row["transport_capabilities_json"])
     route = str(row["compatibility_route"])
+    tool_exposure = _effective_tool_exposure(row)
+    if tool_exposure == "deferred" and (
+        route != "native" or not capabilities.get("stdio")
+        or any(transport != "stdio" for _, _, transport in mirror_facts)
+    ):
+        if _env_row_field(row, "tool_exposure", "native") == "auto":
+            tool_exposure = "native"
+        else:
+            raise BridgeError("deferred exposure supports only native stdio peer registrations")
     relay_base_url = _env_row_field(row, "relay_base_url", "")
     raw_endpoints = _env_row_field(row, "stdio_http_endpoints_json", "")
     stdio_http_endpoints = (
@@ -15353,9 +15613,10 @@ def _desired_entry_descriptors(
                 launcher_args=launcher_args,
                 server_id=server_id,
                 compatibility=(route == "constant-two-tool"),
+                deferred=(tool_exposure == "deferred"),
             )
             descriptor["projectionMode"] = (
-                "converted" if route == "constant-two-tool" else "native"
+                "converted" if route == "constant-two-tool" or tool_exposure == "deferred" else "native"
             )
         elif (
             transport == "streamable-http"
@@ -15475,8 +15736,25 @@ def _reconcile_one_environment(
     dry_run: bool,
 ) -> dict[str, Any]:
     environment_id = str(env_row["environment_id"])
-    environment_summary = _environment_summary(env_row)
-    desired_descriptors = _desired_entry_descriptors(env_row, mirror_facts)
+    try:
+        environment_summary = _environment_summary(env_row)
+        verification = _row_harness_verification(env_row)
+        verification_matches_before = bool(verification) and (
+            verification.get("projectionConfigFingerprint", verification.get("configFingerprint"))
+            == _harness_config_fingerprint(env_row)
+        )
+        desired_descriptors = _desired_entry_descriptors(env_row, mirror_facts)
+    except (BridgeError, ValueError, TypeError, OSError) as exc:
+        # Client-specific policy failures must never roll back bookkeeping for
+        # earlier environments whose configuration files already changed.
+        message = "invalid_client_verification: " + str(exc)
+        if not dry_run:
+            _record_environment_error(database, connection, environment_id, env_row, None, message)
+        return {
+            "environmentId": environment_id, "clientKind": env_row["client_kind"],
+            "status": ENV_STATUS_ERROR, "errorDetail": message,
+            "actions": [], "conflicts": [], "drift": [], "servers": [],
+        }
     desired_by_name = {item["name"]: item for item in desired_descriptors}
     unsupported = [
         {"serverId": server_id, "transport": transport, "code": "unsupported_transport"}
@@ -15657,6 +15935,15 @@ def _reconcile_one_environment(
 
     # Persist projection bookkeeping (same transaction as history/outbox).
     if not dry_run:
+        if verification_matches_before and not conflicts and not drift_names and (to_add or obsolete):
+            # Only our successful fingerprint-checked configuration rewrite may
+            # advance this binding. Keep the actual probe fingerprint intact.
+            verification["projectionConfigFingerprint"] = _harness_config_fingerprint(env_row)
+            connection.execute(
+                "UPDATE agent_environments SET harness_verification_json = ? WHERE environment_id = ?",
+                (_canonical_json(verification), environment_id),
+            )
+            environment_summary["harnessVerification"] = verification
         now = time.time_ns()
         revision = database.current_revision(connection)
         for name, descriptor in sorted(desired_by_name.items()):
@@ -15826,6 +16113,39 @@ def projection_reconcile(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Deterministically converge enrolled environments on the peer mirror."""
+    if dry_run:
+        from contextlib import closing
+        # Upgrade and refresh only a disposable snapshot. Source enrollment,
+        # outbox, permissions and even a missing source directory stay intact.
+        with tempfile.TemporaryDirectory(prefix="bridge-projection-preview-") as temporary:
+            preview = Path(temporary) / "projection.sqlite3"
+            if projection.exists():
+                with closing(sqlite3.connect(
+                    projection.resolve().as_uri() + "?mode=ro", uri=True, timeout=5,
+                )) as source, closing(sqlite3.connect(preview, timeout=5)) as destination:
+                    source.backup(destination)
+            ProjectionDatabase.ensure(preview)
+            sync_result = None
+            if refresh_source is not None:
+                sync_result = projection_sync_peer(
+                    projection=preview, source=refresh_source, side=side,
+                    peer_registry=peer_registry, local_host=local_host, local_port=local_port,
+                )
+            database = ProjectionDatabase(preview, observe_only=True)
+            with closing(database._connect()) as connection:
+                mirror_facts = [(str(row["server_id"]), str(row["name"]), str(row["transport"]))
+                                for row in database.peer_rows(connection)]
+                environments = [
+                    _reconcile_one_environment(database, connection, row, mirror_facts, dry_run=True)
+                    for row in database.environment_rows(connection) if int(row["enabled"]) == 1
+                ]
+            errors = [outcome.get("errorDetail", "environment error") for outcome in environments
+                      if outcome.get("status") in {ENV_STATUS_ERROR, ENV_STATUS_DRIFT}]
+            return {
+                "ok": not errors, "dryRun": True, "sync": sync_result,
+                "mirrorServers": [item[0] for item in mirror_facts],
+                "environments": environments, "errors": errors,
+            }
     ProjectionDatabase.ensure(projection)
     database = ProjectionDatabase(projection)
     if refresh_source is not None:
@@ -15856,23 +16176,6 @@ def projection_reconcile(
     ]
     environments: list[dict[str, Any]] = []
     errors: list[str] = []
-    if dry_run:
-        connection = database._connect()
-        for env_row in env_rows:
-            outcome = _reconcile_one_environment(
-                database, connection, env_row, mirror_facts, dry_run=True
-            )
-            environments.append(outcome)
-            if outcome.get("status") == ENV_STATUS_ERROR:
-                errors.append(outcome.get("errorDetail", "environment error"))
-        return {
-            "ok": not errors,
-            "dryRun": True,
-            "sync": sync_result,
-            "mirrorServers": [item[0] for item in mirror_facts],
-            "environments": environments,
-            "errors": errors,
-        }
     with database._connect(write=True) as connection:
         for env_row in env_rows:
             outcome = _reconcile_one_environment(
@@ -16108,6 +16411,19 @@ def _projection_cli_main(args: argparse.Namespace, *, default_side: str) -> int:
                 stdio_http_endpoints=getattr(args, "stdio_http_endpoints", None),
             )
             _print_json(result)
+            return 0
+        if command == "probe-client":
+            _print_json(projection_probe_client(
+                projection=projection, environment_id=args.environment_id,
+                probe_file=Path(args.probe_file), confirm=args.confirm, dry_run=args.dry_run,
+            ))
+            return 0
+        if command == "record-client-verification":
+            _print_json(projection_record_client_verification(
+                projection=projection, environment_id=args.environment_id,
+                receipt_file=Path(args.receipt).expanduser().resolve(),
+                tool_exposure=args.tool_exposure, confirm=args.confirm, dry_run=args.dry_run,
+            ))
             return 0
         if command == "unenroll":
             result = projection_unenroll(

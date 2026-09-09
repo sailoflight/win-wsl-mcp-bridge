@@ -12,6 +12,7 @@ are not current capabilities; fixture checks are not installed-client evidence.
 | Current completion evidence and open gates | [Acceptance ledger](IMPLEMENTATION_STATUS.md) |
 | Offline checks and field acceptance | [Verification](VERIFICATION.md) |
 | Pinned official SDK interoperability | [SDK evidence](SDK_INTEROP.md) |
+| Harness capability probes and MCP tool exposure | [Tool exposure](MCP_TOOL_EXPOSURE.md) |
 | Installation, configuration, recovery and maintenance | [Deployment](DEPLOYMENT.md) |
 | Release changes | [Changelog](../CHANGELOG.md) |
 

@@ -1793,6 +1793,8 @@ class RegistryTest(unittest.TestCase):
                 "journal_evidence",
                 "legacy_modern_stdio",
                 "stream_evidence",
+                "deferred_tools",
+                "harness_verification",
             ],
         )
         self.assertEqual(
@@ -5916,6 +5918,12 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             connection.execute(
                 "ALTER TABLE agent_environments DROP COLUMN stdio_http_endpoints_json"
             )
+            connection.execute(
+                "ALTER TABLE agent_environments DROP COLUMN harness_verification_json"
+            )
+            connection.execute(
+                "ALTER TABLE agent_environments DROP COLUMN tool_exposure"
+            )
             connection.execute("PRAGMA user_version = 2")
         ProjectionDatabase.ensure(path)
         with ProjectionDatabase(path)._connect() as connection:
@@ -6553,6 +6561,12 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
         with sqlite3.connect(path) as connection:
             connection.execute(
                 "ALTER TABLE agent_environments DROP COLUMN stdio_http_endpoints_json"
+            )
+            connection.execute(
+                "ALTER TABLE agent_environments DROP COLUMN harness_verification_json"
+            )
+            connection.execute(
+                "ALTER TABLE agent_environments DROP COLUMN tool_exposure"
             )
             connection.execute("PRAGMA user_version = 3")
         ProjectionDatabase.ensure(path)

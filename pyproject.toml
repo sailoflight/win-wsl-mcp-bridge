@@ -28,6 +28,8 @@ py-modules = [
     "journal_evidence",
     "legacy_modern_stdio",
     "stream_evidence",
+    "deferred_tools",
+    "harness_verification",
 ]
 include-package-data = false
 
