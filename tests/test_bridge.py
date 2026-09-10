@@ -4726,6 +4726,32 @@ if cmd == "add":
             index += 1
             continue
         if token in ("-e", "--env"):
+            if KIND == "claude":
+                # Real Claude Code `-e/--env` is variadic (`<env...>`, verified
+                # 2.1.267): every following non-option token is consumed as
+                # another KEY=VALUE, a token without "=" is rejected, and the
+                # `--` terminator ends the run. Modelling that here is what makes
+                # the harness able to catch a positional-after-flag argv bug.
+                values = []
+                index += 1
+                while index < len(args) and not args[index].startswith("-"):
+                    values.append(args[index])
+                    index += 1
+                if not values:
+                    print("expected -e KEY=VALUE", file=sys.stderr)
+                    sys.exit(2)
+                for item in values:
+                    if "=" not in item:
+                        print(
+                            "Invalid environment variable format: %s, environment "
+                            "variables should be added as: -e KEY1=value1 -e "
+                            "KEY2=value2" % item,
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                    key, value = item.split("=", 1)
+                    env[key] = value
+                continue
             key, value = args[index + 1].split("=", 1)
             env[key] = value
             index += 2
@@ -5806,6 +5832,73 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             _cli_parse_claude_text(text, "alpha"),
             {"url": "http://127.0.0.1:8877/mcp/alpha", "headers": {}},
         )
+
+    def test_official_cli_stdio_argv_keeps_name_out_of_variadic_env_flags(self) -> None:
+        """Regression: Claude `-e/--env` is variadic, so the name precedes it.
+
+        Real Claude Code 2.1.267 consumes every non-option token after `-e` as
+        another KEY=VALUE and rejects a bare server name with "Invalid
+        environment variable format: <name>"; the projected stdio argv must
+        therefore place the name before the flags and keep the command after the
+        `--` terminator. Codex `--env` remains single-valued.
+        """
+        from bridge_runtime import _cli_add_argv
+
+        entry = {
+            "name": "alpha",
+            "command": "/opt/bridge/python",
+            "args": ["/opt/bridge/wsl-bridge-mcp/bridge.py", "connect", "alpha"],
+            "env": {
+                "WIN_WSL_MCP_BRIDGE_OWNED": "1",
+                "WIN_WSL_MCP_BRIDGE_SERVER": "alpha",
+            },
+        }
+        self.assertEqual(
+            _cli_add_argv("claude", entry, scope="user"),
+            [
+                "claude", "mcp", "add", "--scope", "user", "alpha",
+                "-e", "WIN_WSL_MCP_BRIDGE_OWNED=1",
+                "-e", "WIN_WSL_MCP_BRIDGE_SERVER=alpha",
+                "--", "/opt/bridge/python",
+                "/opt/bridge/wsl-bridge-mcp/bridge.py", "connect", "alpha",
+            ],
+        )
+        self.assertEqual(
+            _cli_add_argv("codex", entry),
+            [
+                "codex", "mcp", "add",
+                "--env", "WIN_WSL_MCP_BRIDGE_OWNED=1",
+                "--env", "WIN_WSL_MCP_BRIDGE_SERVER=alpha",
+                "alpha", "--", "/opt/bridge/python",
+                "/opt/bridge/wsl-bridge-mcp/bridge.py", "connect", "alpha",
+            ],
+        )
+        # no-env shape stays add <name> -- <command> <args...>
+        self.assertEqual(
+            _cli_add_argv("claude", {"name": "beta", "command": "/bin/x", "args": []}),
+            ["claude", "mcp", "add", "beta", "--", "/bin/x"],
+        )
+
+    def test_official_cli_stdio_add_survives_variadic_env_fake_claude(self) -> None:
+        """End-to-end: the projected stdio add works against variadic `-e`."""
+        state = self.install_fake_cli("claude")
+        self.sync_mirror(self.make_peer([self.server("alpha")]))
+        self.enroll(self.candidate("claude"))
+        result = self._reconcile()
+        self.assertTrue(result["ok"], result["errors"])
+        launcher_command, launcher_args = bridge_runtime._default_launcher(self.SIDE)
+        descriptor = bridge_runtime._agent_connect_entry(
+            launcher_command=launcher_command,
+            launcher_args=launcher_args,
+            server_id="alpha",
+        )
+        entry = json.loads(state.read_text())["mcpServers"]["alpha"]
+        self.assertEqual(entry["command"], descriptor["command"])
+        self.assertEqual(entry["args"], descriptor["args"])
+        self.assertEqual(entry["env"], descriptor["env"])
+        # second reconcile is a no-op: the entry is owned and fingerprint-stable
+        self.assertTrue(self._reconcile()["ok"])
+        self.assertEqual(sorted(json.loads(state.read_text())["mcpServers"]), ["alpha"])
 
     def test_official_cli_native_http_projection_with_fake_claude(self) -> None:
         state = self.install_fake_cli("claude")

@@ -4,6 +4,24 @@ All notable changes to this project are recorded here.
 
 ## 0.4.0 - Unreleased
 
+### Claude Code official-CLI adapter argument order
+
+- Fixed the Claude official-CLI `mcp add` argv: real Claude Code `-e/--env` is
+  variadic (`claude mcp add <name> -e K=V -e K=V -- <command> <args...>`, verified
+  2.1.267), so a server name emitted after the env flags was consumed as a
+  malformed env value and `projection reconcile` failed the whole Claude
+  environment with `Invalid environment variable format: <name>` (fingerprint
+  guarded, no partial write). The name now precedes the flags and the command
+  stays after the `--` terminator; Codex `--env` remains single-valued and its
+  argv is unchanged, as is the native Streamable-HTTP branch.
+- Added regression coverage instead of relying on the previously permissive fake
+  CLI: the harness fake Claude CLI now models the variadic contract (non-option
+  tokens consumed as env values, `--` ends the run, a token without `=` is
+  rejected), plus a focused argv assertion and an end-to-end reconcile test. The
+  pre-fix argv reproduces the real failure against that fake. This records a code
+  and test fix only: no client configuration, enrollment or deployment is claimed
+  by this entry.
+
 ### B′ name-delta guidance
 
 - Deferred view switches now return raw `addedTools` / `removedTools` names in

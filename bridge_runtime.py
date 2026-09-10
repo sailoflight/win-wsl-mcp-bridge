@@ -14390,9 +14390,22 @@ def _cli_add_argv(
             for key, value in sorted(headers.items()):
                 argv += ["--header", f"{key}: {value}"]
         return argv
+    if kind == CLIENT_KIND_CLAUDE:
+        # Real Claude Code `-e/--env` is variadic (`<env...>`, verified 2.1.267):
+        # every following non-option token is consumed as another KEY=VALUE, so a
+        # server name placed after the flags is rejected as a malformed env value
+        # ("Invalid environment variable format: <name>"). The name therefore
+        # precedes the flags, and the `--` terminator ends the variadic run before
+        # the command. Codex `--env` stays single-valued.
+        env_flags: list[str] = []
+        for key, value in sorted(entry.get("env", {}).items()):
+            env_flags += ["-e", f"{key}={value}"]
+        argv += (
+            [entry["name"]] + env_flags + ["--", entry["command"]] + list(entry["args"])
+        )
+        return argv
     for key, value in sorted(entry.get("env", {}).items()):
-        flag = "--env" if kind == CLIENT_KIND_CODEX else "-e"
-        argv += [flag, f"{key}={value}"]
+        argv += ["--env", f"{key}={value}"]
     argv += [entry["name"], "--", entry["command"]] + list(entry["args"])
     return argv
 
