@@ -8,11 +8,12 @@ are not current capabilities; fixture checks are not installed-client evidence.
 | Product and command overview | [README](../README.md) |
 | Protocol, transport, trust and module boundaries | [Architecture](ARCHITECTURE.md) |
 | Current supported and unsupported behavior | [MCP coverage](MCP_COVERAGE.md) |
-| Remaining development work | [Development plan](DEVELOPMENT_PLAN.md) |
+| Axis-based development, behavior combinations, dependencies and release gates | [未来开发总计划](DEVELOPMENT_PLAN.md) |
 | Current completion evidence and open gates | [Acceptance ledger](IMPLEMENTATION_STATUS.md) |
 | Offline checks and field acceptance | [Verification](VERIFICATION.md) |
 | Pinned official SDK interoperability | [SDK evidence](SDK_INTEROP.md) |
 | Harness capability probes and MCP tool exposure | [Tool exposure](MCP_TOOL_EXPOSURE.md) |
+| Ten behavior axes, composition constraints, environment evidence and implementation gaps | [桥行为轴与组合矩阵](MCP_EXPOSURE_TAXONOMY.md) |
 | Installation, configuration, recovery and maintenance | [Deployment](DEPLOYMENT.md) |
 | Release changes | [Changelog](../CHANGELOG.md) |
 
