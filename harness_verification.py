@@ -19,6 +19,15 @@ principal.  Strict validation prevents accepting a claimed support boolean,
 missing/reordered evidence, or another challenge's receipt; an actor who can
 fabricate the entire local receipt is inside the project's trusted-OS-user
 boundary.  Attestations are explicitly weaker than protocol observations.
+
+Scope boundary: this module probes the *client Harness* capability only - whether
+a Harness observes tools/list_changed, re-fetches its catalog, and can reach a
+tool discovered after startup.  It deliberately does NOT measure any business
+MCP's tool count, tool-definition volume, or the model-context/token cost of
+exposing that catalog, which are separate per-MCP exposure observations taken by
+the host from an observed catalog.  A negative refresh verdict here therefore
+says nothing about any business MCP's cost or catalog size, and a large business
+catalog says nothing about Harness refresh capability.
 """
 from __future__ import annotations
 
@@ -67,8 +76,10 @@ _INSTRUCTIONS = (
     "schema. Do not read the challenge or receipt into the model to supply a "
     "canary name/proof, manually refetch with a different client, or infer model "
     "visibility from protocol traffic. Record any model-context evidence "
-    "separately as a challenge-bound Agent/human attestation. Stop after the "
-    "canary succeeds and remove this temporary fixture registration."
+    "separately as a challenge-bound Agent/human attestation. This fixture "
+    "measures Harness capability only, never a business MCP's catalog size or "
+    "token cost. Stop after the canary succeeds and remove this temporary "
+    "fixture registration."
 )
 _EVENT_TYPES = (
     "initialized", "initial_catalog", "bootstrap_call", "list_changed",
@@ -78,10 +89,46 @@ _STOP_REASONS = {
     "running", "eof", "timeout", "message-limit", "input-limit",
     "invalid-input", "output-error", "expired",
 }
+# Stop reasons that justify a negative catalog-refresh verdict: the fixture kept
+# an observable window open after emitting the notification, and the Harness
+# never asked for a post-notification catalog.  Excluded, so "not tested" can
+# never be recorded as "does not support":
+#   eof                 the Harness ended the session on its own schedule, so the
+#                       window after the notification is unknown (and a catalog
+#                       request the Harness pipelined before the notification is
+#                       indistinguishable from no request at all)
+#   expired             the challenge ran out of lifetime while handling input
+#   input-limit, invalid-input, output-error
+#                       fixture-side failures that say nothing about the Harness
+_NEGATIVE_VERDICT_STOP_REASONS = frozenset({"timeout", "message-limit"})
 
 
 class ProbeValidationError(ValueError):
     """The bounded probe contract or receipt evidence was not satisfied."""
+
+
+def _refresh_verdict(receipt: dict, supported: bool) -> tuple[str, str]:
+    """Derive the catalog-refresh observation label and capability value.
+
+    Only an observed ``notifications/tools/list_changed`` followed by *no*
+    post-notification catalog and a closed observation window that kept running
+    (see ``_NEGATIVE_VERDICT_STOP_REASONS``) is a negative verdict.  Everything
+    else stays ``unknown`` so recorded evidence never turns "not yet tested" into
+    "does not support".  This observes Harness capability only: it never measures
+    a business MCP's tool count, tool-definition volume, or model-context token
+    cost, which are separate observations taken by the host from an observed
+    catalog.
+    """
+    observations = receipt["observations"]
+    notified = any(item.get("type") == "list_changed" for item in observations)
+    refreshed = any(item.get("type") == "refreshed_catalog" for item in observations)
+    if supported:
+        return "refresh-observed", "supported"
+    if notified and refreshed:
+        return "refreshed-without-canary-completion", "unknown"
+    if notified and receipt["stopReason"] in _NEGATIVE_VERDICT_STOP_REASONS:
+        return "notification-without-refresh", "unsupported"
+    return "no-verdict-yet", "unknown"
 
 
 def _fail(message: str) -> None:
@@ -406,8 +453,9 @@ def validate_probe_receipt(
         _fail("unknown probe stop reason")
     client_info, protocol = _validate_events(challenge, receipt)
     supported = receipt["status"] == "complete"
+    refresh_observation, refresh_capability = _refresh_verdict(receipt, supported)
     capabilities = {
-        "toolsListChanged": "supported" if supported else "unknown",
+        "toolsListChanged": refresh_capability,
         "modelExposure": "unknown", "nativeToolSearch": "unknown",
     }
     evidence: dict[str, Any] = {
@@ -416,6 +464,11 @@ def validate_probe_receipt(
             "observationCount": len(receipt["observations"]),
             "catalogRemoval": "server-catalog-observed" if supported else "unknown",
             "modelSchemaVisibility": "not-proven",
+            "refreshObservation": refresh_observation,
+            # Why this run ended, so a Bridge Agent can tell an observed negative
+            # apart from an untested or still-running capability.
+            "receiptStatus": receipt["status"],
+            "stopReason": receipt["stopReason"],
         },
         "modelExposure": {"source": "unknown"},
         "nativeToolSearch": {"source": "unknown"},

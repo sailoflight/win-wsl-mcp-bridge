@@ -4,6 +4,43 @@ All notable changes to this project are recorded here.
 
 ## 0.4.0 - Unreleased
 
+### Agent-driven capability aspects for the client probe
+
+- The bounded Harness probe now exposes named **aspects** instead of one opaque
+  run: `refresh` (protocol-observed catalog refresh), `harness-protocol`
+  (protocol-observed negotiated revision), `model-exposure` and `native-search`
+  (challenge-bound attestations), and `modern-protocol` (explicitly not
+  observable with this probe version). Each aspect maps to the registry decision
+  it can justify, and `projection probe-client --aspect` prepares one challenge
+  per aspect under `client_probe:<environment-id>:<aspect>`; the pre-aspect key
+  stays readable and recordable and is reported as `legacy`. `projection
+  record-client-verification` consumes the only outstanding challenge when there
+  is exactly one and otherwise requires `--aspect`, and reports the remaining
+  outstanding challenges. Gating is unchanged: only fresh, bound evidence with
+  refresh, model exposure, a shared protocol revision, and observed-unsupported
+  native search enables automatic deferral.
+- Added the read-only `projection probe-status [environment-id]`: per
+  environment it reports each aspect's state (`supported`, `unsupported`,
+  `unknown`, `stale`, `not-probed`, `not-observable`), why recorded evidence does
+  not apply, deferral blockers, every outstanding challenge with its lifetime and
+  paths, and the next concrete observation for each aspect. `projection status`
+  carries the compact per-environment summary. Neither writes nor launches a
+  target, and neither accepts a capability from a client's product name.
+- A negative catalog-refresh verdict is now recorded only when it is
+  evidence-bounded: an observed `notifications/tools/list_changed` with no
+  post-notification catalog and a window that kept running (fixture deadline or
+  exhausted message budget). A session that merely ended, an expired challenge,
+  and fixture-side failures remain `unknown`, because a catalog request the
+  Harness pipelined before the notification is indistinguishable from no request
+  at all. The receipt evidence now carries `refreshObservation`, `receiptStatus`,
+  and `stopReason` so a Bridge Agent can tell an observed negative from an
+  untested capability.
+- Documented the scope boundary explicitly in the probe contract: this probe
+  observes Harness capability only and never measures a business MCP's tool
+  count, tool-definition volume, or the model-context token cost of exposing a
+  catalog. Those remain separate per-MCP exposure observations derived from an
+  observed catalog. No aspect is a substitute for them.
+
 ### Claude Code official-CLI adapter argument order
 
 - Fixed the Claude official-CLI `mcp add` argv: real Claude Code `-e/--env` is

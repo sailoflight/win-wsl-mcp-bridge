@@ -7536,6 +7536,44 @@ class TransportControlJournalTest(unittest.TestCase):
         self.assertIs(args.native_http, False)
         self.assertEqual(args.compatibility_route, "native")
 
+    def test_projection_capability_probe_parsers_are_explicit(self) -> None:
+        parser = build_parser("wsl", 8766, "connect")
+        args = parser.parse_args([
+            "projection", "probe-client", "env-1", "--probe-file", "/tmp/probe.json",
+            "--aspect", "model-exposure", "--confirm",
+        ])
+        self.assertEqual(args.projection_command, "probe-client")
+        self.assertEqual(args.aspect, "model-exposure")
+        self.assertEqual(args.environment_id, "env-1")
+        self.assertIs(args.confirm, True)
+        # The default aspect keeps the legacy single-run workflow unchanged.
+        self.assertEqual(
+            parser.parse_args([
+                "projection", "probe-client", "env-1", "--probe-file", "/tmp/probe.json",
+            ]).aspect,
+            "refresh",
+        )
+        args = parser.parse_args([
+            "projection", "record-client-verification", "env-1", "--receipt", "/tmp/r.json",
+            "--aspect", "refresh",
+        ])
+        self.assertIsNone(parser.parse_args([
+            "projection", "record-client-verification", "env-1", "--receipt", "/tmp/r.json",
+        ]).aspect)
+        self.assertEqual(args.aspect, "refresh")
+        self.assertEqual(args.tool_exposure, "auto")
+        args = parser.parse_args(["projection", "probe-status"])
+        self.assertEqual(args.projection_command, "probe-status")
+        self.assertIsNone(args.environment_id)
+        self.assertEqual(
+            parser.parse_args(["projection", "probe-status", "env-1"]).environment_id, "env-1",
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "projection", "probe-client", "env-1", "--probe-file", "/tmp/probe.json",
+                "--aspect", "tool-token-cost",
+            ])
+
     def test_projection_skips_unsupported_without_blocking_stdio(self) -> None:
         row = {
             "launcher_command": "python3",

@@ -359,6 +359,41 @@ class FixtureStateTests(unittest.TestCase):
                 self.assertEqual(response["result"]["capabilities"], {"tools": {"listChanged": True}})
                 self.assertEqual(probe.validate()["capabilities"]["nativeToolSearch"], "unknown")
 
+    def test_unobserved_refresh_is_negative_only_when_the_window_kept_running(self):
+        # An ended session (eof) leaves the post-notification window unknown, so a
+        # catalog request the Harness pipelined before the notification stays
+        # indistinguishable from no request at all: never a negative verdict.
+        ended = Session()
+        ended.bootstrap()
+        self.assertEqual(len(ended.fixture.receipt["observations"]), 4)
+        ended.fixture.finish("eof")
+        normalized = ended.validate()
+        self.assertEqual(normalized["capabilities"]["toolsListChanged"], "unknown")
+        self.assertEqual(normalized["evidence"]["protocolRefresh"]["refreshObservation"], "no-verdict-yet")
+        self.assertEqual(normalized["evidence"]["protocolRefresh"]["stopReason"], "eof")
+        # A live window that kept running for the whole budget, still with no
+        # post-notification catalog, is the bounded negative observation.
+        for reason in ("timeout", "message-limit"):
+            with self.subTest(stopReason=reason):
+                idle = Session()
+                idle.bootstrap()
+                idle.fixture.finish(reason)
+                normalized = idle.validate()
+                self.assertEqual(normalized["capabilities"]["toolsListChanged"], "unsupported")
+                self.assertEqual(normalized["evidence"]["protocolRefresh"]["refreshObservation"],
+                                 "notification-without-refresh")
+                self.assertEqual(normalized["evidence"]["protocolRefresh"]["receiptStatus"], "incomplete")
+        # A refresh without the completing canary call is real evidence of
+        # refresh, but not of a completed capability, so it stays unknown.
+        partial = Session()
+        partial.bootstrap()
+        partial.send("tools/list")
+        partial.fixture.finish("eof")
+        normalized = partial.validate()
+        self.assertEqual(normalized["capabilities"]["toolsListChanged"], "unknown")
+        self.assertEqual(normalized["evidence"]["protocolRefresh"]["refreshObservation"],
+                         "refreshed-without-canary-completion")
+
     def test_initialization_and_initial_catalog_are_required(self):
         session = Session()
         self.assertIn("error", session.send("tools/list")[-1])
@@ -393,9 +428,10 @@ class FixtureProcessTests(unittest.TestCase):
         self.challenge = hv.create_probe(BINDING)
         self.probe.write_text(json.dumps(self.challenge), encoding="utf-8")
 
-    def start(self):
+    def start(self, command=None):
         process = subprocess.Popen(
-            [sys.executable, "-m", "harness_verification", "--probe", str(self.probe), "--receipt", str(self.receipt)],
+            command or [sys.executable, "-m", "harness_verification",
+                        "--probe", str(self.probe), "--receipt", str(self.receipt)],
             cwd=Path(__file__).resolve().parents[1], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
@@ -474,6 +510,44 @@ class FixtureProcessTests(unittest.TestCase):
         receipt = json.loads(self.receipt.read_text())
         self.assertEqual(len(receipt["observations"]), 4)
         self.assertEqual(hv.validate_probe_receipt(self.challenge, receipt)["capabilities"]["toolsListChanged"], "unknown")
+
+    def test_live_idle_window_records_a_bounded_negative_verdict(self):
+        # The fixture's own run budget is shortened so this stays end-to-end and
+        # fast while the challenge lifetime stays realistic: a timeout stop can
+        # therefore still be validated afterwards, exactly as production would.
+        bootstrap = (
+            "import sys, harness_verification as hv\n"
+            "hv.MAX_RUNTIME_SECONDS = 1.0\n"
+            "raise SystemExit(hv.main(sys.argv[1:]))\n"
+        )
+        process = self.start([sys.executable, "-c", bootstrap,
+                              "--probe", str(self.probe), "--receipt", str(self.receipt)])
+        payloads = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "clientInfo": CLIENT, "capabilities": {}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                "name": self.challenge["tools"]["bootstrap"]}},
+        ]
+        for payload in payloads:
+            process.stdin.write(json.dumps(payload).encode() + b"\n")
+        process.stdin.flush()
+        # Stdin deliberately stays open: the Harness is still running and simply
+        # never asks for the post-notification catalog within the whole budget.
+        self.assertEqual(process.wait(timeout=15), 2)
+        process.stdin.close()
+        process.stdin = None
+        self.assertEqual(process.stderr.read(), b"")
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["stopReason"], "timeout")
+        self.assertEqual([event["type"] for event in receipt["observations"]], [
+            "initialized", "initial_catalog", "bootstrap_call", "list_changed",
+        ])
+        normalized = hv.validate_probe_receipt(self.challenge, receipt)
+        self.assertEqual(normalized["capabilities"]["toolsListChanged"], "unsupported")
+        self.assertEqual(normalized["evidence"]["protocolRefresh"]["refreshObservation"],
+                         "notification-without-refresh")
 
     def test_open_idle_stdin_has_a_deadline(self):
         self.challenge["expiresAt"] = time.time() + 0.5

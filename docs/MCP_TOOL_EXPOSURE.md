@@ -140,10 +140,12 @@ that session, and records its evidence. No user-entered support boolean or
 product-name lookup enables this feature. Preparing a probe does not invoke a
 model, change a real Harness profile, or spend API quota.
 
-1. `projection probe-client <environment-id> --probe-file <new-local-file> --dry-run`
-   previews preparation. With `--confirm`, it writes a short-lived challenge,
-   binds it to the enrolled environment and current configuration SHA-256, and
-   returns the exact fixture command plus the expected receipt path.
+1. `projection probe-client <environment-id> --probe-file <new-local-file>
+   --aspect <aspect> --dry-run` previews preparation. With `--confirm`, it writes
+   a short-lived challenge, binds it to the enrolled environment and current
+   configuration SHA-256, and returns the exact fixture command, the expected
+   receipt path, the Agent steps for that aspect, and the matching
+   `record-client-verification` argv.
 2. The Bridge Agent runs the fixture in the authorized target session. The
    fixture starts with a bootstrap tool, emits a directory-change notification,
    observes a subsequent list containing a new canary schema, and requires the
@@ -159,11 +161,12 @@ model, change a real Harness profile, or spend API quota.
    require instantaneous visibility in the call that triggered expansion. The
    complete bound probe and model-context evidence remain required for enrollment.
 4. `projection record-client-verification <environment-id> --receipt <file>
-   --tool-exposure auto --dry-run` validates the complete result. `--confirm`
-   consumes the current challenge and stores verified evidence. Expired probes,
-   changed configuration fingerprints, foreign environments, and replayed
-   receipts are rejected. This updates enrollment only; applying a client
-   configuration remains a separate `projection reconcile` operation.
+   --aspect <aspect> --tool-exposure auto --dry-run` validates the complete
+   result. `--confirm` consumes that aspect's challenge and stores verified
+   evidence. Expired probes, changed configuration fingerprints, foreign
+   environments, and replayed receipts are rejected. This updates enrollment
+   only; applying a client configuration remains a separate `projection
+   reconcile` operation.
 
 The fixture is an offline stdio MCP, exposed by `python -m harness_verification`.
 The Bridge Agent chooses a target Harness's supported isolation/configuration
@@ -171,6 +174,66 @@ workflow; the bridge does not invent a universal CLI for launching DSH, Codex,
 or Claude Code, and does not execute any Harness or model implicitly. Actual
 installation, client-profile changes and model costs require their own authority.
 An unavailable observation remains unknown instead of being inferred from docs.
+
+### Capability aspects: exploring registry support from an Agent
+
+`projection probe-status` is the read-only starting point. It reports, per
+enrolled environment, which registry decision each **aspect** has actually
+established, why recorded evidence does or does not still apply, which prepared
+challenges are outstanding, and the next concrete observation. It never writes,
+never launches a target, and never accepts a capability from a product name:
+
+```bash
+python3 wsl-bridge-mcp/bridge.py projection probe-status \
+    --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3
+python3 wsl-bridge-mcp/bridge.py projection probe-status <environment-id> \
+    --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3
+```
+
+An aspect names the Harness-side observation that can justify one registry or
+enrollment decision. One bounded fixture run observes the whole environment, so
+an aspect selects *which prepared challenge an Agent consumes and which decision
+it is establishing*, not a different fixture.
+
+| Aspect | Registry field | Observation | Establishes |
+|---|---|---|---|
+| `refresh` | `tool_exposure` | protocol-observed | The Harness re-lists after `notifications/tools/list_changed`. |
+| `harness-protocol` | `compatibility_route` | protocol-observed | The negotiated revision is one this host also verified. |
+| `model-exposure` | `tool_exposure` | challenge-bound attestation | The model is actually shown the discovered tool definitions. |
+| `native-search` | `tool_exposure` | challenge-bound attestation | The Harness has (or lacks) its own tool search, which decides automatic deferral. |
+| `modern-protocol` | `compatibility_route` | not observable here | Deliberately unclaimed: the bounded fixture speaks legacy revisions only. |
+
+Each aspect is prepared and consumed as its own challenge (meta key
+`client_probe:<environment-id>:<aspect>`), so an Agent can work one aspect at a
+time without a later preparation overwriting an earlier one. A challenge prepared
+before per-aspect keys (`client_probe:<environment-id>`) stays readable and
+recordable and is reported as `legacy`: its intent is unknown, so it is never
+reported as a specific aspect. `probe-client --aspect` defaults to `refresh`;
+`record-client-verification` consumes the only outstanding challenge when there
+is exactly one and otherwise requires `--aspect`. Every prepared challenge stays
+visible in `probe-status` until it is consumed.
+
+Each aspect state is one of:
+
+| State | Meaning |
+|---|---|
+| `supported` / `unsupported` | Fresh recorded evidence for this exact environment, client kind, and configuration fingerprint. |
+| `unknown` | The recorded run did not establish it; never a negative claim. |
+| `stale` | Evidence exists, but expiry, a configuration change, or a binding mismatch invalidates it (reasons are reported). |
+| `not-probed` | No recorded verification for this environment yet. |
+| `not-observable` | A property of this probe version, never of the target Harness. |
+
+A negative refresh verdict is deliberately narrow: it requires an *observed*
+`notifications/tools/list_changed` followed by no post-notification catalog and a
+closed window that kept running (the fixture's own deadline elapsed, or the
+Harness exhausted its message budget). A session that merely ended, a challenge
+that expired, and every fixture-side failure stay `unknown`, because a catalog
+request the Harness pipelined before the notification is indistinguishable from
+no request at all. This probe therefore observes Harness capability only: it
+never measures a business MCP's tool count, tool-definition volume, or the
+model-context token cost of exposing a catalog. Those are separate per-MCP
+exposure observations derived from an observed catalog, and no aspect is a proxy
+for them.
 
 Evidence is scoped to the observed client build, protocol, configuration, and
 model-context attestation. Challenge validity is 15 minutes; recorded verification

@@ -12617,11 +12617,17 @@ def build_parser(default_side: str, default_local_port: int, default_link_mode: 
     enroll.add_argument("--confirm", action="store_true")
 
     probe_client = projection_sub.add_parser(
-        "probe-client", help="prepare an isolated client capability probe for a Bridge Agent",
+        "probe-client",
+        help="prepare an isolated client capability probe for a Bridge Agent "
+             "(one aspect per prepared challenge; run --aspect to select)",
     )
     probe_client.add_argument("environment_id")
     probe_client.add_argument("--projection")
     probe_client.add_argument("--probe-file", required=True)
+    probe_client.add_argument(
+        "--aspect", choices=sorted(CLIENT_CAPABILITY_ASPECTS), default="refresh",
+        help="registry decision this prepared challenge is meant to establish",
+    )
     probe_client.add_argument("--dry-run", action="store_true")
     probe_client.add_argument("--confirm", action="store_true")
     record_client = projection_sub.add_parser(
@@ -12631,8 +12637,19 @@ def build_parser(default_side: str, default_local_port: int, default_link_mode: 
     record_client.add_argument("--projection")
     record_client.add_argument("--receipt", required=True)
     record_client.add_argument("--tool-exposure", choices=["native", "auto", "deferred"], default="auto")
+    record_client.add_argument(
+        "--aspect", choices=sorted(CLIENT_CAPABILITY_ASPECTS), default=None,
+        help="prepared challenge to consume; required only when several are outstanding",
+    )
     record_client.add_argument("--dry-run", action="store_true")
     record_client.add_argument("--confirm", action="store_true")
+    probe_status = projection_sub.add_parser(
+        "probe-status",
+        help="read-only: per-environment client capability evidence, outstanding "
+             "challenges, and the next observation for each aspect",
+    )
+    probe_status.add_argument("environment_id", nargs="?")
+    probe_status.add_argument("--projection")
 
     unenroll = projection_sub.add_parser(
         "unenroll",
@@ -13613,25 +13630,17 @@ def _effective_tool_exposure(row: Any) -> str:
         raise BridgeError("invalid recorded tool exposure mode")
     if mode == "native":
         return mode
-    evidence = _row_harness_verification(row)
-    capabilities = evidence.get("capabilities", {})
+    state = _harness_evidence_state(row)
+    capabilities = state["capabilities"]
     if not isinstance(capabilities, dict):
         raise BridgeError("invalid recorded harness capabilities")
     # An observation proves this exact environment only; no universal claim
     # about the named Harness. Expired/absent evidence cannot enable deferral.
-    fresh = (
-        evidence.get("environmentId") == row["environment_id"]
-        and evidence.get("clientKind") == row["client_kind"]
-        and evidence.get("projectionConfigFingerprint", evidence.get("configFingerprint"))
-            == _harness_config_fingerprint(row)
-        and isinstance(evidence.get("validUntil"), (int, float))
-        and evidence["validUntil"] > time.time()
-    )
     usable = (
-        fresh
+        state["fresh"]
         and capabilities.get("toolsListChanged") == "supported"
         and capabilities.get("modelExposure") == "supported"
-        and evidence.get("protocolVersion") in SHARED_COMPATIBLE_PROTOCOL_VERSIONS
+        and state["evidence"].get("protocolVersion") in SHARED_COMPATIBLE_PROTOCOL_VERSIONS
     )
     if mode == "deferred":
         if not usable:
@@ -13640,6 +13649,359 @@ def _effective_tool_exposure(row: Any) -> str:
     if not usable or capabilities.get("nativeToolSearch") != "unsupported":
         return "native"
     return "deferred"
+
+
+# ---- Client capability aspects (probe <-> registry adaptation) -------------
+#
+# One aspect names the Harness-side observation that can justify one registry or
+# enrollment decision, so a Bridge Agent can explore how far an enrolled target
+# environment really supports what this host projects.  The bounded fixture in
+# harness_verification.py observes the whole environment in a single run; the
+# aspect selects the decision the Agent intends to establish and therefore which
+# prepared challenge it consumes.
+#
+# Scope boundary: this probe observes Harness capability only.  It never measures
+# a business MCP's tool count, tool-definition volume, or the model-context token
+# cost of exposing a catalog.  Those are per-MCP exposure observations derived
+# from an observed catalog (see deferred_tools.py) and recorded separately, so no
+# aspect here may be used as a proxy for a token or catalog-volume measurement.
+
+CLIENT_CAPABILITY_ASPECTS: dict[str, dict[str, Any]] = {
+    "refresh": {
+        "capability": "toolsListChanged",
+        "observation": "protocol-observed",
+        "registryField": "tool_exposure",
+        "decision": "deferred (library-collapsed) exposure requires an observed "
+                    "post-notification catalog refresh",
+        "runnable": True,
+        "agentSteps": (
+            "Prepare this aspect's challenge with projection probe-client --aspect refresh.",
+            "In an explicitly authorized isolated session of the enrolled Harness, run the "
+            "printed fixture command as the Harness's MCP server.",
+            "Let the Harness initialize, call the bootstrap tool it discovers, process "
+            "notifications/tools/list_changed, re-list, and call the canary with the proof "
+            "from the refreshed catalog.",
+            "Record the receipt with projection record-client-verification.",
+        ),
+    },
+    "harness-protocol": {
+        "capability": "protocolVersion",
+        "observation": "protocol-observed",
+        "registryField": "compatibility_route",
+        "decision": "deferral requires a legacy revision this host also verified",
+        "runnable": True,
+        "supportedValues": tuple(sorted(SHARED_COMPATIBLE_PROTOCOL_VERSIONS)),
+        "agentSteps": (
+            "Run the same bounded fixture in an isolated session of the enrolled Harness.",
+            "The negotiated revision is observed during initialize and recorded with the receipt.",
+            "A revision outside this host's verified set keeps the environment on the configured route.",
+        ),
+    },
+    "model-exposure": {
+        "capability": "modelExposure",
+        "observation": "challenge-bound-attestation",
+        "registryField": "tool_exposure",
+        "decision": "deferred exposure requires the model to be shown the discovered "
+                    "tool definitions",
+        "runnable": True,
+        "agentSteps": (
+            "Run the same bounded fixture in an isolated session of the enrolled Harness.",
+            "Observe, in the model context, whether the post-notification tool definitions are "
+            "actually visible to the model.",
+            "The fixture alone cannot prove model exposure: record that observation as a "
+            "challenge-bound attestation inside the receipt before recording it.",
+        ),
+    },
+    "native-search": {
+        "capability": "nativeToolSearch",
+        "observation": "challenge-bound-attestation",
+        "registryField": "tool_exposure",
+        "decision": "automatic exposure collapses the catalog only when the Harness has "
+                    "no native tool search",
+        "runnable": True,
+        "agentSteps": (
+            "Run the same bounded fixture in an isolated session of the enrolled Harness.",
+            "Observe whether the Harness exposes its own tool-search or hidden-tool invocation "
+            "instead of a full catalog.",
+            "Record that observation as a challenge-bound attestation inside the receipt; "
+            "protocol traffic never proves it.",
+        ),
+    },
+    "modern-protocol": {
+        "capability": "protocolVersion",
+        "observation": "not-observable",
+        "registryField": "compatibility_route",
+        "decision": "modern discovery/subscription support is not observable with this "
+                    "probe version and stays unclaimed",
+        "runnable": False,
+        "agentSteps": (
+            "Not runnable: the bounded fixture deliberately speaks legacy revisions only and "
+            "answers server/discover and subscriptions/listen with an error.",
+            "A modern revision must never be inferred from a Harness's product name; observe it "
+            "with a separate, explicitly authorized fixture if it is needed.",
+        ),
+    },
+}
+
+_PROBE_META_PREFIX = "client_probe:"
+#: Prepared challenges from before per-aspect keys.  The fixture is identical for
+#: every aspect, so a legacy challenge is still recordable, but its intent is
+#: unknown and is therefore never reported as a specific aspect.
+_PROBE_META_LEGACY_ASPECT = "legacy"
+
+
+def _harness_evidence_state(row: Any) -> dict[str, Any]:
+    """Recorded client evidence plus exactly why it does or does not apply now.
+
+    A recorded observation is bound to one environment, one client kind, and one
+    configuration fingerprint, and it carries its own completion lifetime.  Any
+    mismatch is reported as a reason instead of silently narrowing a catalog.
+    """
+    evidence = _row_harness_verification(row)
+    reasons: list[str] = []
+    if not evidence:
+        reasons.append("no recorded client verification for this environment")
+    else:
+        if evidence.get("environmentId") != row["environment_id"]:
+            reasons.append("recorded verification is bound to a different environment")
+        if evidence.get("clientKind") != row["client_kind"]:
+            reasons.append("recorded verification is bound to a different client kind")
+        recorded = evidence.get(
+            "projectionConfigFingerprint", evidence.get("configFingerprint")
+        )
+        if recorded != _harness_config_fingerprint(row):
+            reasons.append("the enrolled client configuration changed after this verification")
+        valid_until = evidence.get("validUntil")
+        if not isinstance(valid_until, (int, float)):
+            reasons.append("recorded verification records no completion lifetime")
+        elif valid_until <= time.time():
+            reasons.append("recorded verification expired")
+    return {
+        "evidence": evidence,
+        "capabilities": evidence.get("capabilities", {}),
+        "fresh": not reasons,
+        "reasons": reasons,
+        "verifiedAt": evidence.get("verifiedAt"),
+        "validUntil": evidence.get("validUntil"),
+    }
+
+
+def _aspect_observation(aspect: str, state: dict[str, Any]) -> tuple[str, Any]:
+    """Current state and observed value for one aspect.
+
+    ``not-observable`` is a property of this probe version, never of the target
+    Harness; ``unknown`` means the recorded run simply did not establish it.
+    """
+    definition = CLIENT_CAPABILITY_ASPECTS[aspect]
+    if not definition["runnable"]:
+        return "not-observable", None
+    if not state["evidence"]:
+        return "not-probed", None
+    if not state["fresh"]:
+        return "stale", None
+    capability = definition["capability"]
+    if "supportedValues" in definition:
+        observed = state["evidence"].get(capability)
+        if not isinstance(observed, str):
+            return "unknown", None
+        supported = observed in definition["supportedValues"]
+        return ("supported" if supported else "unsupported"), observed
+    capabilities = state["capabilities"]
+    observed = capabilities.get(capability) if isinstance(capabilities, dict) else None
+    if observed in {"supported", "unsupported"}:
+        return str(observed), observed
+    return "unknown", observed if isinstance(observed, str) else None
+
+
+def _read_probe_record(raw: str) -> dict[str, Any]:
+    """Accept both the enveloped per-aspect record and the legacy bare challenge."""
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        raise BridgeError("invalid outstanding client probe record") from None
+    if not isinstance(value, dict):
+        raise BridgeError("invalid outstanding client probe record")
+    if "challenge" in value:
+        challenge = value["challenge"]
+        if not isinstance(challenge, dict):
+            raise BridgeError("invalid outstanding client probe challenge")
+        return {
+            "challenge": challenge,
+            "aspect": value.get("aspect"),
+            "probeFile": value.get("probeFile"),
+            "receiptFile": value.get("receiptFile"),
+            "enveloped": True,
+        }
+    return {
+        "challenge": value, "aspect": None, "probeFile": None,
+        "receiptFile": None, "enveloped": False,
+    }
+
+
+def _probe_records(
+    connection: sqlite3.Connection, environment_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Unconsumed prepared challenges for one environment, keyed by aspect."""
+    prefix = _PROBE_META_PREFIX + environment_id
+    rows = connection.execute(
+        "SELECT key, value FROM projection_meta WHERE key LIKE ?",
+        (_PROBE_META_PREFIX + "%",),
+    ).fetchall()
+    records: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row["key"])
+        if key == prefix:
+            aspect = _PROBE_META_LEGACY_ASPECT
+        elif key.startswith(prefix + ":"):
+            aspect = key[len(prefix) + 1:]
+        else:
+            continue
+        record = _read_probe_record(str(row["value"]))
+        record["aspect"] = aspect
+        record["metaKey"] = key
+        records[aspect] = record
+    return records
+
+
+def _outstanding_client_probes(
+    connection: sqlite3.Connection, environment_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Bounded summaries of unconsumed prepared challenges, keyed by aspect.
+
+    Preparation alone proves nothing: this is local challenge state, not a
+    capability.  Challenges are reported with their lifetime so a Bridge Agent
+    can tell an outstanding, expired, or legacy challenge apart.
+    """
+    outstanding: dict[str, dict[str, Any]] = {}
+    for aspect, record in _probe_records(connection, environment_id).items():
+        challenge = record["challenge"]
+        expires = challenge.get("expiresAt")
+        binding = challenge.get("binding")
+        binding = binding if isinstance(binding, dict) else {}
+        outstanding[aspect] = {
+            "aspect": aspect,
+            "metaKey": record["metaKey"],
+            "probeId": challenge.get("probeId"),
+            "issuedAt": challenge.get("issuedAt"),
+            "expiresAt": expires,
+            "expiresInSeconds": (
+                round(expires - time.time(), 3) if isinstance(expires, (int, float)) else None
+            ),
+            "expired": isinstance(expires, (int, float)) and expires <= time.time(),
+            "probeFile": record["probeFile"],
+            "receiptFile": record["receiptFile"],
+            "configFingerprint": binding.get("configFingerprint"),
+            "knownAspect": aspect in CLIENT_CAPABILITY_ASPECTS,
+        }
+    return outstanding
+
+
+def _probe_next_action(challenge: dict[str, Any]) -> str:
+    if challenge["expired"]:
+        return ("this prepared challenge expired; prepare a fresh one for aspect "
+                + str(challenge["aspect"]))
+    if challenge["probeFile"]:
+        return ("run the printed fixture command, then record-client-verification with "
+                + str(challenge["receiptFile"]))
+    return "run the prepared fixture in an isolated target session, then record the receipt"
+
+
+def _capability_checklist(
+    row: Any, outstanding: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Per-aspect adaptation report for one enrollment, with the next observation."""
+    state = _harness_evidence_state(row)
+    mode = _env_row_field(row, "tool_exposure", "native")
+    try:
+        effective = _effective_tool_exposure(row)
+        exposure_error = None
+    except BridgeError as exc:
+        effective, exposure_error = "invalid", str(exc)
+    capabilities = state["capabilities"] if isinstance(state["capabilities"], dict) else {}
+    items: list[dict[str, Any]] = []
+    actions: list[str] = []
+    for aspect, definition in CLIENT_CAPABILITY_ASPECTS.items():
+        observed_state, value = _aspect_observation(aspect, state)
+        challenge = outstanding.get(aspect)
+        if not definition["runnable"]:
+            action = None
+        elif challenge is not None:
+            action = _probe_next_action(challenge)
+        elif observed_state == "stale":
+            action = ("re-observe this aspect: " + "; ".join(state["reasons"]))
+        elif observed_state == "supported":
+            action = ("evidence applies until " + _utc_text(state["validUntil"])
+                      + "; re-observe before it expires")
+        elif observed_state == "unsupported":
+            action = ("observed negative; it remains recorded evidence, and re-observing is "
+                      "the only way to change it")
+        elif observed_state == "unknown":
+            action = ("not established by the bounded fixture alone; "
+                      + definition["agentSteps"][-1])
+        else:
+            action = ("prepare the aspect challenge with projection probe-client --aspect "
+                      + aspect)
+        items.append({
+            "aspect": aspect,
+            "state": observed_state,
+            "capability": definition["capability"],
+            "capabilityValue": value,
+            "observation": definition["observation"],
+            "registryField": definition["registryField"],
+            "decision": definition["decision"],
+            "outstandingChallenge": challenge,
+            "nextAction": action,
+            "agentSteps": list(definition["agentSteps"]),
+        })
+        if action is not None:
+            actions.append(action)
+    blockers: list[str] = []
+    if mode == "native":
+        blockers.append("this environment records native exposure: no deferral is requested")
+    else:
+        blockers.extend(state["reasons"])
+        for aspect in ("refresh", "model-exposure"):
+            capability = CLIENT_CAPABILITY_ASPECTS[aspect]["capability"]
+            if capabilities.get(capability) != "supported":
+                blockers.append(
+                    aspect + " is not proven ("
+                    + capability + "=" + str(capabilities.get(capability, "unknown")) + ")"
+                )
+        protocol = state["evidence"].get("protocolVersion")
+        if protocol not in SHARED_COMPATIBLE_PROTOCOL_VERSIONS:
+            blockers.append("observed protocol revision " + str(protocol)
+                            + " is not a revision this host verified")
+        if mode == "auto" and capabilities.get("nativeToolSearch") == "supported":
+            blockers.append("the Harness has native tool search, so automatic exposure stays native")
+        try:
+            stdio = bool(json.loads(row["transport_capabilities_json"]).get("stdio"))
+        except (TypeError, ValueError):
+            stdio = False
+        if row["compatibility_route"] != "native" or not stdio:
+            blockers.append("deferred exposure requires the native stdio route and stdio capability")
+    return {
+        "environmentId": row["environment_id"],
+        "toolExposure": mode,
+        "effectiveToolExposure": effective,
+        "toolExposureError": exposure_error,
+        "toolExposureBlockers": blockers,
+        "evidenceFresh": state["fresh"],
+        "evidenceReasons": state["reasons"],
+        "verifiedAt": state["verifiedAt"],
+        "validUntil": state["validUntil"],
+        "capabilities": items,
+        "outstandingChallenges": sorted(
+            outstanding.values(), key=lambda item: str(item["aspect"]),
+        ),
+        "nextActions": actions,
+    }
+
+
+def _utc_text(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "an unknown time"
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
+
 
 
 def _default_launcher(side: str) -> tuple[str, list[str]]:
@@ -15273,15 +15635,27 @@ def projection_enroll(
 
 def projection_probe_client(
     *, projection: Path, environment_id: str, probe_file: Path,
-    confirm: bool = False, dry_run: bool = False,
+    aspect: str = "refresh", confirm: bool = False, dry_run: bool = False,
 ) -> dict[str, Any]:
     """Prepare a bound harmless probe; the Bridge Agent owns target execution.
 
     Preparing never invokes a model, changes a target client profile, or assumes
     any client feature from its name. Only confirmed local challenge state is
     written. The target runs the fixture in an explicitly authorized session.
+    ``aspect`` selects which registry decision the prepared challenge is meant to
+    establish; the fixture observes the whole environment either way.
     """
     from harness_verification import create_probe
+    if aspect not in CLIENT_CAPABILITY_ASPECTS:
+        raise BridgeError(
+            "unknown client capability aspect; choose one of: "
+            + ", ".join(sorted(CLIENT_CAPABILITY_ASPECTS))
+        )
+    if not CLIENT_CAPABILITY_ASPECTS[aspect]["runnable"]:
+        raise BridgeError(
+            "aspect " + aspect + " is not observable with this probe version: "
+            + " ".join(CLIENT_CAPABILITY_ASPECTS[aspect]["agentSteps"])
+        )
     if not dry_run and not confirm:
         raise BridgeError("preparing client verification requires --confirm or --dry-run")
     database = ProjectionDatabase(projection, observe_only=dry_run)
@@ -15317,14 +15691,32 @@ def projection_probe_client(
                 json.dump(challenge, handle, ensure_ascii=False, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
-            database.set_meta(connection, "client_probe:" + environment_id, _canonical_json(challenge))
+            database.set_meta(
+                connection, _PROBE_META_PREFIX + environment_id + ":" + aspect,
+                _canonical_json({
+                    "aspect": aspect, "challenge": challenge,
+                    "probeFile": str(probe_file), "receiptFile": str(receipt_file),
+                    "preparedAtNs": time.time_ns(),
+                }),
+            )
             database.record_history(
                 connection, environment_id=environment_id,
                 revision=database.current_revision(connection), action="client_probe",
-                ok=True, detail="prepared bound client probe " + challenge["probeId"],
+                ok=True, detail="prepared bound client probe " + challenge["probeId"]
+                + " for aspect " + aspect,
             )
+    definition = CLIENT_CAPABILITY_ASPECTS[aspect]
+    record_command = [
+        "projection", "record-client-verification", environment_id,
+        "--receipt", str(receipt_file), "--aspect", aspect,
+        "--tool-exposure", "auto", "--confirm",
+    ]
     return {
         "ok": True, "dryRun": dry_run, "environmentId": environment_id,
+        "aspect": aspect, "capability": definition["capability"],
+        "observation": definition["observation"],
+        "registryField": definition["registryField"],
+        "decision": definition["decision"],
         "probeId": challenge["probeId"], "probeFile": str(probe_file),
         "receiptFile": str(receipt_file),
         "fixture": {"command": sys.executable, "args": [
@@ -15332,20 +15724,37 @@ def projection_probe_client(
             "--probe", str(probe_file),
             "--receipt", str(receipt_file),
         ]},
-        "next": "Bridge Agent: run this harmless fixture in an authorized isolated target Harness session; observe model exposure and native search separately; then record-client-verification with the receipt. Preparation does not run the target or verify its capabilities.",
+        "agentSteps": list(definition["agentSteps"]),
+        "recordCommand": record_command,
+        "next": "Bridge Agent: run this harmless fixture in an authorized isolated target Harness "
+                "session, then record the receipt with record-client-verification "
+                "(same Bridge CLI entry point as this command). Preparation does not run the "
+                "target or verify its capabilities, and this probe never measures a business "
+                "MCP's tool count or token cost.",
     }
 
 
 def projection_record_client_verification(
     *, projection: Path, environment_id: str, receipt_file: Path,
-    tool_exposure: str = "auto", confirm: bool = False, dry_run: bool = False,
+    tool_exposure: str = "auto", aspect: str | None = None,
+    confirm: bool = False, dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Validate and consume one probe receipt before recording client evidence."""
+    """Validate and consume one probe receipt before recording client evidence.
+
+    One receipt observes the whole environment, so ``aspect`` only selects which
+    prepared challenge is consumed.  When it is omitted, a single outstanding
+    challenge is consumed and several require an explicit choice.
+    """
     from harness_verification import validate_probe_receipt
     if not dry_run and not confirm:
         raise BridgeError("recording client verification requires --confirm or --dry-run")
     if tool_exposure not in {"native", "auto", "deferred"}:
         raise BridgeError("unknown tool exposure mode")
+    if aspect is not None and aspect not in CLIENT_CAPABILITY_ASPECTS:
+        raise BridgeError(
+            "unknown client capability aspect; choose one of: "
+            + ", ".join(sorted(CLIENT_CAPABILITY_ASPECTS))
+        )
     if not receipt_file.is_file() or receipt_file.stat().st_size > 1024 * 1024:
         raise BridgeError("verification receipt must be a bounded regular file")
     receipt = json.loads(receipt_file.read_text(encoding="utf-8"))
@@ -15356,10 +15765,29 @@ def projection_record_client_verification(
         row = database.environment_row(connection, environment_id)
         if row is None or not row["enabled"]:
             raise BridgeError("client verification requires an enabled enrolled environment")
-        raw = database.meta_value(connection, "client_probe:" + environment_id)
-        if raw is None:
+        records = _probe_records(connection, environment_id)
+        outstanding = _outstanding_client_probes(connection, environment_id)
+        if not records:
             raise BridgeError("no unconsumed client probe for this environment")
-        challenge = json.loads(raw)
+        if aspect is None:
+            if len(records) > 1:
+                raise BridgeError(
+                    "several unconsumed client probes; select one with --aspect: "
+                    + ", ".join(sorted(records))
+                )
+            aspect = next(iter(records))
+        record = records.get(aspect)
+        if record is None:
+            raise BridgeError(
+                "no unconsumed client probe for aspect " + aspect + "; outstanding: "
+                + ", ".join(sorted(records))
+            )
+        if outstanding[aspect]["expired"]:
+            raise BridgeError(
+                "the prepared client probe for aspect " + aspect
+                + " expired; prepare a fresh one"
+            )
+        challenge = record["challenge"]
         evidence = validate_probe_receipt(challenge, receipt)
         if (
             evidence.get("environmentId") != environment_id
@@ -15384,15 +15812,26 @@ def projection_record_client_verification(
                 "harness_verification_json = ?, updated_at_ns = ? WHERE environment_id = ?",
                 (tool_exposure, updated["harness_verification_json"], time.time_ns(), environment_id),
             )
-            connection.execute("DELETE FROM projection_meta WHERE key = ?", ("client_probe:" + environment_id,))
+            connection.execute("DELETE FROM projection_meta WHERE key = ?", (record["metaKey"],))
             database.append_outbox(
                 connection, "enrollment_changed", environment_id=environment_id,
                 detail="recorded client probe " + evidence["probeId"],
             )
+        remaining = [
+            item for key, item in _outstanding_client_probes(connection, environment_id).items()
+            if key != aspect
+        ]
+    definition = CLIENT_CAPABILITY_ASPECTS.get(aspect, {})
+    capability = definition.get("capability")
+    capabilities = evidence.get("capabilities", {})
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
     return {
         "ok": True, "dryRun": dry_run, "environmentId": environment_id,
+        "aspect": aspect, "capability": capability,
+        "capabilityValue": capabilities.get(capability) if capability else None,
         "toolExposure": tool_exposure, "effectiveToolExposure": effective,
         "verification": evidence, "configurationApplied": False,
+        "outstandingChallenges": sorted(remaining, key=lambda item: str(item["aspect"])),
     }
 
 
@@ -16262,13 +16701,116 @@ def projection_watch(
     return 0
 
 
+def _safe_capability_report(
+    row: Any, outstanding: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Capability checklist for read-only reporting; never fails a whole report."""
+    try:
+        return _capability_checklist(row, outstanding)
+    except BridgeError as exc:
+        return {
+            "environmentId": row["environment_id"],
+            "error": str(exc),
+            "toolExposure": _env_row_field(row, "tool_exposure", "native"),
+            "effectiveToolExposure": None,
+            "toolExposureBlockers": [str(exc)],
+            "evidenceFresh": False,
+            "evidenceReasons": [str(exc)],
+            "capabilities": [],
+            "outstandingChallenges": sorted(
+                outstanding.values(), key=lambda item: str(item["aspect"]),
+            ),
+            "nextActions": [],
+        }
+
+
+def projection_probe_status(
+    *, projection: Path, environment_id: str | None = None,
+) -> dict[str, Any]:
+    """Read-only adaptation report for Bridge Agents.
+
+    Reports, per enrolled environment, which registry decision each capability
+    aspect has actually established, why recorded evidence does or does not
+    still apply, which prepared challenges are outstanding, and the next concrete
+    observation.  It never writes, never launches a target, and never accepts a
+    claimed capability from a client's product name.  It also never reports a
+    business MCP's tool count or token cost: that is a separate per-MCP exposure
+    measurement.
+    """
+    database = ProjectionDatabase(projection, observe_only=True)
+    with database._connect() as connection:
+        rows = database.environment_rows(connection)
+        selected = [
+            (row, _outstanding_client_probes(connection, row["environment_id"]))
+            for row in rows
+            if environment_id is None or row["environment_id"] == environment_id
+        ]
+        reports = [
+            (row, _safe_capability_report(row, outstanding)) for row, outstanding in selected
+        ]
+    if environment_id is not None and not reports:
+        raise BridgeError(f"unknown environment: {environment_id}")
+    environments = []
+    for row, report in reports:
+        environments.append({
+            "environmentId": row["environment_id"],
+            "clientKind": row["client_kind"],
+            "configPath": row["config_path"],
+            "enabled": bool(row["enabled"]),
+            "applyAdapter": row["apply_adapter"],
+            "toolExposure": report["toolExposure"],
+            "effectiveToolExposure": report["effectiveToolExposure"],
+            "toolExposureBlockers": report["toolExposureBlockers"],
+            "evidenceFresh": report["evidenceFresh"],
+            "evidenceReasons": report["evidenceReasons"],
+            "verifiedAt": report.get("verifiedAt"),
+            "validUntil": report.get("validUntil"),
+            "capabilities": report["capabilities"],
+            "outstandingChallenges": report["outstandingChallenges"],
+            "nextActions": report["nextActions"],
+        })
+    return {
+        "database": str(database.path),
+        "environmentCount": len(environments),
+        "environments": environments,
+        "aspects": [
+            {
+                "aspect": name,
+                "capability": definition["capability"],
+                "observation": definition["observation"],
+                "registryField": definition["registryField"],
+                "decision": definition["decision"],
+                "runnable": bool(definition["runnable"]),
+                "agentSteps": list(definition["agentSteps"]),
+            }
+            for name, definition in CLIENT_CAPABILITY_ASPECTS.items()
+        ],
+        "scope": "Harness capability evidence only; this probe never measures a business MCP's "
+                 "tool count, tool-definition volume, or model-context token cost.",
+    }
+
+
 def projection_status(*, projection: Path) -> dict[str, Any]:
     ProjectionDatabase.ensure(projection)
     database = ProjectionDatabase(projection)
     with database._connect() as connection:
-        environments = [
-            _environment_summary(row) for row in database.environment_rows(connection)
-        ]
+        rows = database.environment_rows(connection)
+        environments = [_environment_summary(row) for row in rows]
+        capability = {
+            row["environment_id"]: _safe_capability_report(
+                row, _outstanding_client_probes(connection, row["environment_id"]),
+            )
+            for row in rows
+        }
+        for summary in environments:
+            report = capability.get(summary["environmentId"], {})
+            summary["effectiveToolExposure"] = report.get("effectiveToolExposure")
+            summary["capabilityStates"] = {
+                item["aspect"]: item["state"] for item in report.get("capabilities", [])
+            }
+            summary["outstandingChallenges"] = [
+                item["aspect"] for item in report.get("outstandingChallenges", [])
+            ]
         projections = [
             {
                 "environmentId": row["environment_id"],
@@ -16428,14 +16970,21 @@ def _projection_cli_main(args: argparse.Namespace, *, default_side: str) -> int:
         if command == "probe-client":
             _print_json(projection_probe_client(
                 projection=projection, environment_id=args.environment_id,
-                probe_file=Path(args.probe_file), confirm=args.confirm, dry_run=args.dry_run,
+                probe_file=Path(args.probe_file), aspect=args.aspect,
+                confirm=args.confirm, dry_run=args.dry_run,
             ))
             return 0
         if command == "record-client-verification":
             _print_json(projection_record_client_verification(
                 projection=projection, environment_id=args.environment_id,
                 receipt_file=Path(args.receipt).expanduser().resolve(),
-                tool_exposure=args.tool_exposure, confirm=args.confirm, dry_run=args.dry_run,
+                tool_exposure=args.tool_exposure, aspect=args.aspect,
+                confirm=args.confirm, dry_run=args.dry_run,
+            ))
+            return 0
+        if command == "probe-status":
+            _print_json(projection_probe_status(
+                projection=projection, environment_id=getattr(args, "environment_id", None),
             ))
             return 0
         if command == "unenroll":

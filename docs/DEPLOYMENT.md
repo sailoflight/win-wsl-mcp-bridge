@@ -158,7 +158,16 @@ python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl \
 # optional polling (Ctrl-C to stop); inspect state with:
 python3 wsl-bridge-mcp/bridge.py projection status --side wsl \
     --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3
+# read-only Agent view of proved client capabilities and the next observation
+python3 wsl-bridge-mcp/bridge.py projection probe-status --side wsl \
+    --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3
 ```
+
+`projection probe-status` writes nothing: it reports per environment which
+capability aspect is proved, stale, unprobed, or not observable with this probe
+version, which prepared challenges are outstanding, and the next concrete step.
+See [Tool exposure](MCP_TOOL_EXPOSURE.md) for the aspect table and the exact
+meaning of a negative observation.
 
 `registry-init --projection <path>` creates the authority and appends outbox
 events atomically with projection-affecting registry commits. Each host keeps
