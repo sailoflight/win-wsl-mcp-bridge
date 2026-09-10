@@ -391,6 +391,16 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
             projection=self.projection(), environment_id=self.environment_id,
         )["environments"][0]
         self.assertTrue(any("expired" in reason for reason in entry["evidenceReasons"]))
+        # A recorded deferred policy without usable evidence is reported as an
+        # error state with its reasons, never as a silent downgrade.
+        self.save_evidence({}, mode="deferred")
+        entry = bridge.projection_probe_status(
+            projection=self.projection(), environment_id=self.environment_id,
+        )["environments"][0]
+        self.assertEqual(entry["effectiveToolExposure"], "invalid")
+        self.assertIn("deferred exposure requires", entry["toolExposureError"])
+        self.assertEqual(len(entry["capabilities"]), 5)
+        self.assertTrue(entry["nextActions"])
         with self.assertRaisesRegex(bridge.BridgeError, "unknown environment"):
             bridge.projection_probe_status(
                 projection=self.projection(), environment_id="env-absent",
