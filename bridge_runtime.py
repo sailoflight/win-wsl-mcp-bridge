@@ -12641,6 +12641,11 @@ def build_parser(default_side: str, default_local_port: int, default_link_mode: 
         "--aspect", choices=sorted(CLIENT_CAPABILITY_ASPECTS), default=None,
         help="prepared challenge to consume; required only when several are outstanding",
     )
+    record_client.add_argument(
+        "--client-version", default=None,
+        help="optional client product version this observation ran under; it is pinned "
+             "inside the recorded version fingerprint and is never capability evidence",
+    )
     record_client.add_argument("--dry-run", action="store_true")
     record_client.add_argument("--confirm", action="store_true")
     probe_status = projection_sub.add_parser(
@@ -13635,7 +13640,8 @@ def _effective_tool_exposure(row: Any) -> str:
     if not isinstance(capabilities, dict):
         raise BridgeError("invalid recorded harness capabilities")
     # An observation proves this exact environment only; no universal claim
-    # about the named Harness. Expired/absent evidence cannot enable deferral.
+    # about the named Harness. Absent or identity-mismatched evidence cannot
+    # enable deferral, and nothing here expires on a clock.
     usable = (
         state["fresh"]
         and capabilities.get("toolsListChanged") == "supported"
@@ -13753,10 +13759,14 @@ _PROBE_META_LEGACY_ASPECT = "legacy"
 def _harness_evidence_state(row: Any) -> dict[str, Any]:
     """Recorded client evidence plus exactly why it does or does not apply now.
 
-    A recorded observation is bound to one environment, one client kind, and one
-    configuration fingerprint, and it carries its own completion lifetime.  Any
-    mismatch is reported as a reason instead of silently narrowing a catalog.
+    A recorded observation is bound to one environment, one client kind, one
+    enrolled configuration fingerprint, and the version identity it was observed
+    for.  It carries no validity window: evidence stops applying when that
+    identity changes, and a Bridge Agent re-observes it when a client, its
+    configuration, or the peer server set changes.  Any mismatch is reported as
+    a reason instead of silently narrowing a catalog.
     """
+    from harness_verification import ProbeValidationError, version_fingerprint
     evidence = _row_harness_verification(row)
     reasons: list[str] = []
     if not evidence:
@@ -13771,19 +13781,101 @@ def _harness_evidence_state(row: Any) -> dict[str, Any]:
         )
         if recorded != _harness_config_fingerprint(row):
             reasons.append("the enrolled client configuration changed after this verification")
-        valid_until = evidence.get("validUntil")
-        if not isinstance(valid_until, (int, float)):
-            reasons.append("recorded verification records no completion lifetime")
-        elif valid_until <= time.time():
-            reasons.append("recorded verification expired")
+        identity = evidence.get("versionIdentity")
+        fingerprint = evidence.get("versionFingerprint")
+        if not isinstance(identity, dict) or not identity:
+            reasons.append("recorded verification carries no version identity")
+        elif not isinstance(fingerprint, str):
+            reasons.append("recorded verification carries no version fingerprint")
+        else:
+            try:
+                derived = version_fingerprint(identity)
+            except ProbeValidationError:
+                derived = None
+            if derived != fingerprint:
+                reasons.append(
+                    "recorded version fingerprint does not match its version identity"
+                )
     return {
         "evidence": evidence,
         "capabilities": evidence.get("capabilities", {}),
         "fresh": not reasons,
         "reasons": reasons,
-        "verifiedAt": evidence.get("verifiedAt"),
-        "validUntil": evidence.get("validUntil"),
+        "versionFingerprint": evidence.get("versionFingerprint"),
+        "versionIdentity": evidence.get("versionIdentity"),
+        # Legacy tolerance stays read-only: an old blob may still report when it
+        # was observed, but without a version fingerprint it never applies.
+        "observedAt": evidence.get("observedAt", evidence.get("verifiedAt")),
+        "recordedAt": evidence.get("recordedAt"),
     }
+
+
+def _peer_recheck_state(evidence: Any, current: list[str] | None) -> dict[str, Any]:
+    """Whether a Bridge Agent should re-observe because the peer set changed.
+
+    A new or retired peer MCP does not change what a Harness itself can do, so
+    this never invalidates recorded evidence and never narrows a catalog by
+    itself - it asks for a fresh bounded observation of the same environment.
+    """
+    recorded: list[str] | None = None
+    if isinstance(evidence, dict) and isinstance(evidence.get("peerServers"), list):
+        recorded = sorted({str(item) for item in evidence["peerServers"]})
+    if recorded is None or current is None:
+        return {
+            "recheckRequired": False,
+            "recheckReasons": [],
+            "newPeerServers": [],
+            "retiredPeerServers": [],
+            "peerServersObserved": recorded,
+        }
+    listed = sorted({str(item) for item in current})
+    new = sorted(set(listed) - set(recorded))
+    retired = sorted(set(recorded) - set(listed))
+    reasons: list[str] = []
+    if new:
+        reasons.append(
+            "new peer MCP entered this bridge after the verification: " + ", ".join(new)
+        )
+    if retired:
+        reasons.append(
+            "a peer MCP left this bridge after the verification: " + ", ".join(retired)
+        )
+    return {
+        "recheckRequired": bool(reasons),
+        "recheckReasons": reasons,
+        "newPeerServers": new,
+        "retiredPeerServers": retired,
+        "peerServersObserved": recorded,
+    }
+
+
+def _mirrored_peer_server_ids(connection: sqlite3.Connection) -> list[str] | None:
+    """Local mirrored peer ids; None when this projection has never been synced.
+
+    An empty list means "synced, and no peer MCP was registered"; None means
+    "not comparable", so a recorded peer set is never compared against a mirror
+    that was simply never refreshed.
+    """
+    if _mirrored_peer_fingerprint(connection) is None:
+        return None
+    try:
+        rows = connection.execute(
+            "SELECT server_id FROM peer_projection_state WHERE enabled = 1"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    return sorted(str(row["server_id"]) for row in rows)
+
+
+def _mirrored_peer_fingerprint(connection: sqlite3.Connection) -> str | None:
+    try:
+        row = connection.execute(
+            "SELECT value FROM projection_meta WHERE key = 'peer_fingerprint'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return str(row["value"]) if row is not None else None
+
 
 
 def _aspect_observation(aspect: str, state: dict[str, Any]) -> tuple[str, Any]:
@@ -13908,9 +14000,11 @@ def _probe_next_action(challenge: dict[str, Any]) -> str:
 
 def _capability_checklist(
     row: Any, outstanding: dict[str, dict[str, Any]],
+    peer_servers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Per-aspect adaptation report for one enrollment, with the next observation."""
     state = _harness_evidence_state(row)
+    recheck = _peer_recheck_state(state["evidence"], peer_servers)
     mode = _env_row_field(row, "tool_exposure", "native")
     try:
         effective = _effective_tool_exposure(row)
@@ -13920,6 +14014,11 @@ def _capability_checklist(
     capabilities = state["capabilities"] if isinstance(state["capabilities"], dict) else {}
     items: list[dict[str, Any]] = []
     actions: list[str] = []
+    if recheck["recheckRequired"]:
+        actions.append(
+            "re-observe this environment with a fresh prepared challenge: "
+            + "; ".join(recheck["recheckReasons"])
+        )
     for aspect, definition in CLIENT_CAPABILITY_ASPECTS.items():
         observed_state, value = _aspect_observation(aspect, state)
         challenge = outstanding.get(aspect)
@@ -13930,8 +14029,11 @@ def _capability_checklist(
         elif observed_state == "stale":
             action = ("re-observe this aspect: " + "; ".join(state["reasons"]))
         elif observed_state == "supported":
-            action = ("evidence applies until " + _utc_text(state["validUntil"])
-                      + "; re-observe before it expires")
+            action = ("recorded " + str(_utc_text(state["observedAt"]))
+                      + " under version fingerprint "
+                      + str(state["versionFingerprint"] or "unknown")
+                      + "; no expiry applies - re-observe when the client, its "
+                      "configuration, or the peer MCP set changes")
         elif observed_state == "unsupported":
             action = ("observed negative; it remains recorded evidence, and re-observing is "
                       "the only way to change it")
@@ -13987,8 +14089,15 @@ def _capability_checklist(
         "toolExposureBlockers": blockers,
         "evidenceFresh": state["fresh"],
         "evidenceReasons": state["reasons"],
-        "verifiedAt": state["verifiedAt"],
-        "validUntil": state["validUntil"],
+        "observedAt": state["observedAt"],
+        "recordedAt": state["recordedAt"],
+        "versionFingerprint": state["versionFingerprint"],
+        "versionIdentity": state["versionIdentity"],
+        "recheckRequired": recheck["recheckRequired"],
+        "recheckReasons": recheck["recheckReasons"],
+        "newPeerServers": recheck["newPeerServers"],
+        "retiredPeerServers": recheck["retiredPeerServers"],
+        "peerServersObserved": recheck["peerServersObserved"],
         "capabilities": items,
         "outstandingChallenges": sorted(
             outstanding.values(), key=lambda item: str(item["aspect"]),
@@ -15734,16 +15843,35 @@ def projection_probe_client(
     }
 
 
+def _declared_client_version(value: Any) -> str | None:
+    """Bounded, optional product version the recording Agent observed.
+
+    It is pinned inside the version fingerprint for later comparison, and it is
+    never treated as capability evidence: only the observation is.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        raise BridgeError("declared client version must be 1-64 printable characters")
+    if not all(32 <= ord(character) < 127 for character in value):
+        raise BridgeError("declared client version must be printable ASCII")
+    return value
+
+
 def projection_record_client_verification(
     *, projection: Path, environment_id: str, receipt_file: Path,
     tool_exposure: str = "auto", aspect: str | None = None,
-    confirm: bool = False, dry_run: bool = False,
+    client_version: str | None = None, confirm: bool = False, dry_run: bool = False,
 ) -> dict[str, Any]:
     """Validate and consume one probe receipt before recording client evidence.
 
     One receipt observes the whole environment, so ``aspect`` only selects which
     prepared challenge is consumed.  When it is omitted, a single outstanding
     challenge is consumed and several require an explicit choice.
+
+    The record pins the observed version identity and the timestamp, plus the
+    peer server set that was mirrored at recording time.  It records no validity
+    window: later peer registration is answered by re-observing, not by expiry.
     """
     from harness_verification import validate_probe_receipt
     if not dry_run and not confirm:
@@ -15795,6 +15923,19 @@ def projection_record_client_verification(
             or evidence.get("configFingerprint") != _harness_config_fingerprint(row)
         ):
             raise BridgeError("verification does not match the current enrolled client configuration")
+        # Pin what was observed - identity and time - instead of a validity
+        # window, and pin the mirrored peer set the Agent can re-check against.
+        from harness_verification import version_fingerprint
+        declared = _declared_client_version(client_version)
+        identity = dict(evidence["versionIdentity"])
+        identity["declaredClientVersion"] = declared
+        evidence["versionIdentity"] = identity
+        evidence["versionFingerprint"] = version_fingerprint(identity)
+        peer_fingerprint = _mirrored_peer_fingerprint(connection)
+        evidence["peerFingerprint"] = peer_fingerprint
+        evidence["peerServers"] = (
+            _mirrored_peer_server_ids(connection) if peer_fingerprint is not None else None
+        )
         updated = dict(row)
         updated["tool_exposure"] = tool_exposure
         updated["harness_verification_json"] = _canonical_json(evidence)
@@ -15830,6 +15971,13 @@ def projection_record_client_verification(
         "aspect": aspect, "capability": capability,
         "capabilityValue": capabilities.get(capability) if capability else None,
         "toolExposure": tool_exposure, "effectiveToolExposure": effective,
+        "observedAt": evidence.get("observedAt"), "recordedAt": evidence.get("recordedAt"),
+        "versionFingerprint": evidence.get("versionFingerprint"),
+        "declaredClientVersion": (
+            evidence.get("versionIdentity", {}).get("declaredClientVersion")
+            if isinstance(evidence.get("versionIdentity"), dict) else None
+        ),
+        "peerServers": evidence.get("peerServers"),
         "verification": evidence, "configurationApplied": False,
         "outstandingChallenges": sorted(remaining, key=lambda item: str(item["aspect"])),
     }
@@ -16703,10 +16851,11 @@ def projection_watch(
 
 def _safe_capability_report(
     row: Any, outstanding: dict[str, dict[str, Any]],
+    peer_servers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Capability checklist for read-only reporting; never fails a whole report."""
     try:
-        return _capability_checklist(row, outstanding)
+        return _capability_checklist(row, outstanding, peer_servers)
     except BridgeError as exc:
         return {
             "environmentId": row["environment_id"],
@@ -16717,6 +16866,9 @@ def _safe_capability_report(
             "toolExposureBlockers": [str(exc)],
             "evidenceFresh": False,
             "evidenceReasons": [str(exc)],
+            "recheckRequired": False,
+            "recheckReasons": [],
+            "newPeerServers": [],
             "capabilities": [],
             "outstandingChallenges": sorted(
                 outstanding.values(), key=lambda item: str(item["aspect"]),
@@ -16741,13 +16893,15 @@ def projection_probe_status(
     database = ProjectionDatabase(projection, observe_only=True)
     with database._connect() as connection:
         rows = database.environment_rows(connection)
+        peer_servers = _mirrored_peer_server_ids(connection)
         selected = [
             (row, _outstanding_client_probes(connection, row["environment_id"]))
             for row in rows
             if environment_id is None or row["environment_id"] == environment_id
         ]
         reports = [
-            (row, _safe_capability_report(row, outstanding)) for row, outstanding in selected
+            (row, _safe_capability_report(row, outstanding, peer_servers))
+            for row, outstanding in selected
         ]
     if environment_id is not None and not reports:
         raise BridgeError(f"unknown environment: {environment_id}")
@@ -16765,8 +16919,15 @@ def projection_probe_status(
             "toolExposureBlockers": report["toolExposureBlockers"],
             "evidenceFresh": report["evidenceFresh"],
             "evidenceReasons": report["evidenceReasons"],
-            "verifiedAt": report.get("verifiedAt"),
-            "validUntil": report.get("validUntil"),
+            "observedAt": report.get("observedAt"),
+            "recordedAt": report.get("recordedAt"),
+            "versionFingerprint": report.get("versionFingerprint"),
+            "versionIdentity": report.get("versionIdentity"),
+            "recheckRequired": bool(report.get("recheckRequired")),
+            "recheckReasons": report.get("recheckReasons", []),
+            "newPeerServers": report.get("newPeerServers", []),
+            "retiredPeerServers": report.get("retiredPeerServers", []),
+            "peerServersObserved": report.get("peerServersObserved"),
             "capabilities": report["capabilities"],
             "outstandingChallenges": report["outstandingChallenges"],
             "nextActions": report["nextActions"],
@@ -16797,10 +16958,12 @@ def projection_status(*, projection: Path) -> dict[str, Any]:
     database = ProjectionDatabase(projection)
     with database._connect() as connection:
         rows = database.environment_rows(connection)
+        peer_servers = _mirrored_peer_server_ids(connection)
         environments = [_environment_summary(row) for row in rows]
         capability = {
             row["environment_id"]: _safe_capability_report(
                 row, _outstanding_client_probes(connection, row["environment_id"]),
+                peer_servers,
             )
             for row in rows
         }
@@ -16813,6 +16976,10 @@ def projection_status(*, projection: Path) -> dict[str, Any]:
             summary["outstandingChallenges"] = [
                 item["aspect"] for item in report.get("outstandingChallenges", [])
             ]
+            summary["versionFingerprint"] = report.get("versionFingerprint")
+            summary["observedAt"] = report.get("observedAt")
+            summary["recheckRequired"] = bool(report.get("recheckRequired"))
+            summary["recheckReasons"] = report.get("recheckReasons", [])
         projections = [
             {
                 "environmentId": row["environment_id"],
@@ -16981,6 +17148,7 @@ def _projection_cli_main(args: argparse.Namespace, *, default_side: str) -> int:
                 projection=projection, environment_id=args.environment_id,
                 receipt_file=Path(args.receipt).expanduser().resolve(),
                 tool_exposure=args.tool_exposure, aspect=args.aspect,
+                client_version=args.client_version,
                 confirm=args.confirm, dry_run=args.dry_run,
             ))
             return 0

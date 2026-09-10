@@ -165,7 +165,9 @@ python3 wsl-bridge-mcp/bridge.py projection probe-status --side wsl \
 
 `projection probe-status` writes nothing: it reports per environment which
 capability aspect is proved, stale, unprobed, or not observable with this probe
-version, which prepared challenges are outstanding, and the next concrete step.
+version, the recorded version fingerprint and timestamps, which prepared
+challenges are outstanding, whether the peer MCP set changed since the recorded
+observation (`recheckRequired` / `newPeerServers`), and the next concrete step.
 See [Tool exposure](MCP_TOOL_EXPOSURE.md) for the aspect table and the exact
 meaning of a negative observation.
 

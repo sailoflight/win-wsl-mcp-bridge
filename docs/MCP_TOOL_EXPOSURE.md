@@ -179,9 +179,11 @@ An unavailable observation remains unknown instead of being inferred from docs.
 
 `projection probe-status` is the read-only starting point. It reports, per
 enrolled environment, which registry decision each **aspect** has actually
-established, why recorded evidence does or does not still apply, which prepared
-challenges are outstanding, and the next concrete observation. It never writes,
-never launches a target, and never accepts a capability from a product name:
+established, why recorded evidence does or does not still apply, the recorded
+version fingerprint and observation timestamps, whether the peer MCP set changed
+since that observation, which prepared challenges are outstanding, and the next
+concrete observation. It never writes, never launches a target, and never accepts
+a capability from a product name:
 
 ```bash
 python3 wsl-bridge-mcp/bridge.py projection probe-status \
@@ -217,9 +219,9 @@ Each aspect state is one of:
 
 | State | Meaning |
 |---|---|
-| `supported` / `unsupported` | Fresh recorded evidence for this exact environment, client kind, and configuration fingerprint. |
+| `supported` / `unsupported` | Recorded evidence for this exact environment, client kind, configuration fingerprint, and version identity. |
 | `unknown` | The recorded run did not establish it; never a negative claim. |
-| `stale` | Evidence exists, but expiry, a configuration change, or a binding mismatch invalidates it (reasons are reported). |
+| `stale` | Evidence exists, but a configuration change, a missing/mismatched version identity, or a binding mismatch means it does not apply (reasons are reported). |
 | `not-probed` | No recorded verification for this environment yet. |
 | `not-observable` | A property of this probe version, never of the target Harness. |
 
@@ -235,24 +237,53 @@ model-context token cost of exposing a catalog. Those are separate per-MCP
 exposure observations derived from an observed catalog, and no aspect is a proxy
 for them.
 
-Evidence is scoped to the observed client build, protocol, configuration, and
-model-context attestation. Challenge validity is 15 minutes; recorded verification
-is valid for 24 hours. Re-verify after target build/model/settings changes. This is
-a trusted-local observation contract: receipt validation checks binding and event
+## Recorded evidence: version fingerprint plus timestamps
+
+The registry records *what* was observed and *when*, never a validity window:
+
+| Field | Meaning |
+|---|---|
+| `versionIdentity` | `clientKind`, the MCP client identity seen on the wire (`observedClient`), the negotiated `protocolVersion`, the enrolled `configFingerprint`, and an optional `declaredClientVersion` supplied with `record-client-verification --client-version` (pinned, and never capability evidence). |
+| `versionFingerprint` | SHA-256 over that canonical identity (`harness_verification.version_fingerprint`). Any component change is a different identity. |
+| `observedAt` | When the bounded observation window ended. |
+| `recordedAt` | When this host accepted and recorded the receipt. |
+| `peerServers` / `peerFingerprint` | The mirrored peer MCP set at recording time, or `null` when this projection had never synced a peer mirror. |
+
+Evidence does not expire. It stops applying when the identity it was observed for
+no longer matches — in practice the enrolled configuration content (which this
+host can re-derive locally) — and a Bridge Agent re-observes instead of guessing.
+Age alone is never a reason: `probe-status` reports the timestamps so an Agent can
+judge how old an observation is.
+
+A **new peer MCP entering the bridge is the re-check trigger**: `probe-status` and
+`projection status` compare the current local peer mirror with the recorded
+`peerServers` and report `recheckRequired`, `recheckReasons`, `newPeerServers`,
+and `retiredPeerServers`, plus a *re-observe* next action. This is a request for a
+fresh observation, not an invalidation: a newly registered business MCP says
+nothing about what the Harness itself can do, so it never turns `deferred`
+exposure into `native` on its own. Re-recording the environment against the
+current peer set clears the request, and a mirror that was never refreshed is
+reported as not comparable rather than as a change.
+
+Challenge preparation lifetime is separate and unchanged: a prepared challenge
+must be consumed within 15 minutes (and within the challenge's own 24-hour
+verification bound). That bounds the challenge, not the recorded evidence.
+Re-verify after target build, model, or settings changes. This is a
+trusted-local observation contract: receipt validation checks binding and event
 consistency, not cryptographic authentication against the local user or Agents.
 
 | Recorded policy | Effective behavior |
 |---|---|
 | `native` (existing default) | Full catalog; let the Harness choose model exposure. |
 | `auto` with native search supported, or any required evidence unknown/stale | Full catalog. |
-| `auto` with fresh refresh and model-exposure evidence, native search observed unsupported, and a compatible route | Per-library deferred catalog. |
-| `deferred` | Requires fresh refresh plus model-exposure evidence and the supported legacy stdio route; incompatible or stale evidence is an error. |
+| `auto` with applicable refresh and model-exposure evidence, native search observed unsupported, and a compatible route | Per-library deferred catalog. |
+| `deferred` | Requires applicable refresh plus model-exposure evidence and the supported legacy stdio route; incompatible evidence is an error. |
 
 Configuration changes invalidate eligibility. A successful fingerprint-checked
 Bridge projection may advance `projectionConfigFingerprint` while preserving the
 original probe's `configFingerprint`; this allows its own approved exposure switch
-without laundering an unrelated edit into verification evidence. There is no
-renewal of the evidence lifetime during projection.
+without laundering an unrelated edit into verification evidence. Projection never
+rewrites the recorded identity or its timestamps.
 
 ## Deferred view behavior
 

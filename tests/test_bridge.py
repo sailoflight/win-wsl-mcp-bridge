@@ -7562,6 +7562,15 @@ class TransportControlJournalTest(unittest.TestCase):
         ]).aspect)
         self.assertEqual(args.aspect, "refresh")
         self.assertEqual(args.tool_exposure, "auto")
+        # An optional declared client version is pinned, never required.
+        self.assertIsNone(args.client_version)
+        self.assertEqual(
+            parser.parse_args([
+                "projection", "record-client-verification", "env-1",
+                "--receipt", "/tmp/r.json", "--client-version", "dsh 0.1.1-rc.2",
+            ]).client_version,
+            "dsh 0.1.1-rc.2",
+        )
         args = parser.parse_args(["projection", "probe-status"])
         self.assertEqual(args.projection_command, "probe-status")
         self.assertIsNone(args.environment_id)

@@ -26,16 +26,36 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
         with self.database._connect() as connection:
             return dict(self.database.environment_row(connection, self.environment_id))
 
+    def identity(self, **overrides):
+        identity = {
+            "clientKind": "dsh",
+            "observedClient": {"name": "fixture-client", "version": "1.0"},
+            "protocolVersion": "2025-06-18",
+            "configFingerprint": hashlib.sha256(self.overlay.read_bytes()).hexdigest(),
+            "declaredClientVersion": None,
+        }
+        identity.update(overrides)
+        return identity
+
     def evidence(self, *, native="unsupported", refresh="supported", model="supported"):
+        """Recorded shape: version identity plus timestamps, never a validity window."""
+        identity = self.identity()
         return {
             "environmentId": self.environment_id,
             "clientKind": "dsh", "probeId": "fixture-probe",
-            "configFingerprint": hashlib.sha256(self.overlay.read_bytes()).hexdigest(),
-            "validUntil": time.time() + 3600,
+            "configFingerprint": identity["configFingerprint"],
+            "observedAt": time.time() - 5, "recordedAt": time.time() - 5,
+            "versionIdentity": identity,
+            "versionFingerprint": hv.version_fingerprint(identity),
             "protocolVersion": "2025-06-18",
             "capabilities": {"toolsListChanged": refresh, "modelExposure": model,
                              "nativeToolSearch": native},
         }
+
+    def status_entry(self):
+        return bridge.projection_probe_status(
+            projection=self.projection(), environment_id=self.environment_id,
+        )["environments"][0]
 
     def save_evidence(self, value, mode="auto"):
         with self.database._connect(write=True) as connection:
@@ -66,9 +86,12 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
                 self.save_evidence(self.evidence(native=native, refresh=refresh, model=model))
                 self.assertEqual(bridge._effective_tool_exposure(self.row()), expected)
 
-    def test_expired_foreign_modern_and_changed_config_cannot_enable_deferred(self):
+    def test_identity_mismatch_foreign_modern_and_changed_config_cannot_enable_deferred(self):
         for change in [
-            {"validUntil": 1}, {"environmentId": "other"},
+            {"versionFingerprint": "0" * 64},
+            {"versionFingerprint": None}, {"versionIdentity": None},
+            {"versionIdentity": self.identity(declaredClientVersion="other 9.9")},
+            {"environmentId": "other"},
             {"clientKind": "codex"}, {"protocolVersion": "2026-07-28"},
             {"configFingerprint": "0" * 64},
         ]:
@@ -80,6 +103,57 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
         self.save_evidence(self.evidence())
         self.overlay.write_text('[{"changed":true}]')
         self.assertEqual(bridge._effective_tool_exposure(self.row()), "native")
+
+    def test_legacy_evidence_without_a_version_fingerprint_never_applies(self):
+        """An old blob keeps its validity window; it is reported, never trusted."""
+        legacy = {**self.evidence(), "validUntil": time.time() + 3600,
+                  "verifiedAt": time.time()}
+        for key in ("versionIdentity", "versionFingerprint"):
+            legacy.pop(key)
+        self.save_evidence(legacy)
+        entry = self.status_entry()
+        self.assertFalse(entry["evidenceFresh"])
+        self.assertIsNone(entry["versionFingerprint"])
+        self.assertTrue(any(
+            "version identity" in reason for reason in entry["evidenceReasons"]
+        ))
+        self.assertEqual(entry["effectiveToolExposure"], "native")
+        # Its observation time is still readable, which is the point of keeping
+        # the timestamp: an Agent can tell how old the observation is.
+        self.assertAlmostEqual(entry["observedAt"], legacy["observedAt"], places=3)
+
+    def test_evidence_never_expires_and_a_new_peer_mcp_requests_a_recheck(self):
+        old = time.time() - 400 * 24 * 3600
+        aged = {**self.evidence(), "observedAt": old, "recordedAt": old}
+        self.save_evidence({**aged, "peerServers": ["alpha", "gamma"]})
+        entry = self.status_entry()
+        # Age is never a reason on its own, however old the observation is.
+        self.assertTrue(entry["evidenceFresh"])
+        self.assertEqual(entry["evidenceReasons"], [])
+        self.assertEqual(entry["effectiveToolExposure"], "deferred")
+        # A mirror that was never refreshed is not comparable, so no false prompt.
+        self.assertFalse(entry["recheckRequired"])
+        self.assertEqual(entry["peerServersObserved"], ["alpha", "gamma"])
+        self.sync_mirror(self.make_peer([self.server("alpha"), self.server("beta")]))
+        entry = self.status_entry()
+        self.assertTrue(entry["recheckRequired"])
+        self.assertEqual(entry["newPeerServers"], ["beta"])
+        self.assertEqual(entry["retiredPeerServers"], ["gamma"])
+        self.assertTrue(any(
+            "new peer MCP entered" in reason for reason in entry["recheckReasons"]
+        ))
+        self.assertTrue(any(
+            "re-observe this environment" in action for action in entry["nextActions"]
+        ))
+        # A new peer MCP asks for re-observation; it never narrows the catalog.
+        self.assertTrue(entry["evidenceFresh"])
+        self.assertEqual(entry["effectiveToolExposure"], "deferred")
+        # Re-observing the current peer set clears the request: the trigger is the
+        # change, and the record stays valid until the identity itself changes.
+        self.save_evidence({**aged, "peerServers": ["alpha", "beta"]})
+        entry = self.status_entry()
+        self.assertFalse(entry["recheckRequired"])
+        self.assertEqual(entry["recheckReasons"], [])
 
     def test_descriptors_use_one_deferred_registration_per_peer(self):
         self.save_evidence(self.evidence())
@@ -385,12 +459,16 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
         ))
         self.assertEqual(entry["effectiveToolExposure"], "native")
         self.assertTrue(entry["toolExposureBlockers"])
-        # Expiry is reported as its own reason, not as an unknown capability.
-        self.save_evidence({**self.evidence(), "validUntil": 1})
+        # A version-identity mismatch is reported as its own reason, not as an
+        # unknown capability, and nothing expires on a clock.
+        self.save_evidence({**self.evidence(), "versionFingerprint": "0" * 64})
         entry = bridge.projection_probe_status(
             projection=self.projection(), environment_id=self.environment_id,
         )["environments"][0]
-        self.assertTrue(any("expired" in reason for reason in entry["evidenceReasons"]))
+        self.assertTrue(any(
+            "version fingerprint does not match" in reason
+            for reason in entry["evidenceReasons"]
+        ))
         # A recorded deferred policy without usable evidence is reported as an
         # error state with its reasons, never as a silent downgrade.
         self.save_evidence({}, mode="deferred")
@@ -415,6 +493,9 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
         self.assertEqual(entry["capabilityStates"]["modern-protocol"], "not-observable")
         self.assertEqual(entry["outstandingChallenges"], [])
         self.assertEqual(entry["toolExposure"], "auto")
+        self.assertEqual(entry["versionFingerprint"], self.evidence()["versionFingerprint"])
+        self.assertTrue(isinstance(entry["observedAt"], (int, float)))
+        self.assertFalse(entry["recheckRequired"])
 
     def test_real_negative_receipt_is_persisted_as_an_observed_negative(self):
         """No mock: a real fixture receipt flows through validation into policy."""
@@ -446,6 +527,24 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
             receipt_file=receipt, aspect="refresh", confirm=True,
         )
         self.assertEqual(result["capabilityValue"], "unsupported")
+        # The record pins identity and time; it carries no validity window.
+        verification = result["verification"]
+        self.assertNotIn("validUntil", verification)
+        self.assertNotIn("verifiedAt", verification)
+        self.assertEqual(
+            verification["versionFingerprint"],
+            hv.version_fingerprint(verification["versionIdentity"]),
+        )
+        self.assertEqual(result["versionFingerprint"], verification["versionFingerprint"])
+        self.assertEqual(
+            verification["versionIdentity"]["observedClient"],
+            {"name": "dsh", "version": "fixture"},
+        )
+        self.assertEqual(verification["versionIdentity"]["protocolVersion"], "2025-06-18")
+        self.assertIsNone(verification["versionIdentity"]["declaredClientVersion"])
+        self.assertIsNone(result["declaredClientVersion"])
+        self.assertGreaterEqual(verification["recordedAt"], verification["observedAt"])
+        self.assertIsNone(verification["peerServers"])
         self.assertEqual(
             result["verification"]["evidence"]["protocolRefresh"]["refreshObservation"],
             "notification-without-refresh",
@@ -467,6 +566,30 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
         self.assertIn(
             "model-exposure is not proven (modelExposure=unknown)", entry["toolExposureBlockers"],
         )
+
+    def test_declared_client_version_is_bounded_and_never_capability_evidence(self):
+        self.assertIsNone(bridge._declared_client_version(None))
+        self.assertIsNone(bridge._declared_client_version(""))
+        self.assertEqual(
+            bridge._declared_client_version("dsh 0.1.1-rc.2"), "dsh 0.1.1-rc.2",
+        )
+        with self.assertRaisesRegex(bridge.BridgeError, "1-64 printable"):
+            bridge._declared_client_version("x" * 65)
+        with self.assertRaisesRegex(bridge.BridgeError, "printable ASCII"):
+            bridge._declared_client_version("dsh\t1")
+        # It is pinned inside the fingerprint, so a different declaration is a
+        # different identity, and it never changes a capability verdict.
+        first = hv.version_fingerprint(self.identity())
+        second = hv.version_fingerprint(self.identity(declaredClientVersion="dsh 9.9"))
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            set(self.identity()), {
+                "clientKind", "observedClient", "protocolVersion",
+                "configFingerprint", "declaredClientVersion",
+            },
+        )
+        with self.assertRaises(hv.ProbeValidationError):
+            hv.version_fingerprint({})
 
 
 if __name__ == "__main__":

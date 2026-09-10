@@ -4,6 +4,38 @@ All notable changes to this project are recorded here.
 
 ## 0.4.0 - Unreleased
 
+### Recorded client evidence: version fingerprint instead of a validity window
+
+- Recorded Harness evidence no longer carries or honours a validity period.
+  `validate_probe_receipt` now returns `versionIdentity` (client kind, the MCP
+  client identity observed on the wire, the negotiated protocol revision, the
+  enrolled configuration fingerprint, and an optional declared client product
+  version), its SHA-256 `versionFingerprint`, and the `observedAt`/`recordedAt`
+  timestamps in place of `verifiedAt`/`validUntil`. A new public
+  `harness_verification.version_fingerprint(identity)` computes the pin, and
+  `record-client-verification --client-version <text>` pins an Agent-observed
+  product version inside it (bounded printable metadata, never capability
+  evidence).
+- `_harness_evidence_state` no longer reasons about a clock: evidence applies
+  while the environment, client kind, configuration fingerprint, and version
+  identity still match, and a missing identity/fingerprint or a fingerprint that
+  does not match its own identity components is reported as its own reason. A
+  legacy blob that only carried `validUntil` is still reported with its
+  observation time but never applies. Deferral gating keeps its other
+  requirements unchanged.
+- A **new peer MCP entering the bridge** is now the re-check trigger instead of
+  expiry. The record pins the mirrored peer set (`peerServers`,
+  `peerFingerprint`) at recording time, and `probe-status`/`projection status`
+  compare it with the current local mirror, reporting `recheckRequired`,
+  `recheckReasons`, `newPeerServers`, `retiredPeerServers`, and a re-observe next
+  action. This asks for a fresh observation and never narrows a catalog by
+  itself: a new business MCP says nothing about Harness capability. A projection
+  whose peer mirror has never been synced is reported as not comparable rather
+  than as a change, and re-recording clears the request.
+- The 15-minute prepared-challenge lifetime and the challenge's own 24-hour
+  consumption bound are unchanged; they bound the challenge, not the recorded
+  evidence.
+
 ### Agent-driven capability aspects for the client probe
 
 - The bounded Harness probe now exposes named **aspects** instead of one opaque

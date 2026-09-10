@@ -20,6 +20,12 @@ missing/reordered evidence, or another challenge's receipt; an actor who can
 fabricate the entire local receipt is inside the project's trusted-OS-user
 boundary.  Attestations are explicitly weaker than protocol observations.
 
+Accepted evidence is normalized into a version identity (client kind, observed
+MCP client identity, negotiated protocol revision, enrolled configuration
+fingerprint) plus the times it was observed and recorded.  It carries no expiry:
+evidence stops applying when that identity changes, and it is re-observed when a
+client or its configuration changes or when a new peer MCP enters the bridge.
+
 Scope boundary: this module probes the *client Harness* capability only - whether
 a Harness observes tools/list_changed, re-fetches its catalog, and can reach a
 tool discovered after startup.  It deliberately does NOT measure any business
@@ -59,7 +65,12 @@ MAX_MESSAGE_BYTES = 64 * 1024
 MAX_TOTAL_INPUT_BYTES = 1024 * 1024
 MAX_MESSAGES = 128
 MAX_RUNTIME_SECONDS = 300
+MAX_VERSION_IDENTITY_BYTES = 4 * 1024
 PROBE_TTL_SECONDS = 15 * 60
+#: Bounds how long a prepared challenge may be consumed.  It is a property of
+#: the challenge, never of the recorded evidence: recorded evidence carries a
+#: version fingerprint and timestamps instead of a validity window, so it stops
+#: applying on an identity change rather than on a clock.
 VERIFICATION_TTL_SECONDS = 24 * 60 * 60
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}\Z")
@@ -150,6 +161,22 @@ def _json_bytes(value: Any, limit: int) -> bytes:
 
 def _digest(value: Any, limit: int = MAX_RECEIPT_BYTES) -> str:
     return hashlib.sha256(_json_bytes(value, limit)).hexdigest()
+
+
+def version_fingerprint(identity: dict[str, Any]) -> str:
+    """SHA-256 over one canonical version identity (public helper).
+
+    The fingerprint pins *what* was observed - client kind, the MCP client
+    identity seen on the wire, the negotiated protocol revision, the enrolled
+    configuration content, and any declared client product version - and it
+    replaces a validity window: recorded evidence applies while this identity
+    still matches, and is re-observed when the client, the enrolled
+    configuration, or the peer server set changes.  A caller that adds
+    components must recompute the fingerprint with this same function.
+    """
+    if not isinstance(identity, dict) or not identity:
+        _fail("version identity must be a non-empty object")
+    return _digest(identity, MAX_VERSION_IDENTITY_BYTES)
 
 
 def _exact(value: Any, required: set[str], optional: set[str] | None = None) -> dict:
@@ -478,11 +505,23 @@ def validate_probe_receipt(
         capabilities[kind], evidence[kind] = _validate_attestation(
             kind, value, challenge, receipt, client_info, stamp,
         )
+    identity = {
+        "clientKind": challenge["binding"]["clientKind"],
+        # A bounded negative may end before any initialize was observed, so the
+        # client identity is optional and never invented.
+        "observedClient": dict(client_info) if isinstance(client_info, dict) else None,
+        "protocolVersion": protocol,
+        "configFingerprint": challenge["binding"]["configFingerprint"],
+    }
     return {
         "schemaVersion": PROBE_VERSION, **challenge["binding"],
         "probeId": challenge["probeId"], "protocolVersion": protocol,
         "observedClientInfo": client_info,
-        "verifiedAt": stamp, "validUntil": challenge["verificationValidUntil"],
+        # Evidence identity, not a validity window: observedAt is when the
+        # observation window ended, recordedAt when this host accepted it.
+        "observedAt": updated, "recordedAt": stamp,
+        "versionIdentity": identity,
+        "versionFingerprint": version_fingerprint(identity),
         "receiptSha256": _digest(receipt),
         "protocolEvidenceSha256": _protocol_evidence_digest(receipt),
         "capabilities": capabilities, "evidence": evidence,
