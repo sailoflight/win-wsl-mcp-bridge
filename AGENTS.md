@@ -9,9 +9,13 @@ Before work, run `apg context --target . --task <current-task> --format context`
 
 This repository delivers one shared, bidirectional WIN-WSL MCP bridge. It has
 exactly two runtime component directories: `win-bridge-mcp/` and `wsl-bridge-mcp/`.
-`docs/` and `tests/` are non-runtime support directories, explicitly approved for
-project documentation and verification assets. Shared runtime modules stay at
-repository root; do not add another runtime component without an architecture change.
+`installer/` owns client-specific discovery, enrollment, configuration adapters,
+and installation-time verification; it is an internal support package shipped
+with the bridge, not a third node/runtime component. New client-specific install
+logic belongs there, never in the generic MCP serving/transport runtime.
+`docs/` and `tests/` are support directories for documentation and verification.
+Shared runtime modules stay at repository root; do not add another runtime
+component without an architecture change.
 
 Start with `README.md` and `docs/INDEX.md`, then read `docs/ARCHITECTURE.md` for
 protocol or trust-boundary work and `docs/VERIFICATION.md` for checks. Business MCPs

@@ -14,13 +14,30 @@ WSL.
 ## Source Ownership
 
 The user-approved layout has exactly two runtime components, `win-bridge-mcp/`
-and `wsl-bridge-mcp/`, plus `docs/` and `tests/` support directories. Shared runtime
-modules remain root-level Python modules shipped in the same wheel. `bridge_runtime`
-owns node/registry/control orchestration; transport adapters and the persistent
-connector are separate modules; `bridge_protocol` owns pure protocol-era projections;
-`journal_maintenance` and `journal_evidence` own explicit local maintenance/offline
-correlation. None of these introduces business-MCP logic or a third runtime component.
-Fixtures and verification utilities are development-only source-distribution assets.
+and `wsl-bridge-mcp/`. Shared generic runtime modules remain root-level Python
+modules. The internal `installer/` support package ships in the same wheel and
+owns client discovery, enrollment, configuration projection/adapters, projection
+CLI parsing/dispatch, and installation-time Harness verification. `docs/` and
+`tests/` remain documentation and verification support directories.
+
+The normal `serve`, `connect`, Registry MCP and Control MCP entrypoints do not
+load installer modules. The existing `projection ...` CLI loads `installer.cli`
+on demand; an explicitly supplied `registry-init --projection` path may load
+`installer.projection.ProjectionDatabase` to preserve the atomic registry/outbox
+transaction. This installation hook does not run during MCP serving. Generic
+JSON serialization and registry fact/outbox helpers remain in `bridge_runtime`;
+the installer imports the core error type, registry query and protocol constants.
+Client kind, filesystem layout and CLI dialect decisions live only in the
+installer. Existing root `harness_verification` imports and launch commands are
+thin compatibility entrypoints to the installer-owned probe.
+
+`bridge_runtime` owns node/registry/control orchestration; transport adapters and
+the persistent connector are separate modules; `bridge_protocol` owns pure
+protocol-era projections; `journal_maintenance` and `journal_evidence` own explicit
+local maintenance/offline correlation. These modules introduce no business-MCP
+logic or third runtime component. See [installer ownership](../installer/README.md)
+for the installation boundary. Fixtures and verification utilities are
+development-only source-distribution assets.
 
 ## Topology
 
@@ -36,6 +53,27 @@ WSL bridge node  =================================  Windows bridge node
 The Windows node listens on loopback port `8767`; the WSL node actively
 connects. Once established, both nodes can emit `open` frames, so direction is a
 property of a logical stream rather than the TCP connection initiator.
+
+### Client and connector boundary
+
+There is one bridge node per host, not one node per client process. DSH Web,
+each DSH TUI process, and each Codex process start their own local connector;
+the connector attaches to the node's loopback control socket and carries that
+client's MCP session over a logical stream. Client installation and connector
+processes therefore fan in at the node, while node lifecycle and the
+Windows/WSL peer link remain host-scoped:
+
+```text
+DSH Web connector ─┐
+DSH TUI connectors ├─> WSL node <====> Windows node
+Codex connectors  ─┘       └─> registered peer MCPs
+```
+
+The connector boundary is also the isolation boundary for request ids,
+initialize negotiation, disconnect cleanup, and connection-scoped dynamic tool
+views. A shared business backend is a separate concern: only registrations
+with `multiProcessAllowed=false` share one backend generation, and their calls
+are serialized without merging the clients' MCP sessions or tool views.
 
 ## Protocol layers
 
@@ -560,8 +598,14 @@ cannot publish a replacement state.
 Every shared backend has one stdin write lock and one request dispatcher. The
 dispatcher does not send the next client request until the current response has
 arrived, which prevents concurrent calls into synchronous MCP/Playwright
-implementations. Cancellation and responses to backend-initiated requests bypass
-the request queue under the same write lock so nested exchanges do not deadlock.
+implementations. Queued requests use bounded per-connection FIFO lanes and
+round-robin dispatch, so one busy TUI or Codex connection cannot monopolize a
+shared backend. The backend and each connection have both request-count and
+encoded-byte bounds; an over-limit request receives a retryable bridge error,
+while the MCP connection remains usable. Cancellation, lease cleanup, and
+responses to backend-initiated requests bypass the normal client queue under
+the same write lock so nested exchanges do not deadlock and disconnected
+clients release their queued capacity immediately.
 
 A registration may define a generic `process.clientLease` with private tool
 patterns, one release tool/argument match, and a result path that must confirm

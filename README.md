@@ -11,14 +11,18 @@ This project intentionally has only two runtime component directories:
 ```text
 win-bridge-mcp/   Windows node, local proxy, and local registry
 wsl-bridge-mcp/   WSL node, local proxy, and local registry
+installer/       Internal client installation, configuration adapters and probes
 docs/            Contracts, development plan, deployment and verification
 tests/           Offline tests, fixtures and distribution checks
 ```
 
-Shared stdlib-only runtime modules remain at root, preserving source-launcher and
-wheel import identities. Documentation and tests are support directories, not
-additional runtime components. Start at [the documentation index](docs/INDEX.md)
-for task-specific contracts and the current acceptance ledger.
+Shared stdlib-only runtime modules remain at root. The internal
+[installer package](installer/README.md) is versioned and shipped with the bridge,
+but owns client-specific installation/configuration logic separately from MCP
+serving. Existing `projection ...` commands load it on demand; normal node/proxy
+commands do not. Documentation and tests are support directories, not additional
+runtime components. Start at [the documentation index](docs/INDEX.md) for
+task-specific contracts and the current acceptance ledger.
 
 ## Bidirectional model
 

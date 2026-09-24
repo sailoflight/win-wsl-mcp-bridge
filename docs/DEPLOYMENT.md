@@ -19,10 +19,13 @@ python -m pip install build
 python -m build
 ```
 
-The wheel contains the root runtime modules declared by `pyproject.toml` and
-package metadata; source-only component launchers and development tests are not
-installed. Keep released wheels in an Operator-owned versions directory for
-rollback. Do not build directly in the production checkout. The repository does
+The wheel contains the root modules and internal `installer` package declared by
+`pyproject.toml`, plus package metadata. Client-specific configuration adapters
+and capability probes are owned by [the installer](../installer/README.md);
+existing `projection ...` commands remain available. Source-only component
+launchers and development tests are not installed. Keep released wheels in an
+Operator-owned versions directory for rollback. Do not build directly in the
+production checkout. The repository does
 not grant an external redistribution license; choose and record one before
 publishing artifacts outside the owner-controlled deployment.
 

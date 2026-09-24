@@ -9,6 +9,7 @@ Packaging and real Windows/WSL field checks are listed separately.
 python3 - <<'PY'
 from pathlib import Path
 for path in (list(Path('.').glob('*.py')) + list(Path('tests').rglob('*.py'))
+             + list(Path('installer').rglob('*.py'))
              + [Path('win-bridge-mcp/bridge.py'), Path('wsl-bridge-mcp/bridge.py')]):
     compile(path.read_text(encoding='utf-8'), str(path), 'exec')
 print('syntax ok')
@@ -47,8 +48,10 @@ The `test_bridge.py` suite verifies:
   one backend/profile owner, heterogeneous-client initialize virtualization using
   a deterministic Bridge profile, downstream instruction/capability replay,
   paginated tool-catalog agreement, capability-aware server-request routing,
-  collision-free per-client ids, serialized requests, cancellation/progress
-  routing, and structured lease busy/fixed-view errors;
+  collision-free per-client ids, bounded round-robin request lanes across 48
+  simultaneous logical clients, encoded-byte admission limits, serialized
+  requests, cancellation/progress routing, disconnect capacity cleanup, and
+  structured lease busy/fixed-view errors;
 - generic (never client-specific) shared initialize revision negotiation: verified
   logical revisions (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`) are
   accepted, a `2025-11-25` initialize is accepted at `2025-11-25` with its
@@ -171,10 +174,16 @@ The `test_bridge.py` suite verifies:
   lifecycle control and only aggregate; and peer Registry `describe`/`status`
   answers merge a compact redacted `lifecycle` field while `list` rows and
   Registry-only callers stay unchanged;
-- package metadata (`pyproject.toml`) declares exactly the root runtime modules;
-  layout tests reject undeclared root Python files or runtime imports of tests;
+- package metadata (`pyproject.toml`) declares the root modules and internal
+  `installer` package; layout tests reject undeclared root Python files or
+  runtime/installer imports of tests;
   console versions match the runtime, `doctor` reports valid and
   invalid configurations, and expected CLI errors remain traceback-free.
+
+The `test_installer_boundary.py` suite verifies that ordinary source entrypoint
+parsing does not load installer modules, projection commands retain their parser
+options, source launchers resolve the original two component directories, and
+the old/new probe entrypoints preserve module identity and mutable fixture bounds.
 
 The `test_archive_profile.py` suite verifies the deterministic safe ZIP profile:
 
@@ -229,10 +238,12 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m tests.smoke_install \
 ```
 
 `build` first creates the sdist, then builds the wheel from it. The verifier derives
-runtime modules from `pyproject.toml`, requires exact wheel source bytes, verifies
-all docs/tests/fixtures in the sdist, and rejects development code inside wheels.
-Install the wheel into an isolated environment and run both console entry points
-with `--version`; this is not production installation.
+runtime modules and installer package files from `pyproject.toml`, requires exact
+wheel source bytes, verifies all docs/tests/fixtures in the sdist, and rejects
+development code inside wheels. The isolated installation smoke runs both console
+entrypoints, installer dry-runs against absent temporary databases, and the probe
+file from site-packages outside the source checkout. This is not production
+installation.
 
 ## Real Windows/WSL field test
 

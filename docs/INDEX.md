@@ -15,12 +15,14 @@ are not current capabilities; fixture checks are not installed-client evidence.
 | Harness capability probes and MCP tool exposure | [Tool exposure](MCP_TOOL_EXPOSURE.md) |
 | Ten behavior axes, composition constraints, environment evidence and implementation gaps | [桥行为轴与组合矩阵](MCP_EXPOSURE_TAXONOMY.md) |
 | Installation, configuration, recovery and maintenance | [Deployment](DEPLOYMENT.md) |
+| Client-specific installation and configuration adapter ownership | [Installer](../installer/README.md) |
 | Release changes | [Changelog](../CHANGELOG.md) |
 
 ## Repository Boundaries
 
 `win-bridge-mcp/` and `wsl-bridge-mcp/` are the only runtime components. Shared
-stdlib-only runtime modules remain at root so source launchers and wheel imports
-use the same module identities. `docs/` and `tests/` are support directories, not
-additional runtime components. Development fixtures are excluded from wheels and
-included in source distributions for reproducible verification.
+stdlib-only runtime modules remain at root. `installer/` is an internal support
+package shipped in the same wheel; client-specific discovery and configuration
+adapters belong there. `docs/` and `tests/` are support directories, not additional
+runtime components. Development fixtures are excluded from wheels and included
+in source distributions for reproducible verification.

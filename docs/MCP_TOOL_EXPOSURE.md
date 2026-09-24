@@ -10,8 +10,9 @@ successful `tools/list` says nothing about model-context cost.
 An optional **legacy stdio** `deferred-mcp <registered-id>` surface keeps one
 library entry visible until the Agent selects it. This is a connection-scoped
 view, not a permission boundary or a guarantee of per-conversation isolation.
-Two facade processes have independent views; if a Harness shares one MCP
-connection across multiple Agents, those Agents also share that view.
+Each connector process owns one MCP connection and therefore one independent
+view; if a Harness shares one MCP connection across multiple Agents, those
+Agents also share that view.
 
 ## Environment adaptation decision (revised 2026-09-09)
 
@@ -28,7 +29,17 @@ Here DSH `tools.mode=native` is the model's tool-call representation, while brid
 `deferred-mcp` controls the size of `tools/list`. They can and do coexist; do not
 switch DSH into `code` or `both` to enable this feature. Activation means the
 frontends are ready with collapsed library entries, not that every MCP is expanded.
-Runtime views are shared by Agents using the same MCP connection.
+Runtime views are shared by Agents using the same MCP connection. Multiple DSH
+TUI processes and multiple Codex processes normally have separate connectors,
+so their views are independent even though all connectors attach to the same
+host node and may share a business backend.
+
+For TUI clients, expand/collapse is not a terminal widget operation. The
+connector exposes the small library entry or the expanded downstream tools to
+that TUI connection, and the client must refresh its catalog before using an
+expanded set. Codex should use ordinary `connect` with its native complete
+catalog or the explicit two-tool `compatibility-mcp` route; do not infer that
+Codex's native search implies support for bridge-driven dynamic add/remove.
 
 The Web profile activation is an explicitly approved configuration override using
 the repository frontend, not a synthesized `harness_verification_json` receipt.
@@ -133,6 +144,12 @@ adds `tool_exposure` and `harness_verification_json` to `agent_environments`;
 transport capabilities and compatibility routes remain separate. Migrating v1–v4
 keeps existing environment IDs, transport fields, projection fingerprints, and
 outbox records. Old rows default to native exposure and empty/unknown evidence.
+A *new* enrollment records the per-client-kind default instead of that legacy
+schema default (`enroll --tool-exposure`, `auto` for DeepSeek Harness profiles
+and `native` for every other client), so enrolling a second profile of one
+Harness no longer pins that profile to the complete fixed catalog on its own.
+Recording `auto` changes no catalog by itself: without applicable evidence it
+still resolves to `native`. `deferred` is never an enrollment default.
 
 The Bridge-side Agent receives a verification task, prepares a harmless fixture,
 runs it in an explicitly authorized isolated target Harness session, observes
@@ -219,7 +236,7 @@ Each aspect state is one of:
 
 | State | Meaning |
 |---|---|
-| `supported` / `unsupported` | Recorded evidence for this exact environment, client kind, configuration fingerprint, and version identity. |
+| `supported` / `unsupported` | Recorded evidence for this exact environment, client kind, configuration fingerprint, and version identity — or, for DeepSeek Harness profiles only, an explicitly family-scoped observation adopted from a sibling profile of the same installation (reported as `evidenceFamilyAdopted` with its recording environment). |
 | `unknown` | The recorded run did not establish it; never a negative claim. |
 | `stale` | Evidence exists, but a configuration change, a missing/mismatched version identity, or a binding mismatch means it does not apply (reasons are reported). |
 | `not-probed` | No recorded verification for this environment yet. |
@@ -254,6 +271,21 @@ no longer matches — in practice the enrolled configuration content (which this
 host can re-derive locally) — and a Bridge Agent re-observes instead of guessing.
 Age alone is never a reason: `probe-status` reports the timestamps so an Agent can
 judge how old an observation is.
+
+**One recorded exception, for DeepSeek Harness only.** One Harness installation is
+several enrolled profiles (`web` / `dsh-tui` / `headless`) that share one MCP
+client package on one host, so an observation of that client covers the family
+rather than one profile's file. A recorded DSH observation therefore carries
+`scope: dsh-family` and the `recordedEnvironmentId` it was observed in, and it is
+offered to sibling Harness profiles that have **no observation of their own**; a
+profile observed directly is never overwritten, and the recording profile keeps
+the per-configuration guard for its own evidence. Adoption is never inferred from
+a product or client name, only DSH rows may adopt, and the adopted row's recorded
+mode becomes `auto` — the observation is evidence, so this host's policy still
+decides what it means. `probe-status` and `projection status` report
+`evidenceFamilyAdopted` and `evidenceAdoptedFromEnvironmentId` so an adopted
+catalog is never presented as a profile's own observation. Non-DSH clients keep
+the exact-environment binding.
 
 A **new peer MCP entering the bridge is the re-check trigger**: `probe-status` and
 `projection status` compare the current local peer mirror with the recorded
