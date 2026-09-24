@@ -20,3 +20,8 @@ __pycache__/
 .claude/
 TESTWORKTREE/
 
+# --- local agent state and scratch (not part of the bridge) ---
+.agent-teams/
+.mnemon/
+.t1-probe/
+
