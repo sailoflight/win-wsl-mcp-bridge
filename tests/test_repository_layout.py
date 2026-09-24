@@ -17,8 +17,14 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertEqual({path.stem for path in ROOT.glob("*.py")}, set(modules))
         self.assertEqual(project["project"]["dependencies"], [])
 
+    def test_installer_package_is_explicitly_shipped(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        self.assertEqual(project["tool"]["setuptools"]["packages"], ["installer"])
+        self.assertTrue((ROOT / "installer" / "__init__.py").is_file())
+        self.assertIn("recursive-include installer", (ROOT / "MANIFEST.in").read_text())
+
     def test_runtime_does_not_import_development_tests(self):
-        for path in ROOT.glob("*.py"):
+        for path in list(ROOT.glob("*.py")) + list((ROOT / "installer").rglob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):
                 names = []

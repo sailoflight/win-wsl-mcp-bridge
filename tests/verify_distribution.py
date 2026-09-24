@@ -16,6 +16,9 @@ import zipfile
 def verify_distributions(root: Path, wheel: Path, sdist: Path) -> dict[str, int]:
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     runtime = {name + ".py" for name in project["tool"]["setuptools"]["py-modules"]}
+    for package in project["tool"]["setuptools"].get("packages", []):
+        directory = root / package.replace(".", "/")
+        runtime.update(path.relative_to(root).as_posix() for path in directory.glob("*.py"))
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
         if len(names) != len(set(names)):
@@ -29,7 +32,7 @@ def verify_distributions(root: Path, wheel: Path, sdist: Path) -> dict[str, int]
         if any(name.startswith(("tests/", "docs/", "fixture_", "test_")) for name in names):
             raise ValueError("wheel unexpectedly includes development sources")
     expected = runtime | {"README.md", "AGENTS.md", "pyproject.toml", "MANIFEST.in"}
-    for directory in ("docs", "tests", "win-bridge-mcp", "wsl-bridge-mcp"):
+    for directory in ("docs", "tests", "installer", "win-bridge-mcp", "wsl-bridge-mcp"):
         for path in (root / directory).rglob("*"):
             if path.is_file() and path.suffix in {".py", ".md", ".json", ".txt"}:
                 expected.add(path.relative_to(root).as_posix())

@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest import mock
 
-import bridge_runtime as bridge
+from installer import projection as bridge
 import harness_verification as hv
 from tests import test_bridge as fixtures
 
@@ -63,6 +63,140 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
                 "UPDATE agent_environments SET tool_exposure=?, harness_verification_json=? "
                 "WHERE environment_id=?", (mode, json.dumps(value), self.environment_id),
             )
+
+    def row_of(self, environment_id):
+        with self.database._connect() as connection:
+            return dict(self.database.environment_row(connection, environment_id))
+
+    def add_profile(self, name, *, client_kind="dsh", mode="native", evidence=None):
+        """Insert a second enrolled profile row for the same host.
+
+        A real Harness install has several enrolled profiles (web / dsh-tui /
+        headless) that share one MCP client package; this creates the second one
+        without a full second scan/enroll cycle.
+        """
+        row = self.row()
+        environment_id = ("env-" + name.ljust(24, "0"))[:28]
+        overlay = self.dsh_home / "profiles" / name / "cordis-bridge-overlay.json"
+        overlay.parent.mkdir(parents=True, exist_ok=True)
+        overlay.write_text("[]\n", encoding="utf-8")
+        now = time.time_ns()
+        with self.database._connect(write=True) as connection:
+            connection.execute(
+                "INSERT INTO agent_environments (environment_id, client_kind, host_side, "
+                "scope, config_path, discovery_source, enabled, launcher_command, "
+                "launcher_args_json, apply_adapter, file_sha256, file_size, file_mtime_ns, "
+                "may_contain_secrets, transport_capabilities_json, compatibility_route, "
+                "relay_base_url, stdio_http_endpoints_json, confirmed_at_ns, created_at_ns, "
+                "updated_at_ns, tool_exposure, harness_verification_json) "
+                "VALUES (?, ?, ?, 'user', ?, 'scan', 1, ?, ?, 'bridge-file', '', 0, 0, 0, "
+                "?, 'native', '', '', ?, ?, ?, ?, ?)",
+                (
+                    environment_id, client_kind, row["host_side"], str(overlay),
+                    row["launcher_command"], row["launcher_args_json"],
+                    row["transport_capabilities_json"], now, now, now, mode,
+                    json.dumps(evidence) if evidence is not None else "{}",
+                ),
+            )
+        return environment_id
+
+    def family_evidence(self, environment_id, **overrides):
+        """The recorded shape of a family-scoped DSH observation."""
+        evidence = self.evidence()
+        evidence["scope"] = bridge.FAMILY_EVIDENCE_SCOPE
+        evidence["recordedEnvironmentId"] = environment_id
+        evidence.update(overrides)
+        return evidence
+
+    def test_dsh_observation_is_family_scoped_and_covers_a_sibling_profile(self):
+        sibling = self.add_profile("dsh-tui")
+        path = self.root / "probe.json"
+        bridge.projection_probe_client(
+            projection=self.projection(), environment_id=self.environment_id,
+            probe_file=path, confirm=True,
+        )
+        receipt = self.root / "receipt.json"
+        receipt.write_text("{}")
+        with mock.patch(
+            "harness_verification.validate_probe_receipt", return_value=self.evidence()
+        ):
+            result = bridge.projection_record_client_verification(
+                projection=self.projection(), environment_id=self.environment_id,
+                receipt_file=receipt, tool_exposure="auto", confirm=True,
+            )
+        self.assertEqual(
+            [item["environmentId"] for item in result["familyAdoptedEnvironments"]],
+            [sibling],
+        )
+        # The recording keeps its own observation and its own configuration guard.
+        recorded = self.row()
+        self.assertEqual(recorded["tool_exposure"], "auto")
+        self.assertEqual(bridge._effective_tool_exposure(recorded), "deferred")
+        stored = json.loads(recorded["harness_verification_json"])
+        self.assertEqual(stored["scope"], bridge.FAMILY_EVIDENCE_SCOPE)
+        self.assertEqual(stored["recordedEnvironmentId"], self.environment_id)
+        # The sibling adopts the same observation without a second probe.
+        adopted = self.row_of(sibling)
+        self.assertEqual(adopted["tool_exposure"], "auto")
+        state = bridge._harness_evidence_state(adopted)
+        self.assertTrue(state["familyAdopted"])
+        self.assertEqual(state["adoptedFromEnvironmentId"], self.environment_id)
+        self.assertEqual(state["reasons"], [])
+        self.assertEqual(bridge._effective_tool_exposure(adopted), "deferred")
+        # The read-only report must present an adopted catalog as adopted.
+        entry = bridge.projection_probe_status(
+            projection=self.projection(), environment_id=sibling,
+        )["environments"][0]
+        self.assertTrue(entry["evidenceFamilyAdopted"])
+        self.assertEqual(entry["evidenceAdoptedFromEnvironmentId"], self.environment_id)
+        self.assertEqual(entry["effectiveToolExposure"], "deferred")
+
+    def test_family_scope_requires_the_explicit_marker_and_a_dsh_row(self):
+        sibling = self.add_profile("dsh-tui")
+        unmarked = self.evidence()
+        unmarked["environmentId"] = self.environment_id
+        with self.database._connect(write=True) as connection:
+            connection.execute(
+                "UPDATE agent_environments SET tool_exposure='auto', "
+                "harness_verification_json=? WHERE environment_id=?",
+                (json.dumps(unmarked), sibling),
+            )
+        state = bridge._harness_evidence_state(self.row_of(sibling))
+        self.assertFalse(state["familyAdopted"])
+        self.assertTrue(any(
+            "different environment" in reason for reason in state["reasons"]
+        ))
+        self.assertEqual(bridge._effective_tool_exposure(self.row_of(sibling)), "native")
+
+        # The same marked observation never covers another client family.
+        claude = self.add_profile(
+            "claude-main", client_kind="claude", mode="auto",
+            evidence=self.family_evidence(self.environment_id),
+        )
+        claude_state = bridge._harness_evidence_state(self.row_of(claude))
+        self.assertFalse(claude_state["familyAdopted"])
+        self.assertEqual(bridge._effective_tool_exposure(self.row_of(claude)), "native")
+
+    def test_a_profile_with_its_own_observation_is_never_overwritten(self):
+        own = self.evidence()
+        sibling = self.add_profile("dsh-tui", mode="auto", evidence=own)
+        before = self.row_of(sibling)["harness_verification_json"]
+        with self.database._connect(write=True) as connection:
+            adopted = bridge._adopt_family_evidence(
+                connection, self.database, source_row=self.row(),
+                evidence_json=json.dumps(self.family_evidence(self.environment_id)),
+            )
+        self.assertEqual(adopted, [])
+        self.assertEqual(self.row_of(sibling)["harness_verification_json"], before)
+
+    def test_a_deferred_profile_is_not_downgraded_by_family_adoption(self):
+        sibling = self.add_profile("dsh-tui", mode="deferred")
+        with self.database._connect(write=True) as connection:
+            bridge._adopt_family_evidence(
+                connection, self.database, source_row=self.row(),
+                evidence_json=json.dumps(self.family_evidence(self.environment_id)),
+            )
+        self.assertEqual(self.row_of(sibling)["tool_exposure"], "deferred")
 
     def test_default_has_no_assumed_harness_support(self):
         row = self.row()

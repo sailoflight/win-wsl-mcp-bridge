@@ -9,7 +9,7 @@ import threading
 import unittest
 from unittest import mock
 
-import bridge_runtime as bridge
+from installer import projection as bridge
 from tests.test_bridge import ProjectionHarness
 
 

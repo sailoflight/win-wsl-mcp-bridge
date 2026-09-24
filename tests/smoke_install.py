@@ -52,6 +52,31 @@ def smoke_install(wheel: Path) -> dict[str, object]:
         runtime = json.loads(result.stdout)
         if not runtime["installed"] or not all(runtime["version"] in value for value in versions.values()):
             raise RuntimeError("installed runtime identity/version mismatch")
+        installer_checks = {}
+        for side, name in (("win", "win-wsl-mcp-win"), ("wsl", "win-wsl-mcp-wsl")):
+            executable = scripts / (name + (".exe" if os.name == "nt" else ""))
+            projection = root / (side + "-preview.sqlite3")
+            preview = subprocess.run(
+                [str(executable), "projection", "reconcile", "--dry-run",
+                 "--projection", str(projection)],
+                cwd=root, env=environment, capture_output=True, text=True, timeout=15,
+            )
+            if preview.returncode or not json.loads(preview.stdout).get("ok") or projection.exists():
+                raise RuntimeError("installed installer dry-run failed: " + preview.stderr[-1000:])
+            installer_checks[side] = True
+        probe = subprocess.run(
+            [str(python), "-I", "-c",
+             "import pathlib; from installer import harness_verification as hv; "
+             "from installer.projection import _default_launcher; "
+             "assert _default_launcher('wsl') == ('win-wsl-mcp-wsl', []); "
+             "assert _default_launcher('win') == ('win-wsl-mcp-win', []); "
+             "assert 'site-packages' in pathlib.Path(hv.__file__).parts; "
+             "import subprocess, sys; "
+             "raise SystemExit(subprocess.call([sys.executable, '-I', hv.__file__, '--help']))"],
+            cwd=root, env=environment, capture_output=True, text=True, timeout=15,
+        )
+        if probe.returncode:
+            raise RuntimeError("installed installer launcher/probe failed: " + probe.stderr[-1000:])
         probe_environment = {key: value for key, value in environment.items()
                              if not key.startswith("WIN_WSL_MCP_BRIDGE_")}
         facade = subprocess.run(
@@ -62,7 +87,8 @@ def smoke_install(wheel: Path) -> dict[str, object]:
             raise RuntimeError("installed facade proxy smoke failed: " + facade.stderr[-2000:])
         facade_proxies = json.loads(facade.stdout)
         return {"ok": True, "isolatedInstall": True, "runtimeVersion": runtime["version"],
-                "entrypoints": versions, "facadeProxies": facade_proxies,
+                "entrypoints": versions, "installerPreviews": installer_checks,
+                "facadeProxies": facade_proxies,
                 "temporaryEnvironmentRemovedOnReturn": True}
 
 

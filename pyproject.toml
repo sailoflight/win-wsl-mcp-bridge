@@ -15,6 +15,7 @@ win-wsl-mcp-win = "bridge_runtime:win_main"
 win-wsl-mcp-wsl = "bridge_runtime:wsl_main"
 
 [tool.setuptools]
+packages = ["installer"]
 py-modules = [
     "bridge_runtime",
     "bridge_publisher",

@@ -58,16 +58,6 @@ from bridge_runtime import (
     proxy_stdio,
     publish_artifact,
     stage_input,
-    ProjectionDatabase,
-    _looks_bridge_owned,
-    default_projection_path,
-    projection_enroll,
-    projection_reconcile,
-    projection_scan_candidates,
-    projection_status,
-    projection_sync_peer,
-    projection_unenroll,
-    projection_watch,
     _parse_capability_index,
     capability_index_dedupe,
     capability_index_load,
@@ -75,10 +65,16 @@ from bridge_runtime import (
     capability_install_plan,
     _control_tools,
     _control_mcp_dispatch,
-    _desired_entry_descriptors,
     build_parser,
     CONTROL_INSTRUCTIONS,
     negotiate_mcp_protocol_version,
+)
+
+from installer.projection import (
+    ProjectionDatabase, _looks_bridge_owned, default_projection_path,
+    projection_enroll, projection_reconcile, projection_scan_candidates,
+    projection_status, projection_sync_peer, projection_unenroll, projection_watch,
+    _desired_entry_descriptors,
 )
 
 WIN = ROOT / "win-bridge-mcp" / "bridge.py"
@@ -1858,7 +1854,7 @@ class RegistryTest(unittest.TestCase):
             and not path.name.startswith(".")
             # Explicitly approved support directories and generated build outputs
             # are not additional runtime components.
-            and path.name not in {"docs", "tests", "release-artifacts", "build", "dist"}
+            and path.name not in {"docs", "tests", "installer", "release-artifacts", "build", "dist"}
             and not path.name.endswith(".egg-info")
         )
         self.assertEqual(directories, ["win-bridge-mcp", "wsl-bridge-mcp"])
@@ -4644,7 +4640,7 @@ class BidirectionalIntegrationTest(unittest.TestCase):
 
 import shutil
 
-import bridge_runtime as bridge_runtime
+from installer import projection as installer_projection
 
 FAKE_CLI_SRC = r'''#!@PYBIN@
 import json, os, sys
@@ -5005,6 +5001,52 @@ class ProjectionScannerOutboxEnrollTest(ProjectionHarness):
         with self.assertRaisesRegex(BridgeError, "already enrolled"):
             self.enroll(candidate)
 
+    def dsh_overlay_candidate(self) -> dict:
+        matches = [
+            candidate for candidate in self.scan()
+            if candidate["clientKind"] == "dsh"
+            and candidate["configPath"].endswith("cordis-bridge-overlay.json")
+        ]
+        self.assertEqual(len(matches), 1, matches)
+        return matches[0]
+
+    def recorded_exposure(self, kind: str) -> str:
+        with sqlite3.connect(self.projection()) as connection:
+            row = connection.execute(
+                "SELECT tool_exposure FROM agent_environments WHERE client_kind = ?",
+                (kind,),
+            ).fetchone()
+        self.assertIsNotNone(row, kind)
+        return row[0]
+
+    def test_dsh_enrollment_records_auto_exposure_by_default(self) -> None:
+        # One Harness on one host has several enrolled profiles (web / dsh-tui /
+        # headless). Enrollment must not hard-pin each profile to the complete
+        # catalog: auto lets this host's exposure policy decide, and still
+        # yields the complete catalog until that environment has probe evidence.
+        result = self.enroll(self.dsh_overlay_candidate())
+        self.assertEqual(result["environment"]["toolExposure"], "auto")
+        self.assertEqual(self.recorded_exposure("dsh"), "auto")
+
+    def test_non_dsh_enrollment_keeps_the_native_default(self) -> None:
+        self.enroll(self.candidate("claude"))
+        self.assertEqual(self.recorded_exposure("claude"), "native")
+
+    def test_enrollment_accepts_an_explicit_exposure_mode(self) -> None:
+        result = self.enroll(self.dsh_overlay_candidate(), tool_exposure="native")
+        self.assertEqual(result["environment"]["toolExposure"], "native")
+        self.assertEqual(self.recorded_exposure("dsh"), "native")
+
+    def test_enrollment_rejects_deferred_without_probe_evidence(self) -> None:
+        with self.assertRaisesRegex(
+            BridgeError, "deferred exposure cannot be selected at enrollment"
+        ):
+            self.enroll(self.dsh_overlay_candidate(), tool_exposure="deferred")
+
+    def test_enrollment_rejects_an_unknown_exposure_mode(self) -> None:
+        with self.assertRaisesRegex(BridgeError, "unknown tool exposure mode"):
+            self.enroll(self.dsh_overlay_candidate(), tool_exposure="sometimes")
+
     def test_registry_init_events_and_runtime_only_noop(self) -> None:
         projection = self.root / "peer-proj.sqlite3"
         manifest = self.root / "manifest.json"
@@ -5119,7 +5161,7 @@ class ProjectionReconcileTest(ProjectionHarness):
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run):
                 with mock.patch(
-                    "bridge_runtime._apply_environment_entries",
+                    "installer.projection._apply_environment_entries",
                     return_value={"actions": [], "mode": "bridge-file"},
                 ) as apply:
                     result = self._reconcile(dry_run=dry_run)
@@ -5220,8 +5262,8 @@ class ProjectionReconcileTest(ProjectionHarness):
     def test_crash_at_boundary_converges_without_duplicates(self) -> None:
         # Simulate a crashed previous apply: entries already present but no DB state.
         self.sync_mirror(self.make_peer([self.server("alpha")]))
-        launcher_command, launcher_args = bridge_runtime._default_launcher(self.SIDE)
-        descriptor = bridge_runtime._agent_connect_entry(
+        launcher_command, launcher_args = installer_projection._default_launcher(self.SIDE)
+        descriptor = installer_projection._agent_connect_entry(
             launcher_command=launcher_command,
             launcher_args=launcher_args,
             server_id="alpha",
@@ -5283,7 +5325,7 @@ class ProjectionReconcileTest(ProjectionHarness):
             projection_path=self.root / "peer.sqlite3.proj.sqlite3",
         )
         self.sync_mirror(peer)
-        real_replace = bridge_runtime._atomic_replace_bytes
+        real_replace = installer_projection._atomic_replace_bytes
 
         state = {"corrupted": False}
 
@@ -5294,7 +5336,7 @@ class ProjectionReconcileTest(ProjectionHarness):
                 state["corrupted"] = True
 
         with mock.patch(
-            "bridge_runtime._atomic_replace_bytes", side_effect=flaky_replace
+            "installer.projection._atomic_replace_bytes", side_effect=flaky_replace
         ):
             result = self._reconcile()
         self.assertFalse(result["ok"])
@@ -5379,7 +5421,7 @@ class ProjectionReconcileTest(ProjectionHarness):
         self.assertIn("user-thing", original)
 
     def test_dsh_overlay_projection_and_removal(self) -> None:
-        from bridge_runtime import CLIENT_KIND_DSH
+        from installer.projection import CLIENT_KIND_DSH
 
         profile = self.dsh_home / "profiles" / "main"
         self.sync_mirror(self.make_peer([self.server("alpha"), self.server("beta")]))
@@ -5610,7 +5652,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         # stdio entry keeps command/args/env in the same owned document
         self.assertIn("[mcp_servers.beta]", text)
         self.assertIn("command =", text)
-        entries = bridge_runtime._codex_owned_document_entries(text)
+        entries = installer_projection._codex_owned_document_entries(text)
         self.assertEqual(entries["alpha"]["url"], "http://127.0.0.1:8877/mcp/alpha")
         self.assertIn("connect", entries["beta"]["args"])
         # idempotent second run changes nothing
@@ -5639,7 +5681,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.sync_mirror(peer)
         transition = self._reconcile()
         self.assertTrue(transition["ok"], transition["errors"])
-        entries = bridge_runtime._codex_owned_document_entries(
+        entries = installer_projection._codex_owned_document_entries(
             config.read_text(encoding="utf-8")
         )
         self.assertEqual(list(entries), ["alpha"])
@@ -5657,7 +5699,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.sync_mirror(peer)
         back = self._reconcile()
         self.assertTrue(back["ok"], back["errors"])
-        entries = bridge_runtime._codex_owned_document_entries(
+        entries = installer_projection._codex_owned_document_entries(
             config.read_text(encoding="utf-8")
         )
         self.assertEqual(list(entries), ["alpha"])
@@ -5716,7 +5758,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         )
         self.sync_mirror(peer)
         with mock.patch(
-            "bridge_runtime._atomic_replace_bytes",
+            "installer.projection._atomic_replace_bytes",
             side_effect=BridgeError("readback mismatch"),
         ):
             failed = self._reconcile()
@@ -5792,7 +5834,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             ).fetchall()), stored)
 
     def test_official_cli_native_http_argv_shapes_and_round_trip(self) -> None:
-        from bridge_runtime import (
+        from installer.projection import (
             _cli_add_argv, _cli_get_argv, _cli_remove_argv,
             _cli_get_entry, _cli_parse_claude_text,
         )
@@ -5842,7 +5884,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         therefore place the name before the flags and keep the command after the
         `--` terminator. Codex `--env` remains single-valued.
         """
-        from bridge_runtime import _cli_add_argv
+        from installer.projection import _cli_add_argv
 
         entry = {
             "name": "alpha",
@@ -5886,8 +5928,8 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.enroll(self.candidate("claude"))
         result = self._reconcile()
         self.assertTrue(result["ok"], result["errors"])
-        launcher_command, launcher_args = bridge_runtime._default_launcher(self.SIDE)
-        descriptor = bridge_runtime._agent_connect_entry(
+        launcher_command, launcher_args = installer_projection._default_launcher(self.SIDE)
+        descriptor = installer_projection._agent_connect_entry(
             launcher_command=launcher_command,
             launcher_args=launcher_args,
             server_id="alpha",
@@ -5950,7 +5992,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.assertEqual(env_result["actions"], [])
 
     def test_dsh_overlay_native_http_render_and_removal(self) -> None:
-        from bridge_runtime import CLIENT_KIND_DSH
+        from installer.projection import CLIENT_KIND_DSH
 
         profile = self.dsh_home / "profiles" / "main"
         self.sync_mirror(self.make_peer([self.http_server("alpha")]))
@@ -6022,7 +6064,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         with ProjectionDatabase(path)._connect() as connection:
             row = ProjectionDatabase(path).environment_row(connection, environment_id)
         self.assertIsNotNone(row)
-        summary = bridge_runtime._environment_summary(row)
+        summary = installer_projection._environment_summary(row)
         self.assertEqual(summary["relayBaseUrl"], "")
         self.assertEqual(summary["stdioHttpEndpoints"], {})
         self.assertEqual(summary["environmentId"], environment_id)
@@ -6048,7 +6090,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         # cli absent -> shared file is not bridge-owned onboarding: official
         # requires the CLI; instead run the file path through the adapter
         # directly to prove only alpha is added and user servers are untouched
-        from bridge_runtime import _claude_json_document, _claude_server_value
+        from installer.projection import _claude_json_document, _claude_server_value
         entries, document = _claude_json_document(
             self.claude_json.read_text(encoding="utf-8")
         )
@@ -6213,7 +6255,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             stored_before = dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall())
-        real_parse = bridge_runtime._claude_json_document
+        real_parse = installer_projection._claude_json_document
         calls = {"count": 0}
 
         def flaky_parse(text: str):
@@ -6225,7 +6267,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             raise BridgeError("claude configuration is not valid JSON (probe)")
 
         with mock.patch(
-            "bridge_runtime._claude_json_document", side_effect=flaky_parse
+            "installer.projection._claude_json_document", side_effect=flaky_parse
         ):
             result = self._reconcile()
         self.assertFalse(result["ok"])
@@ -6315,7 +6357,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
         return json.loads(self.claude_json.read_text(encoding="utf-8"))
 
     def test_enroll_endpoint_mapping_validation_and_normalization(self) -> None:
-        parse = bridge_runtime._parse_stdio_http_endpoints
+        parse = installer_projection._parse_stdio_http_endpoints
         # inline JSON must be an object of bounded, valid entries
         for bad_mapping, fragment in (
             ("[1,2]", "must decode to a JSON object"),
@@ -6535,7 +6577,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
         self.assertEqual(config.read_text(encoding="utf-8"), tampered)
 
     def test_dsh_overlay_converted_projection_render_and_removal(self) -> None:
-        from bridge_runtime import CLIENT_KIND_DSH
+        from installer.projection import CLIENT_KIND_DSH
 
         profile = self.dsh_home / "profiles" / "main"
         self.sync_mirror(self.make_peer([self.server("alpha")]))
@@ -6666,7 +6708,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
         with ProjectionDatabase(path)._connect() as connection:
             row = ProjectionDatabase(path).environment_row(connection, environment_id)
         self.assertIsNotNone(row)
-        summary = bridge_runtime._environment_summary(row)
+        summary = installer_projection._environment_summary(row)
         self.assertEqual(summary["stdioHttpEndpoints"], {})
         self.assertEqual(summary["relayBaseUrl"], "")
         self.assertEqual(summary["environmentId"], environment_id)
@@ -7186,7 +7228,7 @@ class ProjectionFinalCoverageTest(ProjectionHarness):
             {"id": "beta", "name": "Beta MCP"},
         ]
         with mock.patch(
-            "bridge_runtime.local_registry_query",
+            "installer.projection.local_registry_query",
             return_value=list(summaries),
         ) as query:
             synced = projection_sync_peer(
@@ -7206,7 +7248,7 @@ class ProjectionFinalCoverageTest(ProjectionHarness):
         self.assertEqual(sorted(self._claude_servers()), ["alpha", "beta"])
         # a later remote refresh sees one server disabled -> one entry removed
         with mock.patch(
-            "bridge_runtime.local_registry_query",
+            "installer.projection.local_registry_query",
             return_value=[{"id": "beta", "name": "Beta MCP"}],
         ):
             projection_sync_peer(
@@ -7222,7 +7264,7 @@ class ProjectionFinalCoverageTest(ProjectionHarness):
 
     def test_remote_query_rejects_invalid_ids_conservatively(self) -> None:
         with mock.patch(
-            "bridge_runtime.local_registry_query",
+            "installer.projection.local_registry_query",
             return_value=[
                 {"id": "alpha", "name": "Alpha"},
                 {"id": "../evil", "name": "Evil"},
@@ -7535,6 +7577,21 @@ class TransportControlJournalTest(unittest.TestCase):
         self.assertIsNone(args.relay_url)
         self.assertIs(args.native_http, False)
         self.assertEqual(args.compatibility_route, "native")
+        # Omitted exposure selects the per-client-kind default at enrollment;
+        # the CLI never silently pins one.
+        self.assertIsNone(args.tool_exposure)
+        self.assertEqual(
+            parser.parse_args([
+                "projection", "enroll", "cand-123", "--tool-exposure", "auto",
+            ]).tool_exposure,
+            "auto",
+        )
+        self.assertEqual(
+            parser.parse_args([
+                "projection", "enroll", "cand-123", "--tool-exposure", "native",
+            ]).tool_exposure,
+            "native",
+        )
 
     def test_projection_capability_probe_parsers_are_explicit(self) -> None:
         parser = build_parser("wsl", 8766, "connect")
