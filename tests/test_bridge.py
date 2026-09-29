@@ -1154,7 +1154,9 @@ class RegistryTest(unittest.TestCase):
                 ]
                 stdout.write = mock.Mock()
                 compatibility_mcp("127.0.0.1", 1, "sample")
-                response = json.loads(stdout.write.call_args_list[0].args[0])
+                # Protocol output is written as UTF-8 bytes; asserting on the
+                # text ``write`` would test a path production never takes.
+                response = json.loads(stdout.buffer.write.call_args_list[0].args[0])
                 self.assertEqual(
                     [tool["name"] for tool in response["result"]["tools"]],
                     ["bridge_capabilities", "bridge_call"],
