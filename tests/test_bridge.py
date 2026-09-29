@@ -50,6 +50,8 @@ from bridge_runtime import (
     SharedBackend,
     StreamState,
     _is_loopback,
+    _reject_call_rule,
+    _reject_rule_matches,
     _event_journal_path,
     default_registry_path,
     local_registry_query,
@@ -181,7 +183,14 @@ def write_shared_registry(path: Path, state: Path) -> None:
                             },
                             "sharedState": {
                                 "mode": "fixed",
-                                "rejectTools": ["view_change"],
+                                "rejectTools": [
+                                    "view_change",
+                                    {
+                                        "tool": "echo",
+                                        "path": ["name"],
+                                        "equals": ["view_change"],
+                                    },
+                                ],
                             },
                         },
                         "capabilityGroups": ["test", "shared-backend"],
@@ -483,6 +492,8 @@ class RegistryTest(unittest.TestCase):
                 "releasedResultPath",
                 "browser_*",
                 "view_change",
+                "rejectCalls",
+                "equals",
             ):
                 self.assertNotIn(private, serialized)
 
@@ -751,6 +762,94 @@ class RegistryTest(unittest.TestCase):
             Registry._validate_manifest_row(
                 {"id": "bad-input-type", "command": "python", "inputDelivery": "yes"}
             )
+
+    def test_registry_accepts_and_bounds_argument_level_reject_rules(self) -> None:
+        def shared(reject_tools):
+            return Registry._validate_manifest_row(
+                {
+                    "id": "shared-rules",
+                    "command": "python",
+                    "process": {
+                        "multiProcessAllowed": False,
+                        "sharedState": {"mode": "fixed", "rejectTools": reject_tools},
+                    },
+                }
+            )["process"]["sharedState"]
+
+        # A name-only list keeps its historical shape: no empty rejectCalls key
+        # appears, so existing registrations and their exact-shape assertions
+        # are unaffected.
+        self.assertEqual(shared(["view_change"]), {"mode": "fixed", "rejectTools": ["view_change"]})
+        self.assertNotIn("rejectCalls", shared([]))
+
+        normalized = shared(
+            [
+                "view_change",
+                {
+                    "tool": "mcp_tool_invoke",
+                    "path": ["name"],
+                    "equals": ["mcp_tool_view"],
+                },
+            ]
+        )
+        self.assertEqual(normalized["rejectTools"], ["view_change"])
+        self.assertEqual(
+            normalized["rejectCalls"],
+            [
+                {
+                    "tool": "mcp_tool_invoke",
+                    "path": ["name"],
+                    "equals": ["mcp_tool_view"],
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(BridgeError, "rejectTools entries must be"):
+            shared([""])
+        with self.assertRaisesRegex(BridgeError, "reject rule requires a tool name"):
+            shared([{"path": ["name"], "equals": ["view_change"]}])
+        with self.assertRaisesRegex(BridgeError, "reject rule has unknown keys"):
+            shared([{"tool": "echo", "path": ["name"], "equals": ["x"], "regex": ".*"}])
+        with self.assertRaisesRegex(BridgeError, "reject rule path must be"):
+            shared([{"tool": "echo", "path": [], "equals": ["x"]}])
+        with self.assertRaisesRegex(BridgeError, "reject rule path must be"):
+            shared([{"tool": "echo", "path": ["a", "b", "c", "d", "e"], "equals": ["x"]}])
+        with self.assertRaisesRegex(BridgeError, "reject rule path must be"):
+            shared([{"tool": "echo", "path": ["a" * 65], "equals": ["x"]}])
+        with self.assertRaisesRegex(BridgeError, "reject rule equals must be"):
+            shared([{"tool": "echo", "path": ["name"], "equals": []}])
+        with self.assertRaisesRegex(BridgeError, "reject rule equals must be"):
+            shared([{"tool": "echo", "path": ["name"], "equals": ["x" * 257]}])
+        with self.assertRaisesRegex(BridgeError, "reject rule equals must be"):
+            shared([{"tool": "echo", "path": ["name"], "equals": [True]}])
+        with self.assertRaisesRegex(BridgeError, "more than 32 reject rules"):
+            shared(
+                [
+                    {"tool": "echo", "path": ["name"], "equals": [str(index)]}
+                    for index in range(33)
+                ]
+            )
+
+    def test_reject_rules_match_only_the_exact_bounded_path(self) -> None:
+        rule = _reject_call_rule(
+            "shared-rules",
+            {"tool": "mcp_tool_invoke", "path": ["name"], "equals": ["mcp_tool_view"]},
+        )
+        self.assertTrue(_reject_rule_matches(rule, {"name": "mcp_tool_view"}))
+        self.assertFalse(_reject_rule_matches(rule, {"name": "mcp_tool_catalog"}))
+        self.assertFalse(_reject_rule_matches(rule, {"arguments": {"name": "mcp_tool_view"}}))
+        self.assertFalse(_reject_rule_matches(rule, {}))
+        self.assertTrue(_reject_rule_matches(rule, {"name": "mcp_tool_view", "extra": 1}))
+        self.assertFalse(_reject_rule_matches(rule, {"name": None}))
+        self.assertFalse(_reject_rule_matches(rule, {"name": "MCP_TOOL_VIEW"}))
+
+        nested = _reject_call_rule(
+            "shared-rules",
+            {"tool": "door", "path": ["target", "name"], "equals": ["view_change"]},
+        )
+        self.assertTrue(_reject_rule_matches(nested, {"target": {"name": "view_change"}}))
+        self.assertFalse(_reject_rule_matches(nested, {"target": "view_change"}))
+        self.assertFalse(_reject_rule_matches(nested, {"target": {"Name": "view_change"}}))
 
     def test_listener_security_boundary_is_loopback(self) -> None:
         self.assertTrue(_is_loopback("127.0.0.1"))
@@ -2551,6 +2650,45 @@ class SharedBackendAcceptanceTest(unittest.TestCase):
         finally:
             first.close()
             second.close()
+
+    def test_05b_fixed_view_rejects_a_matching_argument_field(self) -> None:
+        client = RawBridgeClient(self.wsl_local_port, "shared-browser")
+        client.initialize()
+        try:
+            event_start = len(self._log_lines("events.log"))
+            blocked = client.call(2, "echo", {"name": "view_change"})
+            self.assertTrue(blocked["result"]["isError"])
+            self.assertEqual(
+                blocked["result"]["structuredContent"]["error"]["code"],
+                "shared_view_fixed",
+            )
+            # The rule gates the call shape before it is serialized, so the
+            # shared backend never sees the argument that names the rejected
+            # tool.
+            self.assertEqual(
+                [
+                    row
+                    for row in self._log_lines("events.log")[event_start:]
+                    if row.startswith("call:echo:")
+                ],
+                [],
+            )
+            allowed = client.call(3, "echo", {"name": "echo", "value": "passed"})
+            self.assertEqual(
+                allowed["result"]["structuredContent"]["value"], "passed"
+            )
+            control = [
+                row
+                for row in self._log_lines("events.log")[event_start:]
+                if row.startswith("call:echo:")
+            ]
+            self.assertEqual(len(control), 1)
+            unmatched = client.call(4, "echo", {"value": "value-only"})
+            self.assertEqual(
+                unmatched["result"]["structuredContent"]["value"], "value-only"
+            )
+        finally:
+            client.close()
 
     def test_03_backend_crash_cleans_tree_and_other_target_survives(self) -> None:
         independent_before = invoke_proxy(

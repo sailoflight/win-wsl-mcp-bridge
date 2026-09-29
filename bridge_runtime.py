@@ -61,6 +61,18 @@ MAX_SHARED_QUEUED_BYTES = 64 * 1024 * 1024
 MAX_SHARED_CLIENT_QUEUED_BYTES = 32 * 1024 * 1024
 MAX_SHARED_INTERNAL_QUEUED_REQUESTS = 4
 SHARED_BACKEND_STOP_TIMEOUT_SECONDS = 10
+#: Bounded argument-level rejection for a fixed shared view. ``rejectTools``
+#: accepts a plain tool name (rejected on the name alone) or one structured rule
+#: ``{"tool": ..., "path": [...], "equals": [...]}`` that rejects the call only
+#: when the exact string at that argument path equals a listed value. Matching is
+#: exact equality over a bounded path: no patterns, no regex, and no business
+#: semantics, so a registration can gate a downstream call-by-name door without
+#: teaching the bridge what the business tool means.
+MAX_REJECT_CALL_RULES = 32
+MAX_REJECT_CALL_PATH_STEPS = 4
+MAX_REJECT_CALL_PATH_STEP_CHARS = 64
+MAX_REJECT_CALL_VALUES = 32
+MAX_REJECT_CALL_VALUE_CHARS = 256
 ARTIFACT_META_KEY = "io.win-wsl-mcp-bridge/artifact"
 ARTIFACT_ENV_PREFIX = "WIN_WSL_MCP_BRIDGE_ARTIFACT_"
 #: artifacts extension revisions. Version 1 has no resume; version 2 adds
@@ -222,6 +234,67 @@ def _is_loopback(host: str) -> bool:
     except (OSError, ValueError):
         return False
     return bool(addresses) and all(address.is_loopback for address in addresses)
+
+
+def _reject_call_rule(server_id: str, rule: Any) -> dict[str, Any]:
+    """Validate one structured ``rejectTools`` entry into a normalized rule.
+
+    A rule names one registered tool, a bounded path of argument keys, and the
+    exact string values rejected at that path. Anything richer (patterns,
+    regexes, nested predicates) is rejected here on purpose: the bridge gates a
+    call shape, it does not interpret business arguments.
+    """
+    if not isinstance(rule, dict):
+        raise BridgeError(
+            f"registry entry {server_id!r} sharedState rejectTools entries must be "
+            "a non-empty tool name or a {tool, path, equals} object"
+        )
+    if set(rule) - {"tool", "path", "equals"}:
+        raise BridgeError(
+            f"registry entry {server_id!r} sharedState reject rule has unknown keys"
+        )
+    tool = rule.get("tool")
+    if not isinstance(tool, str) or not tool:
+        raise BridgeError(
+            f"registry entry {server_id!r} sharedState reject rule requires a tool name"
+        )
+    path = rule.get("path")
+    if (
+        not isinstance(path, list)
+        or not 1 <= len(path) <= MAX_REJECT_CALL_PATH_STEPS
+        or not all(
+            isinstance(step, str) and 0 < len(step) <= MAX_REJECT_CALL_PATH_STEP_CHARS
+            for step in path
+        )
+    ):
+        raise BridgeError(
+            f"registry entry {server_id!r} sharedState reject rule path must be "
+            f"1..{MAX_REJECT_CALL_PATH_STEPS} non-empty argument keys"
+        )
+    equals = rule.get("equals")
+    if (
+        not isinstance(equals, list)
+        or not 1 <= len(equals) <= MAX_REJECT_CALL_VALUES
+        or not all(
+            isinstance(value, str) and 0 < len(value) <= MAX_REJECT_CALL_VALUE_CHARS
+            for value in equals
+        )
+    ):
+        raise BridgeError(
+            f"registry entry {server_id!r} sharedState reject rule equals must be "
+            f"1..{MAX_REJECT_CALL_VALUES} non-empty strings"
+        )
+    return {"tool": tool, "path": list(path), "equals": list(equals)}
+
+
+def _reject_rule_matches(rule: dict[str, Any], arguments: dict[str, Any]) -> bool:
+    """True when one live call's arguments hit this structured reject rule."""
+    current: Any = arguments
+    for step in rule["path"]:
+        if not isinstance(current, dict) or step not in current:
+            return False
+        current = current[step]
+    return isinstance(current, str) and current in rule["equals"]
 
 
 def _http_reason(status: int) -> str:
@@ -2108,13 +2181,28 @@ class Registry:
             if (
                 shared_state.get("mode") != "fixed"
                 or not isinstance(rejected_tools, list)
-                or not all(isinstance(tool, str) and tool for tool in rejected_tools)
             ):
                 raise BridgeError(f"registry entry {server_id!r} sharedState is invalid")
-            process["sharedState"] = {
-                "mode": "fixed",
-                "rejectTools": list(rejected_tools),
-            }
+            reject_names: list[str] = []
+            reject_calls: list[dict[str, Any]] = []
+            for entry in rejected_tools:
+                if isinstance(entry, str):
+                    if not entry:
+                        raise BridgeError(
+                            f"registry entry {server_id!r} sharedState rejectTools "
+                            "entries must be non-empty tool names or reject rules"
+                        )
+                    reject_names.append(entry)
+                else:
+                    reject_calls.append(_reject_call_rule(server_id, entry))
+            if len(reject_calls) > MAX_REJECT_CALL_RULES:
+                raise BridgeError(
+                    f"registry entry {server_id!r} sharedState has more than "
+                    f"{MAX_REJECT_CALL_RULES} reject rules"
+                )
+            process["sharedState"] = {"mode": "fixed", "rejectTools": reject_names}
+            if reject_calls:
+                process["sharedState"]["rejectCalls"] = reject_calls
         groups = row.get("capabilityGroups", [])
         if not isinstance(groups, list) or not all(isinstance(group, str) for group in groups):
             raise BridgeError(f"registry entry {server_id!r} capabilityGroups must be strings")
@@ -4286,8 +4374,15 @@ class SharedBackend:
         shared_state = self.process_config.get("sharedState")
         if not isinstance(shared_state, dict):
             return False
-        tool_name, _arguments = self._tool_call(message)
-        if tool_name not in shared_state.get("rejectTools", []):
+        tool_name, arguments = self._tool_call(message)
+        rejected = tool_name in shared_state.get("rejectTools", [])
+        if not rejected:
+            rejected = any(
+                rule.get("tool") == tool_name and _reject_rule_matches(rule, arguments)
+                for rule in shared_state.get("rejectCalls", [])
+                if isinstance(rule, dict)
+            )
+        if not rejected:
             return False
         await self._send_tool_policy_error(
             client_id,

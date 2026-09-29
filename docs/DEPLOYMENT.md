@@ -89,7 +89,10 @@ putting business-specific logic in the bridge:
     },
     "sharedState": {
       "mode": "fixed",
-      "rejectTools": ["mcp_tool_view"]
+      "rejectTools": [
+        "mcp_tool_view",
+        {"tool": "mcp_tool_invoke", "path": ["name"], "equals": ["mcp_tool_view"]}
+      ]
     }
   }
 }
@@ -102,6 +105,19 @@ conflict returns structured `client_lease_busy`; a fixed-view mutation returns
 cannot confirm cleanup, only that registration's owned process generation is
 stopped. The bridge never deletes browser profile locks or kills Edge by process
 name.
+
+A `rejectTools` entry is either a tool name — rejected on the name alone — or one
+bounded rule `{"tool": …, "path": […], "equals": […]}` that rejects a call only
+when the exact string reached by walking `path` through the call arguments is one
+of `equals`. The second form exists for the ordinary shape where one downstream
+tool is a call-by-name door: it takes the real target in an argument field, so a
+name-only rejection of `mcp_tool_view` would not cover
+`mcp_tool_invoke` with `{"name": "mcp_tool_view"}`. Matching is exact string
+equality over at most four argument keys and thirty-two values per rule, with at
+most thirty-two rules; the bridge gates a call shape and never interprets
+business arguments, so patterns and regexes are rejected at `registry-init`. A
+plain name list keeps its historical serialized shape, and the public listing
+never exposes the rules.
 
 ## Agent-local file input registration
 

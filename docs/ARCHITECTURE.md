@@ -622,7 +622,9 @@ startup.
 
 Connection-scoped dynamic tool views cannot be silently shared. A shared
 registration that cannot virtualize views declares `sharedState.mode=fixed` and
-private mutation tool names. Those calls receive `shared_view_fixed`; list-changed
+private rejection entries: a tool name, or one bounded exact-string rule over the
+call's argument path when the downstream exposes the real target through a
+call-by-name door. Those calls receive `shared_view_fixed`; list-changed
 notifications remain consistent for all attached clients. When the business MCP
 also folds its own tool surface, exactly one of the two layers folds; the
 registration rule is in [Tool exposure](MCP_TOOL_EXPOSURE.md).

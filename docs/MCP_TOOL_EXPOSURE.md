@@ -67,6 +67,9 @@ a view the others share, so exactly one layer folds:
   cannot virtualize views declares `sharedState.mode=fixed` and names the
   downstream view-mutation tools in `rejectTools`; those calls receive
   `shared_view_fixed`. Those names are registration data, never bridge knowledge.
+  An entry is either a tool name or one bounded
+  `{"tool": …, "path": […], "equals": […]}` rule, so a call-by-name door that
+  takes its real target in an argument field can be gated on that field too.
   Rejecting the view tool removes neither read-only discovery nor the call-by-name
   gate, so a registration normally rejects only the tool that mutates the view.
 - **The other direction is a registration change, not a second fold.** If a client
@@ -79,10 +82,13 @@ per-turn tool-definition snapshot rather than a model self-report; a downstream
 fold is not a permission boundary; the deferred entry forwards a client
 cancellation for the call in flight, but a downstream that ignores it may still
 finish the work, so cancelling or timing out is not evidence that downstream work
-stopped. `rejectTools` also matches top-level tool names only, so
-a downstream call-by-name gate can still reach a rejected tool; rejecting a view
-tool declares that the business default never folds, and is not by itself an
-enforceable block on every path to that tool.
+stopped. `rejectTools` matches a top-level tool name or one exact string at a
+bounded argument path, so it gates the call shapes a registration names; it is a
+declared policy for the bridge's own routed calls, not a sandbox, and any path a
+registration does not describe — another argument key, a differently shaped door
+— still reaches the downstream tool. Rejecting a view tool declares that the
+business default never folds, and is not by itself an enforceable block on every
+path to that tool.
 
 ## Research basis
 
