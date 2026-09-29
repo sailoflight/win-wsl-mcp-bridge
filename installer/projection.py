@@ -1595,6 +1595,11 @@ def _run_tool(argv: list[str], timeout: int = 30) -> tuple[int, str, str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # The client CLIs are Node programs: they emit UTF-8. Without an
+        # explicit codec this decodes with the platform locale codec, which on
+        # Windows is the ANSI code page — a non-ASCII entry name would raise
+        # UnicodeDecodeError or, worse, silently parse as mojibake.
+        encoding="utf-8",
         timeout=timeout,
         check=False,
     )

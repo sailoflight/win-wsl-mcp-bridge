@@ -373,6 +373,11 @@ class FacadeProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # The facade speaks UTF-8. Text mode without an explicit codec
+            # decodes with the platform locale codec, so a non-ASCII payload
+            # raises UnicodeDecodeError (Windows ANSI code page) or arrives as
+            # mojibake.
+            encoding="utf-8",
         )
 
     def exchange(self, message: dict) -> dict:
@@ -909,6 +914,7 @@ class HttpConnectRouteE2ETest(unittest.TestCase):
             ],
             input=messages,
             text=True,
+            encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=ROOT,

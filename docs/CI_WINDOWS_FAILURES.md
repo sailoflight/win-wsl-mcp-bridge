@@ -25,6 +25,36 @@ the mismatch showed up on the digest and not on the content. The write now
 passes `newline="\n"`, so the published digest covers the bytes the caller
 asked for.
 
+A sweep for the same defect class elsewhere found no second instance: every
+production write whose bytes are hashed or transferred is opened binary
+(`"wb"`, `os.fdopen(..., "wb")`, or an explicit `O_BINARY` flag), including the
+artifact spool, the journal, and the projection's `_atomic_replace_bytes`. The
+class existed only in the artifact fixture.
+
+The related locale-decoding class was swept too. A call that passes `text=True`
+(or `universal_newlines=True`) without `encoding=` decodes the child's output
+with the platform locale codec — the ANSI code page on Windows — so a non-ASCII
+payload raises `UnicodeDecodeError` or silently arrives as mojibake. Sixty-three
+such calls exist across the repository, but only those that carry non-ASCII
+payloads can fail, so two were fixed rather than all of them:
+`installer/projection.py::_run_tool` (it parses `claude`/`codex` CLI output as
+JSON; those CLIs are Node programs that emit UTF-8) and the facade harness in
+`tests/test_compatibility_resilience.py`, which is the residual
+`UnicodeDecodeError: 'gbk' codec` bucket from §6. The remaining calls are latent,
+not benign: each one is a latent locale bug if its child ever emits non-ASCII.
+
+Two of the report's platform claims were also re-checked first-hand on the real
+Windows interpreter, rather than taken on trust:
+
+- RC2 — with only `HOME` set, `pathlib.Path.home()` still returned the real
+  profile (`C:\Users\<user>`); it honoured the value only once `USERPROFILE` was
+  set too. The harness's "hermetic home" was therefore inert on Windows, and
+  setting `USERPROFILE`/`HOMEDRIVE`/`HOMEPATH` is both necessary and sufficient.
+- RC4 — `os.kill(exited_pid, 0)` returned `None` **without raising**, so a wait
+  loop never observes the exit, and `os.kill(bogus_pid, 0)` raised
+  `OSError [WinError 87]` rather than `ProcessLookupError`. Both failure modes
+  the report names are real.
+
 ---
 
 # Windows CI failure diagnosis — `.github/workflows/ci.yml` (`verify`)
