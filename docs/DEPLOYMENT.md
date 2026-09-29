@@ -66,12 +66,33 @@ Initialize the WSL-local registry:
 The default database is beneath `$XDG_STATE_HOME/win-wsl-mcp-bridge` or
 `~/.local/state/win-wsl-mcp-bridge`. Never place it under `/mnt/c`.
 
-## Shared backend registration
+## Registration mode: dedicated by default
 
-Use explicit `multiProcessAllowed=false` only for newline-delimited JSON-RPC stdio
-MCPs that must have one backend generation per registration and node. The bridge
-normalizes enforcement to `bridge-shared-backend`. This mode parses and rewrites
-JSON-RPC; `true` and `null` retain dedicated byte-transparent streams.
+A registration is a dedicated process by default. `multiProcessAllowed` is `true`
+once the MCP is verified to tolerate a second concurrent instance, and `null`
+while that is not yet verified; either way each logical client gets its own
+byte-transparent stream and the bridge never parses or rewrites the MCP's
+JSON-RPC. Prefer `true`: most business MCPs are ordinary per-process stdio
+servers, so several clients can each run their own instance instead of queueing
+behind one.
+
+Dedicated is not by itself a claim that two instances can share state. An MCP that
+writes a fixed output path, or that is not safe under two simultaneous calls, can
+still collide with its own second instance. Declare `true` once that is settled,
+and treat "can it be opened twice" (process isolation) as a separate question from
+"can two runs interleave safely" (business state).
+
+## Shared backend registration (explicit exception)
+
+Use explicit `multiProcessAllowed=false` only for an MCP that genuinely cannot be
+opened more than once: a single browser profile or device session, an exclusive
+cloud login, or any service whose account or license refuses a second concurrent
+instance. Those are the registrations for which one shared backend generation per
+registration and node is the honest model. The bridge normalizes enforcement to
+`bridge-shared-backend`. This mode parses and rewrites JSON-RPC, needs
+`sharedState.mode=fixed` when the MCP exposes connection-scoped views, and cannot
+use `inputDelivery` (below). `true` and `null` retain dedicated byte-transparent
+streams.
 
 A generic exclusive resource and fixed shared view can be configured without
 putting business-specific logic in the bridge:
