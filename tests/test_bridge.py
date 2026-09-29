@@ -197,6 +197,23 @@ def write_shared_registry(path: Path, state: Path) -> None:
                         "artifactDelivery": {"enabled": False},
                     },
                     {
+                        "id": "exclusive-browser",
+                        "name": "Exclusive fixture",
+                        "summary": "One client at a time fixture.",
+                        "command": sys.executable,
+                        "args": [str(SHARED_FIXTURE)],
+                        "cwd": str(ROOT),
+                        "env": {
+                            "FIXTURE_MCP_NAME": "exclusive-fixture",
+                            "FIXTURE_SPAWN_LOG": str(state / "exclusive-spawns.log"),
+                            "FIXTURE_EVENT_LOG": str(state / "exclusive-events.log"),
+                            "FIXTURE_CHILD_PID_FILE": str(state / "exclusive-child.pid"),
+                        },
+                        "process": {"concurrency": "one-to-one"},
+                        "capabilityGroups": ["test", "shared-backend"],
+                        "artifactDelivery": {"enabled": False},
+                    },
+                    {
                         "id": "other-mcp",
                         "name": "Independent fixture",
                         "summary": "Dedicated process isolation fixture.",
@@ -566,7 +583,10 @@ class RegistryTest(unittest.TestCase):
             self.assertIn(str(database), process.stdout)
             public = Registry(database).public("example-wsl-mcp")
             self.assertEqual(public["id"], "example-wsl-mcp")
-            self.assertIsNone(public["process"]["multiProcessAllowed"])
+            # The shipped example declares no concurrency, so it gets the safe
+            # default: one client, one bridge-owned backend.
+            self.assertEqual(public["process"]["concurrency"], "one-to-one")
+            self.assertIs(public["process"]["multiProcessAllowed"], False)
 
     def test_doctor_reports_deployment_readiness_and_clean_cli_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -828,6 +848,136 @@ class RegistryTest(unittest.TestCase):
                     {"tool": "echo", "path": ["name"], "equals": [str(index)]}
                     for index in range(33)
                 ]
+            )
+
+    def test_concurrency_defaults_to_one_to_one(self) -> None:
+        process = Registry._validate_manifest_row(
+            {"id": "default-concurrency", "command": "python"}
+        )["process"]
+        self.assertEqual(process["concurrency"], "one-to-one")
+        self.assertIs(process["multiProcessAllowed"], False)
+        self.assertEqual(process["enforcement"], "bridge-shared-backend")
+        self.assertNotIn("concurrencyEvidence", process)
+        # An explicit null is not a third state: it means "not declared", so it
+        # lands on the same safe default.
+        declared_null = Registry._validate_manifest_row(
+            {"id": "null-concurrency", "command": "python", "process": {"multiProcessAllowed": None}}
+        )["process"]
+        self.assertEqual(declared_null["concurrency"], "one-to-one")
+
+    def test_legacy_multi_process_allowed_maps_onto_concurrency(self) -> None:
+        shared = Registry._validate_manifest_row(
+            {
+                "id": "legacy-shared",
+                "command": "python",
+                "process": {"multiProcessAllowed": False},
+            }
+        )["process"]
+        self.assertEqual(shared["concurrency"], "many-to-one")
+        self.assertEqual(shared["enforcement"], "bridge-shared-backend")
+        dedicated = Registry._validate_manifest_row(
+            {
+                "id": "legacy-dedicated",
+                "command": "python",
+                "process": {"multiProcessAllowed": True},
+            }
+        )["process"]
+        self.assertEqual(dedicated["concurrency"], "many-to-many")
+        self.assertEqual(dedicated["enforcement"], "dedicated-stream")
+        self.assertIs(dedicated["multiProcessAllowed"], True)
+
+    def test_concurrency_promotion_requires_named_evidence(self) -> None:
+        for mode in ("many-to-one", "many-to-many"):
+            with self.assertRaises(BridgeError):
+                Registry._validate_manifest_row(
+                    {"id": "promoted", "command": "python", "process": {"concurrency": mode}}
+                )
+        promoted = Registry._validate_manifest_row(
+            {
+                "id": "promoted",
+                "command": "python",
+                "process": {
+                    "concurrency": "many-to-one",
+                    "concurrencyEvidence": "two clients shared one session, no interference",
+                },
+            }
+        )["process"]
+        self.assertEqual(promoted["concurrency"], "many-to-one")
+        self.assertEqual(
+            promoted["concurrencyEvidence"],
+            "two clients shared one session, no interference",
+        )
+        # A legacy boolean is grandfathered: it predates the authored field.
+        self.assertNotIn(
+            "concurrencyEvidence",
+            Registry._validate_manifest_row(
+                {
+                    "id": "legacy-no-evidence",
+                    "command": "python",
+                    "process": {"multiProcessAllowed": False},
+                }
+            )["process"],
+        )
+
+    def test_concurrency_conflicts_and_mode_gates_are_rejected(self) -> None:
+        with self.assertRaises(BridgeError):
+            Registry._validate_manifest_row(
+                {
+                    "id": "conflict",
+                    "command": "python",
+                    "process": {"concurrency": "many-to-one", "multiProcessAllowed": True},
+                }
+            )
+        with self.assertRaises(BridgeError):
+            Registry._validate_manifest_row(
+                {"id": "bad-mode", "command": "python", "process": {"concurrency": "two-by-two"}}
+            )
+        # A resource lease and a fixed shared view are shared-backend features.
+        with self.assertRaises(BridgeError):
+            Registry._validate_manifest_row(
+                {
+                    "id": "lease-on-dedicated",
+                    "command": "python",
+                    "process": {
+                        "concurrency": "many-to-many",
+                        "concurrencyEvidence": "two instances observed side by side",
+                        "clientLease": {
+                            "toolPatterns": ["browser_*"],
+                            "releaseTool": "browser_session",
+                            "releaseArguments": {"action": "release"},
+                        },
+                    },
+                }
+            )
+        # Input staging needs the dedicated process that a shared backend lacks.
+        with self.assertRaises(BridgeError):
+            Registry._validate_manifest_row(
+                {"id": "input-on-shared", "command": "python", "inputDelivery": {"enabled": True}}
+            )
+
+    def test_bridge_managed_streamable_http_cannot_use_a_shared_backend(self) -> None:
+        process = Registry._validate_manifest_row(
+            {
+                "id": "http-managed",
+                "command": "python",
+                "transport": {
+                    "type": "streamable-http",
+                    "endpoint": "http://127.0.0.1:39001/mcp",
+                },
+            }
+        )["process"]
+        self.assertEqual(process["concurrency"], "many-to-many")
+        with self.assertRaises(BridgeError):
+            Registry._validate_manifest_row(
+                {
+                    "id": "http-shared",
+                    "command": "python",
+                    "transport": {
+                        "type": "streamable-http",
+                        "endpoint": "http://127.0.0.1:39001/mcp",
+                    },
+                    "process": {"concurrency": "one-to-one"},
+                }
             )
 
     def test_reject_rules_match_only_the_exact_bounded_path(self) -> None:
@@ -2650,6 +2800,30 @@ class SharedBackendAcceptanceTest(unittest.TestCase):
         finally:
             first.close()
             second.close()
+
+    def test_05c_one_to_one_admits_a_single_client_and_frees_it_on_detach(self) -> None:
+        owner = RawBridgeClient(self.wsl_local_port, "exclusive-browser")
+        owner.initialize()
+        try:
+            # The second client is refused before it can mint a session, and the
+            # refusal names a retryable condition rather than a broken backend.
+            with self.assertRaises(BridgeError) as caught:
+                RawBridgeClient(self.wsl_local_port, "exclusive-browser")
+            self.assertIn("admits one client at a time", str(caught.exception))
+            # The owner keeps working across the refusal.
+            echo = owner.call(2, "echo", {"name": "admission"})
+            self.assertIn("result", echo, echo)
+        finally:
+            owner.close()
+        # Detach stops the generation, so the next client starts a fresh one
+        # with no cleanup tool and no business cooperation.
+        successor = RawBridgeClient(self.wsl_local_port, "exclusive-browser")
+        successor.initialize()
+        try:
+            echo = successor.call(2, "echo", {"name": "admission"})
+            self.assertIn("result", echo, echo)
+        finally:
+            successor.close()
 
     def test_05b_fixed_view_rejects_a_matching_argument_field(self) -> None:
         client = RawBridgeClient(self.wsl_local_port, "shared-browser")

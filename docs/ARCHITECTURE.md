@@ -139,11 +139,18 @@ MCP protocol negotiation.
 For an incoming `open`, the receiving node resolves only the supplied registry
 id. The remote caller cannot provide command, args, cwd, or env.
 
-Registrations whose `multiProcessAllowed` is `true` or `null` retain the dedicated
-byte-transparent behavior: each logical stream starts its own locally configured
-command, and the bridge does not parse or rewrite its MCP messages.
+Registrations that declare `concurrency: "many-to-many"` (the historical
+`multiProcessAllowed: true`) retain the dedicated byte-transparent behavior: each
+logical stream starts its own locally configured command, and the bridge does not
+parse or rewrite its MCP messages.
 
-An explicit `multiProcessAllowed=false` selects the bridge-enforced shared mode.
+An explicit `concurrency: "many-to-one"` (the historical
+`multiProcessAllowed=false`) selects the bridge-enforced shared mode.
+`concurrency: "one-to-one"` is the default and selects the same shared backend
+with client admission restricted to one logical client at a time, so the second
+client is refused before any session reaches the MCP. `process.concurrency` is the
+authored field; `multiProcessAllowed` and `enforcement` are derived and rewritten
+on every accepted registration.
 All clients for that registry id on that node attach to one backend generation
 and await the same atomic spawn future. The bridge parses newline-delimited
 JSON-RPC only in this mode, virtualizes one physical initialize exchange using a
@@ -301,8 +308,8 @@ process declarations. Example:
   "name": "Onshape MCP",
   "summary": "Onshape browser and modeling tools.",
   "process": {
-    "multiProcessAllowed": false,
-    "enforcement": "bridge-shared-backend",
+    "concurrency": "many-to-one",
+    "concurrencyEvidence": "two profiles shared one browser session, no interference",
     "clientLease": {
       "enabled": true,
       "busyPolicy": "error",
@@ -313,9 +320,11 @@ process declarations. Example:
 }
 ```
 
-`multiProcessAllowed` may be `null` only while registration metadata is not yet
-verified; the bridge never converts a missing declaration into `true`. Explicit
-`false` is normalized to `bridge-shared-backend` and is enforced by the node that
+A missing declaration — including an explicit `null` — is not an "unverified"
+third state: it selects the safe default `one-to-one`, enforced as a shared
+backend restricted to a single logical client. Declaring `many-to-one` or
+`many-to-many` requires `concurrencyEvidence` naming the observed support and
+is enforced by the node that
 owns the registration. Public summaries reveal only the enforcement outcome and
 whether a lease/fixed view applies; exact tool patterns, release arguments, result
 paths, commands, and environment remain private. Registry status reports
@@ -466,7 +475,7 @@ reuses output publication authority.
   the host.
 - The Operator enables `inputDelivery` per business MCP and bounds the aggregate
   staged size. `inputDelivery.enabled` requires a dedicated business process
-  (`multiProcessAllowed` is not `false`); shared-backend input staging is not
+  (declared `concurrency: "many-to-many"`); shared-backend input staging is not
   implemented and the manifest is rejected at `registry-init`.
 - The transfer mirrors the artifact protocol in the reverse direction: the
   sender snapshots one opened regular-file handle, and only input id, display
@@ -629,7 +638,7 @@ notifications remain consistent for all attached clients. When the business MCP
 also folds its own tool surface, exactly one of the two layers folds; the
 registration rule is in [Tool exposure](MCP_TOOL_EXPOSURE.md).
 
-Registrations whose `multiProcessAllowed` is `true` or `null` keep the dedicated
+Registrations that declare `concurrency: "many-to-many"` keep the dedicated
 lifecycle: the bridge performs only the process start needed for that logical
 stream and does not claim business-level singleton safety.
 

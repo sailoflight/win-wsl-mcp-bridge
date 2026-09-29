@@ -73,6 +73,22 @@ MAX_REJECT_CALL_PATH_STEPS = 4
 MAX_REJECT_CALL_PATH_STEP_CHARS = 64
 MAX_REJECT_CALL_VALUES = 32
 MAX_REJECT_CALL_VALUE_CHARS = 256
+#: Concurrency axis for a registration, safest first. ``one-to-one`` admits a
+#: single logical client per registration and node, ``many-to-one`` shares one
+#: bridge-owned backend generation, ``many-to-many`` gives every logical client
+#: its own byte-transparent process. The authored manifest field is
+#: ``process.concurrency``; the historical boolean ``multiProcessAllowed`` is
+#: still accepted and mapped, then rewritten as a derived mirror.
+CONCURRENCY_ONE_TO_ONE = "one-to-one"
+CONCURRENCY_MANY_TO_ONE = "many-to-one"
+CONCURRENCY_MANY_TO_MANY = "many-to-many"
+CONCURRENCY_MODES = (
+    CONCURRENCY_ONE_TO_ONE,
+    CONCURRENCY_MANY_TO_ONE,
+    CONCURRENCY_MANY_TO_MANY,
+)
+#: Promoting a registration above the default must name the observed support.
+MAX_CONCURRENCY_EVIDENCE_CHARS = 320
 ARTIFACT_META_KEY = "io.win-wsl-mcp-bridge/artifact"
 ARTIFACT_ENV_PREFIX = "WIN_WSL_MCP_BRIDGE_ARTIFACT_"
 #: artifacts extension revisions. Version 1 has no resume; version 2 adds
@@ -234,6 +250,76 @@ def _is_loopback(host: str) -> bool:
     except (OSError, ValueError):
         return False
     return bool(addresses) and all(address.is_loopback for address in addresses)
+
+
+def _normalize_concurrency(
+    server_id: str, process: dict[str, Any], transport_type: str
+) -> str:
+    """Resolve ``process.concurrency`` and fill the derived fields.
+
+    ``concurrency`` is the authored field; ``multiProcessAllowed`` and
+    ``enforcement`` are derived and rewritten here so every reader keeps seeing
+    one shape. Absent concurrency means the safest mode, not "unknown": unless a
+    registration names observed support for more, it admits a single client and
+    one backend. A bridge-managed ``streamable-http`` registration cannot use the
+    bridge-owned stdio backend, so it stays ``many-to-many``.
+    """
+    declared = process.get("concurrency")
+    legacy = process.get("multiProcessAllowed")
+    if legacy is not None and not isinstance(legacy, bool):
+        raise BridgeError(
+            f"registry entry {server_id!r} multiProcessAllowed must be true, false, or null"
+        )
+    if declared is not None:
+        if declared not in CONCURRENCY_MODES:
+            raise BridgeError(
+                f"registry entry {server_id!r} concurrency must be one of "
+                + ", ".join(CONCURRENCY_MODES)
+            )
+        if legacy is not None:
+            mapped = (
+                CONCURRENCY_MANY_TO_MANY if legacy else CONCURRENCY_MANY_TO_ONE
+            )
+            if mapped != declared:
+                raise BridgeError(
+                    f"registry entry {server_id!r} multiProcessAllowed conflicts with "
+                    f"concurrency {declared!r}"
+                )
+        mode = declared
+    elif legacy is not None:
+        mode = CONCURRENCY_MANY_TO_MANY if legacy else CONCURRENCY_MANY_TO_ONE
+    else:
+        mode = (
+            CONCURRENCY_MANY_TO_MANY
+            if transport_type == "streamable-http"
+            else CONCURRENCY_ONE_TO_ONE
+        )
+    evidence = process.get("concurrencyEvidence")
+    if evidence is not None:
+        if (
+            not isinstance(evidence, str)
+            or not evidence.strip()
+            or len(evidence) > MAX_CONCURRENCY_EVIDENCE_CHARS
+        ):
+            raise BridgeError(
+                f"registry entry {server_id!r} concurrencyEvidence must be a non-empty "
+                f"string of at most {MAX_CONCURRENCY_EVIDENCE_CHARS} characters"
+            )
+        process["concurrencyEvidence"] = evidence.strip()
+    if declared is not None and mode != CONCURRENCY_ONE_TO_ONE:
+        if "concurrencyEvidence" not in process:
+            raise BridgeError(
+                f"registry entry {server_id!r} concurrency {mode!r} requires "
+                "concurrencyEvidence naming the observed support for it"
+            )
+    process["concurrency"] = mode
+    process["enforcement"] = (
+        "dedicated-stream"
+        if mode == CONCURRENCY_MANY_TO_MANY
+        else "bridge-shared-backend"
+    )
+    process["multiProcessAllowed"] = mode == CONCURRENCY_MANY_TO_MANY
+    return mode
 
 
 def _reject_call_rule(server_id: str, rule: Any) -> dict[str, Any]:
@@ -944,6 +1030,18 @@ class JsonRpcError(BridgeError):
 class DrainingError(BridgeError):
     """Raised when a shared registration refuses a new stream because the
     Operator has armed lifecycle drain for that registration."""
+
+
+class ClientAdmissionError(BridgeError):
+    """Raised when a one-to-one registration already has its single client.
+
+    The registration admits one logical client at a time, so the second client
+    is refused before it can mint a session. Nothing is asked of the business
+    MCP: this is the bridge declining to attach, not the MCP rejecting a
+    session. Retryable once the current client detaches, because the backend
+    generation stops with its last client and a fresh generation starts for the
+    next one.
+    """
 
 
 @dataclass
@@ -2116,25 +2214,18 @@ class Registry:
             raise BridgeError(
                 f"registry entry {server_id!r} env must not set bridge artifact/input variables"
             )
-        process = row.get(
-            "process",
-            {"multiProcessAllowed": None, "enforcement": "unverified"},
-        )
+        process = row.get("process", {})
         if not isinstance(process, dict):
             raise BridgeError(f"registry entry {server_id!r} process must be an object")
         process = dict(process)
-        allowed = process.get("multiProcessAllowed")
-        if allowed is not None and not isinstance(allowed, bool):
-            raise BridgeError(
-                f"registry entry {server_id!r} multiProcessAllowed must be true, false, or null"
-            )
-        if allowed is False:
-            process["enforcement"] = "bridge-shared-backend"
+        concurrency = _normalize_concurrency(server_id, process, transport_type)
+        shared_backend = concurrency != CONCURRENCY_MANY_TO_MANY
         client_lease = process.get("clientLease")
         if client_lease is not None:
-            if allowed is not False:
+            if not shared_backend:
                 raise BridgeError(
-                    f"registry entry {server_id!r} clientLease requires multiProcessAllowed=false"
+                    f"registry entry {server_id!r} clientLease requires a shared backend "
+                    f"(concurrency {CONCURRENCY_MANY_TO_ONE!r})"
                 )
             if not isinstance(client_lease, dict):
                 raise BridgeError(f"registry entry {server_id!r} clientLease must be an object")
@@ -2173,7 +2264,7 @@ class Registry:
             }
         shared_state = process.get("sharedState")
         if shared_state is not None:
-            if allowed is not False or not isinstance(shared_state, dict):
+            if not shared_backend or not isinstance(shared_state, dict):
                 raise BridgeError(
                     f"registry entry {server_id!r} sharedState requires a shared backend"
                 )
@@ -2266,7 +2357,7 @@ class Registry:
             "maxBytes": input_max_bytes,
             "mode": "agent-input-v1",
         }
-        if input_enabled and process.get("multiProcessAllowed") is False:
+        if input_enabled and shared_backend:
             raise BridgeError(
                 f"registry entry {server_id!r} inputDelivery requires a dedicated "
                 "business process; shared-backend input staging is not implemented"
@@ -2353,17 +2444,16 @@ class Registry:
                     "'bridge-managed'"
                 )
             supervision = _validate_http_supervision(server_id, supervision_raw)
+        if transport_type == "streamable-http" and shared_backend:
+            raise BridgeError(
+                f"registry entry {server_id!r} streamable-http cannot use concurrency "
+                f"{concurrency!r}; the bridge-owned shared JSON-RPC backend is stdio-only"
+            )
         if transport_type == "streamable-http" and ownership == "bridge-managed":
             if not command.strip():
                 raise BridgeError(
                     f"registry entry {server_id!r} bridge-managed streamable-http "
                     "requires a local command to supervise"
-                )
-            if allowed is False:
-                raise BridgeError(
-                    f"registry entry {server_id!r} bridge-managed streamable-http "
-                    "cannot use multiProcessAllowed=false (the bridge-managed "
-                    "shared JSON-RPC backend is stdio-only)"
                 )
             if supervision is None:
                 raise BridgeError(
@@ -2444,6 +2534,8 @@ class Registry:
             "multiProcessAllowed": private_process.get("multiProcessAllowed"),
             "enforcement": private_process.get("enforcement", "unverified"),
         }
+        if private_process.get("concurrency"):
+            process["concurrency"] = private_process["concurrency"]
         if isinstance(private_process.get("clientLease"), dict):
             process["clientLease"] = {
                 "enabled": True,
@@ -2884,6 +2976,14 @@ class SharedBackend:
                 ):
                     raise BridgeError(
                         "shared backend stream closed while waiting to attach"
+                    )
+                if (
+                    self.process_config.get("concurrency") == CONCURRENCY_ONE_TO_ONE
+                    and self.clients
+                ):
+                    raise ClientAdmissionError(
+                        f"registered MCP {self.target} admits one client at a time; "
+                        "another client currently owns it"
                     )
                 if self.restart_in_progress:
                     wait_for_restart = True
@@ -7694,6 +7794,20 @@ class BridgeNode:
             except asyncio.CancelledError:
                 self.streams.pop(stream_id, None)
                 raise
+            except ClientAdmissionError as exc:
+                self.streams.pop(stream_id, None)
+                self.log(f"refused shared registered MCP {target}: {exc}")
+                await self._send_frame(
+                    {
+                        "type": "open_error",
+                        "stream": stream_id,
+                        "code": "client_admission_exclusive",
+                        "retryable": True,
+                        "message": "registered MCP admits one client at a time; "
+                        "another client currently owns it",
+                    }
+                )
+                return
             except DrainingError as exc:
                 self.streams.pop(stream_id, None)
                 self.log(
@@ -10033,6 +10147,9 @@ class BridgeNode:
         """Operator-facing status for one registration on this node."""
         mode = self._lifecycle_mode(target)
         row: dict[str, Any] = {"id": target, "registered": True, "mode": mode}
+        entry_process = (self.registry.launch(target).get("process") or {})
+        if entry_process.get("concurrency"):
+            row["concurrency"] = entry_process["concurrency"]
         if mode == "http":
             entry = self.registry.launch(target)
             private_management = entry.get("management", {}) or {}

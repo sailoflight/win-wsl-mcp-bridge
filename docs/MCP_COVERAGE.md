@@ -3,8 +3,9 @@
 ## Scope
 
 This matrix separates downstream MCP semantics from the bridge's private
-transport. Dedicated registrations are standard stdio byte relays; explicit
-`multiProcessAllowed=false` registrations use the documented shared JSON-RPC
+transport. Dedicated registrations are standard stdio byte relays; shared-backend
+registrations (the default `one-to-one`, or `many-to-one` when declared) use the
+documented shared JSON-RPC
 adapter. The peer TCP protocol is not exposed as an MCP transport. Evidence is the MCP 2025-06-18
 specification, the standard transport/resource definitions, current source, and
 offline tests.
@@ -134,7 +135,7 @@ same authority split: the Agent side uploads an explicitly authorized local
 file, and the remote MCP reads it from a bridge-created stage.
 
 1. Operator enables `inputDelivery` for a dedicated business MCP
-   (`multiProcessAllowed` is not `false`); shared-backend input staging is
+   (declared `concurrency: "many-to-many"`); shared-backend input staging is
    rejected at `registry-init`.
 2. Peers negotiate the `artifact-inputs/1` extension on the link
    (`artifactInputs` echoes only when both sides offer it).

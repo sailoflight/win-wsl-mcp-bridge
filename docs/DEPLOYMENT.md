@@ -66,49 +66,72 @@ Initialize the WSL-local registry:
 The default database is beneath `$XDG_STATE_HOME/win-wsl-mcp-bridge` or
 `~/.local/state/win-wsl-mcp-bridge`. Never place it under `/mnt/c`.
 
-## Registration mode: one backend by default
+## Registration mode: the concurrency axis
 
-A registration starts exclusive: one bridge-owned backend generation serves every
-logical client of that registration and node, declared as
-`multiProcessAllowed=false`. Multi-open (`true`) is earned, not assumed — promote a
-registration to it only after an observation shows the MCP tolerates a second
-concurrent instance. `null` stays the "not yet verified" value and behaves as a
-dedicated byte-transparent stream, so write `false` deliberately when exclusivity is
-what you mean instead of leaving the field unset.
+A registration declares `process.concurrency`, one of three modes. The mode says how
+many logical clients may share how many backend processes, and it is the Operator's
+main risk decision:
 
-Why exclusive first: the second instance is what breaks quietly. An MCP with a fixed
-output path, a single lock file, a device session, or a license that refuses a second
-seat can collide with its own copy, and the symptom is a wrong or half-written result
-rather than an error the caller can see. Promote only when you can name the evidence:
-two instances running concurrently through the surface you actually use, each
-producing the output it expects, with no interference observed.
+| `concurrency` | clients : backends | what it asks of the business MCP |
+|---|---|---|
+| `one-to-one` (default) | 1 : 1 | nothing: no concurrency, no release tool, no tool names |
+| `many-to-one` | N : 1 | its session survives several clients; a resource lease wherever clients share a resource |
+| `many-to-many` | N : N | it survives several instances: no fixed output path, no single-instance lock, no device or licence seat conflict |
 
-What exclusive costs, so that promotion is a real decision: the bridge parses and
-rewrites JSON-RPC instead of passing bytes through; connection-scoped tool views need
-`sharedState.mode=fixed` (below); `inputDelivery` is rejected, so an Agent-local file
-can only be staged to a dedicated process; and calls from different clients are
-serialized, so one long call delays the others.
+`one-to-one` is the default because it is the only mode that needs nothing proven on
+either side. Writing the field explicitly is allowed and clearer; leaving it out
+selects it. An explicit `multiProcessAllowed: null` is not a third state — it means
+"not declared" and lands on the same default.
 
-Exclusive is not a higher security level. The supported profile already trusts the
-local OS user, Agents, and registered business MCPs, and does not defend them against
-one another; exclusive changes fidelity and capability, not trust. It buys exactly one
-thing — a second instance never appears — which is why it is the right default when the
-MCP's concurrent behavior is unobserved. It also loses things, and one of them is a
-long-term debt rather than a one-time cost: because the bridge interprets the protocol
-instead of forwarding bytes, it must keep up with every protocol detail the MCP uses
-(cancellation, progress, `_meta`, JSON-RPC error shape, future methods), and every gap
-is a compatibility defect the transparent path cannot have. Dedicated (`true`) is not
-the unsafe choice it can look like; it is byte-transparent and isolates clients, at the
-price of N processes, N licenses or caches, and exposure to the MCP's own concurrency.
+Promotion is earned, not assumed. Declaring `many-to-one` or `many-to-many` also
+requires `process.concurrencyEvidence`, a short string naming the observation that
+justifies it — two clients sharing one session with no interference, or two instances
+running side by side with no interference. `registry-init` rejects the promotion
+without it. An MCP nobody has observed stays `one-to-one`; the bridge does not guess.
+
+Why the safest mode first: the second instance or the second client is what breaks
+quietly. An MCP with a fixed output path, a single lock file, a device session, or a
+license that refuses a second seat can collide with its own copy, and the symptom is a
+wrong or half-written result rather than an error the caller can see. `one-to-one`
+removes the question entirely: one client, one backend, neither side needing any
+concurrency support.
+
+What `one-to-one` does: the second client's `connect` is refused with
+`client_admission_exclusive` (marked retryable), and its `initialize` never reaches the
+MCP. When the owner detaches the generation stops, so the next client gets a fresh
+backend. Nothing is asked of the MCP: no release tool, no tool names, no cooperation.
+
+What promotion costs, so that it is a real decision: `many-to-one` makes the bridge
+parse and rewrite JSON-RPC instead of passing bytes through; it needs
+`sharedState.mode=fixed` for connection-scoped tool views; it rejects `inputDelivery`,
+so an Agent-local file can only be staged to a dedicated process; and it serializes
+calls from different clients, so one long call delays the others. `many-to-many` keeps
+bytes transparent and isolates clients, at the price of N processes, N licenses or
+caches, and exposure to the MCP's own concurrency.
+
+Neither mode is a higher security level. The supported profile already trusts the local
+OS user, Agents, and registered business MCPs, and does not defend them against one
+another; the modes change fidelity and capability, not trust. One of the shared modes'
+costs is a long-term debt rather than a one-time price: because the bridge interprets
+the protocol instead of forwarding bytes, it must keep up with every protocol detail
+the MCP uses (cancellation, progress, `_meta`, JSON-RPC error shape, future methods),
+and every gap is a compatibility defect the transparent path cannot have.
+
+One exception: a bridge-managed `streamable-http` registration defaults to
+`many-to-many`, because the bridge-owned backend is stdio-only.
 
 ## Shared backend registration
 
-Use explicit `multiProcessAllowed=false` for the registrations that run one shared
-backend generation per registration and node. The bridge normalizes enforcement to
-`bridge-shared-backend`. This mode parses and rewrites JSON-RPC, needs
-`sharedState.mode=fixed` when the MCP exposes connection-scoped views, and cannot
-use `inputDelivery` (below). `true` and `null` retain dedicated byte-transparent
-streams.
+Use `concurrency: "many-to-one"` (or the historical `multiProcessAllowed: false`) for
+registrations that run one shared backend generation per registration and node. The
+bridge normalizes enforcement to `bridge-shared-backend`. This mode parses and rewrites
+JSON-RPC, needs `sharedState.mode=fixed` when the MCP exposes connection-scoped views,
+and cannot use `inputDelivery` (below).
+
+`multiProcessAllowed` and `enforcement` are derived: the bridge rewrites both on every
+registration it accepts, so read `concurrency` as the authored field. `true` maps to
+`many-to-many` and keeps a dedicated byte-transparent stream; a registration that
+declares both `concurrency` and `multiProcessAllowed` must agree.
 
 A generic exclusive resource and fixed shared view can be configured without
 putting business-specific logic in the bridge:
@@ -116,7 +139,8 @@ putting business-specific logic in the bridge:
 ```json
 {
   "process": {
-    "multiProcessAllowed": false,
+    "concurrency": "many-to-one",
+    "concurrencyEvidence": "two DSH profiles shared one browser session, no interference",
     "clientLease": {
       "toolPatterns": ["browser_*"],
       "releaseTool": "browser_session",
@@ -160,15 +184,19 @@ never exposes the rules.
 
 A business MCP that should accept an Agent-local file (for example a model file
 to analyze) opts into the negotiated `artifact-inputs/1` extension with a private
-manifest field. It must remain a dedicated process; shared
-(`multiProcessAllowed=false`) registrations reject `inputDelivery.enabled` at
-`registry-init` because input staging for shared backends is not implemented:
+manifest field. It must remain a dedicated process; shared-backend
+registrations (the default `one-to-one`, or `many-to-one`) reject
+`inputDelivery.enabled` at `registry-init` because input staging for shared
+backends is not implemented:
 
 ```json
 {
   "id": "analysis-mcp",
   "command": "...",
-  "process": {"multiProcessAllowed": true},
+  "process": {
+    "concurrency": "many-to-many",
+    "concurrencyEvidence": "two instances observed side by side, no interference"
+  },
   "inputDelivery": {"enabled": true, "maxBytes": 268435456}
 }
 ```

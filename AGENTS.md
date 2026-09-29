@@ -36,10 +36,15 @@ Artifact delivery is explicit workspace push, never remote-path scraping. A
 business MCP may publish only a completed regular file in its bridge-created
 stream or shared-generation stage. The bridge snapshots, limits, hashes,
 transfers, and atomically commits only beneath an Operator-authorized local
-inbox. Agents never submit peer source paths. Preserve raw MCP byte transparency
-for registrations whose `multiProcessAllowed` is true or unknown. An explicit
-false selects the generic bridge-owned shared JSON-RPC backend, ID routing,
-request serialization, lifecycle state machine, and optional registration-driven
+inbox. Agents never submit peer source paths. Registrations declare
+`process.concurrency`, and the default is `one-to-one`: one logical client at a
+time on one bridge-owned backend, admitting no second client. Preserve raw MCP
+byte transparency only for a registration that declares `many-to-many` (the
+historical `multiProcessAllowed: true`); a registration that has been observed to
+tolerate more than the default must say so and name that observation in
+`process.concurrencyEvidence`. `one-to-one` and `many-to-one` select the generic
+bridge-owned shared JSON-RPC backend, ID routing, request serialization,
+lifecycle state machine, client admission, and optional registration-driven
 client lease; never add business-specific matching logic.
 
 Run tests from the repository root with `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest

@@ -4,6 +4,27 @@ All notable changes to this project are recorded here.
 
 ## 0.4.0 - Unreleased
 
+### Registration concurrency: one client and one backend by default
+
+- A registration now declares `process.concurrency`, one of `one-to-one`,
+  `many-to-one`, or `many-to-many`. The default is `one-to-one`: one logical
+  client at a time on one bridge-owned backend generation, which needs no
+  concurrency support from the business MCP and no release tool. The second
+  client's `connect` is refused with a structured, retryable
+  `client_admission_exclusive`, and when the owner detaches the generation stops,
+  so the next client starts a fresh one.
+- Promoting a registration above the default is deliberate: `many-to-one` and
+  `many-to-many` also require `process.concurrencyEvidence` naming the observed
+  support, and `registry-init` rejects the promotion without it. A bridge-managed
+  `streamable-http` registration defaults to `many-to-many`, because the
+  bridge-owned backend is stdio-only.
+- The historical boolean `multiProcessAllowed` is still read and mapped (`false`
+  to `many-to-one`, `true` to `many-to-many`); a registration declaring both must
+  agree; and both it and `enforcement` are now rewritten as derived values on
+  every accepted registration. An explicit `null` is no longer a third state — it
+  means "not declared" and lands on the default. The redacted description view
+  reports the mode, and operator status reports it alongside `mode`.
+
 ### Recorded client evidence: version fingerprint instead of a validity window
 
 - Recorded Harness evidence no longer carries or honours a validity period.
