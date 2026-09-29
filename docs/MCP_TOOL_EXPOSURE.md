@@ -47,6 +47,42 @@ The database's `auto` policy still consumes fresh, bound verification evidence;
 this revised compatibility decision neither invents a successful old canary
 receipt nor overrides that validation by client name.
 
+## Two tool-surface layers: one owner per layer
+
+A business MCP may ship its own tool-surface compression: a shared library that
+adds discovery/view/invoke control tools and can fold its own `tools/list`. That
+is a second layer in front of `deferred-mcp`, and the two layers have different
+scopes. The business view belongs to the registration and is shared by every
+client attached to that shared backend; the bridge view belongs to one connector
+process. Folding in both layers costs a second expansion and lets one client move
+a view the others share, so exactly one layer folds:
+
+- **Default: the bridge folds.** Register the business MCP at the exposure mode it
+  itself declares as its default, and never set that MCP's exposure switch
+  (`MCP_TOOL_EXPOSURE`, `MESHQ_MCP_TOOL_EXPOSURE`, or an equivalent) from the
+  registration's `env`. A business default that is already a bounded, always
+  expanded catalog is what makes expanding the bridge entry meaningful: one
+  expansion then reveals the whole downstream surface.
+- **Fixed shared view.** A shared registration (`multiProcessAllowed=false`) that
+  cannot virtualize views declares `sharedState.mode=fixed` and names the
+  downstream view-mutation tools in `rejectTools`; those calls receive
+  `shared_view_fixed`. Those names are registration data, never bridge knowledge.
+  Rejecting the view tool removes neither read-only discovery nor the call-by-name
+  gate, so a registration normally rejects only the tool that mutates the view.
+- **The other direction is a registration change, not a second fold.** If a client
+  cannot handle a changing `tools/list`, serve that environment with `connect`
+  (native, complete catalog) and let the business layer own the fold. Folding in
+  both layers for one environment is the configuration this rule forbids.
+
+What this does not claim: model-visible addition or removal still needs a
+per-turn tool-definition snapshot rather than a model self-report; a downstream
+fold is not a permission boundary; and the deferred entry does not forward client
+cancellation, so a cancelled or timed-out long call is not evidence that
+downstream work stopped. `rejectTools` also matches top-level tool names only, so
+a downstream call-by-name gate can still reach a rejected tool; rejecting a view
+tool declares that the business default never folds, and is not by itself an
+enforceable block on every path to that tool.
+
 ## Research basis
 
 Research retrieved on 2026-09-08, before implementation:
