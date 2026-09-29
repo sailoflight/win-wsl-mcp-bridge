@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import fnmatch
 import hashlib
 import ipaddress
@@ -30,7 +31,7 @@ import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import bridge_protocol
 import stream_evidence
@@ -250,6 +251,34 @@ def _is_loopback(host: str) -> bool:
     except (OSError, ValueError):
         return False
     return bool(addresses) and all(address.is_loopback for address in addresses)
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """A connection that closes when its ``with`` block ends.
+
+    ``with sqlite3.connect(...) as connection`` is a *transaction* context
+    manager: it commits or rolls back and leaves the connection open. Because a
+    connection participates in a reference cycle, that handle then survives
+    until a collection pass, which on Windows keeps the database file locked and
+    makes temporary-directory cleanup fail with ``Error 32``. This subclass
+    keeps the commit/rollback semantics and adds the close.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
+def connect_sqlite(
+    path: Any, *, timeout: float = 5.0, uri: bool = False
+) -> sqlite3.Connection:
+    """Open a registry/journal connection that also closes on context exit."""
+
+    return sqlite3.connect(
+        path, timeout=timeout, uri=uri, factory=_ClosingConnection
+    )
 
 
 def _normalize_concurrency(
@@ -1550,7 +1579,7 @@ class EventJournal:
         previous_umask = os.umask(0o077) if os.name != "nt" else None
         try:
             self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-            with sqlite3.connect(self.path, timeout=5) as connection:
+            with connect_sqlite(self.path) as connection:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute("PRAGMA synchronous = NORMAL")
                 connection.execute("PRAGMA foreign_keys = ON")
@@ -1597,7 +1626,7 @@ class EventJournal:
         encoded = _canonical_json(safe)
         if len(encoded.encode("utf-8")) > 4096:
             encoded = _canonical_json({"truncated": True})
-        with sqlite3.connect(self.path, timeout=5) as connection:
+        with connect_sqlite(self.path) as connection:
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute(
                 "INSERT INTO events (occurred_at_ns, monotonic_ns, side, category, "
@@ -1610,7 +1639,7 @@ class EventJournal:
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
-        with sqlite3.connect(self.path, timeout=5) as connection:
+        with connect_sqlite(self.path) as connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 "SELECT occurred_at_ns, side, category, correlation_id, target, "
@@ -1624,7 +1653,7 @@ class EventJournal:
 
     def prune(self) -> None:
         now = time.time_ns()
-        with sqlite3.connect(self.path, timeout=5) as connection:
+        with connect_sqlite(self.path) as connection:
             connection.execute("PRAGMA foreign_keys = ON")
             cutoff = now - self.max_age_seconds * 1_000_000_000
             connection.execute("DELETE FROM traces WHERE expires_at_ns <= ?", (now,))
@@ -1720,7 +1749,7 @@ class EventJournal:
             if not method_filter
             else _canonical_json(method_filter)
         )
-        with sqlite3.connect(self.path, timeout=5) as connection:
+        with connect_sqlite(self.path) as connection:
             connection.execute(
                 "INSERT INTO traces (trace_id,target,level,byte_budget,expires_at_ns,"
                 "confirmed,created_at_ns,direction_filter,method_filter_json) "
@@ -1810,7 +1839,7 @@ class EventJournal:
         kind, method = self._classify_message(data)
         now = time.time_ns()
         written = 0
-        with sqlite3.connect(self.path, timeout=5) as connection:
+        with connect_sqlite(self.path) as connection:
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("BEGIN IMMEDIATE")
@@ -1869,7 +1898,7 @@ class EventJournal:
         result stays JSON-safe; callers gate that explicitly.
         """
         limit = max(1, min(int(limit), 200))
-        with sqlite3.connect(self.path, timeout=5) as connection:
+        with connect_sqlite(self.path) as connection:
             connection.row_factory = sqlite3.Row
             clause = "WHERE trace_id = ?" if trace_id is not None else ""
             arguments: list[Any] = [trace_id] if trace_id is not None else []
@@ -1938,7 +1967,7 @@ class EventJournal:
     def active_targets(self) -> set[str]:
         """Distinct targets with confirmed, unexpired, non-exhausted sessions."""
         now = time.time_ns()
-        with sqlite3.connect(self.path, timeout=5) as connection:
+        with connect_sqlite(self.path) as connection:
             rows = connection.execute(
                 "SELECT DISTINCT target FROM traces WHERE confirmed = 1 "
                 "AND expires_at_ns > ? AND bytes_used < byte_budget",
@@ -1991,13 +2020,25 @@ class Registry:
                 )
             connection.execute("SELECT id FROM servers LIMIT 1").fetchall()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA query_only = ON")
-        return connection
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a short-lived reader connection and always close it.
+
+        ``with sqlite3.connect(...)`` is a *transaction* context manager, not a
+        closing one, so the bare idiom leaves the file handle open until the
+        object is collected. On Windows that open handle blocks temp-directory
+        cleanup with ``WinError 32``, so the connection is closed explicitly
+        here instead of relying on collection.
+        """
+        connection = connect_sqlite(self.path)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA query_only = ON")
+            yield connection
+        finally:
+            connection.close()
 
     @classmethod
     def initialize_database(
@@ -2020,7 +2061,7 @@ class Registry:
         connection: sqlite3.Connection | None = None
         try:
             database.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-            connection = sqlite3.connect(database, timeout=5)
+            connection = connect_sqlite(database)
             if os.name != "nt":
                 database.chmod(0o600)
             connection.execute("PRAGMA foreign_keys = ON")

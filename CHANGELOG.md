@@ -4,6 +4,32 @@ All notable changes to this project are recorded here.
 
 ## 0.4.0 - Unreleased
 
+### Verification: a deterministic CI gate, and connections that close
+
+- `tests/run_offline.py` splits the offline suite. `--deterministic-only` runs
+  everything except a named set of load-sensitive tests (bounded handler
+  deadlines, concurrent 404 recovery, spawn and initialize counting, connector
+  liveness under thread load), and the blocking CI `test` job now uses it. Those
+  tests assert wall-clock and interleaving behaviour: they pass on an idle host
+  and flake on a saturated two-core runner, which had made every push red. The
+  whole suite still runs in a non-blocking job, so a real regression stays
+  visible.
+- The Windows matrix leg is non-blocking until its recorded causes are resolved:
+  `WinError 32` while a temporary directory holding a registry or journal
+  database is removed, `WinError 10038` and `WinError 10022` on closed or
+  unconnected loopback sockets, a bounded fixture-cleanup deadline, and a
+  candidate check that rejects a pre-existing unrelated `%USERPROFILE%\.claude.json`
+  on the runner.
+- Connections close when their `with` block ends. `with sqlite3.connect(...) as
+  connection` is a *transaction* context manager, not a closing one: it commits
+  or rolls back and leaves the handle open until a collection pass, which on
+  Windows keeps the database file locked and makes temporary-directory cleanup
+  fail with `Error 32`. `bridge_runtime.connect_sqlite` now supplies a
+  `_ClosingConnection` that keeps the commit/rollback semantics and adds the
+  close, and every runtime journal/registry connection and both projection
+  connection factories use it. This is the recorded cause of most Windows-only
+  test failures. Test-side connections are unchanged.
+
 ### Registration concurrency: one client and one backend by default
 
 - A registration now declares `process.concurrency`, one of `one-to-one`,

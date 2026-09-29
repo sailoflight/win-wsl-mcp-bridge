@@ -26,6 +26,41 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -t . -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_bridge
 ```
 
+The suite is split into a deterministic gate and a load-sensitive remainder:
+
+```bash
+# What CI gates on: every test except the named load-sensitive set.
+PYTHONDONTWRITEBYTECODE=1 python3 -m tests.run_offline --deterministic-only -v
+
+# The whole suite, load-sensitive tests included; run this on an idle host.
+PYTHONDONTWRITEBYTECODE=1 python3 -m tests.run_offline -v
+
+# Show exactly which tests the gate excludes.
+PYTHONDONTWRITEBYTECODE=1 python3 -m tests.run_offline --list-load-sensitive
+```
+
+`tests/run_offline.py` names the excluded tests individually, with the pressure
+each one is sensitive to. They assert wall-clock and interleaving behaviour, so
+they pass on an idle host and flake on a saturated two-core runner — a shared CI
+leg, or a workstation running several Agents at once. Add a name there only
+with a recorded intermittent failure, and run the full suite before a release:
+the whole suite still runs in CI, non-blockingly, so a regression stays visible.
+
+Windows CI is not a gate. The recorded causes are `PermissionError [WinError 32]`
+while a temporary directory holding `registry.sqlite3`, `events.sqlite`, or
+`win.sqlite` is removed, `OSError [WinError 10038]` and `[WinError 10022]` on
+closed or unconnected loopback sockets, a bounded fixture-cleanup deadline, and a
+candidate check that rejects a pre-existing unrelated `%USERPROFILE%\.claude.json`
+on the runner. Most of those failures share one production cause, now fixed:
+`with sqlite3.connect(...) as connection` is a transaction context manager, not a
+closing one, so the handle stayed open and blocked Windows temporary-directory
+cleanup with `WinError 32`. `bridge_runtime.connect_sqlite` supplies a
+`_ClosingConnection` that keeps commit/rollback and adds the close, and the
+runtime journal/registry sites and both projection connection factories use it.
+Test-side `sqlite3.connect` calls still use the bare idiom, and the remaining
+Windows causes above are not yet fixed, so the leg stays non-blocking until a run
+confirms otherwise.
+
 The `test_bridge.py` suite verifies:
 
 - typed stdio/Streamable-HTTP registry validation and public redaction, native HTTP relay and registered external HTTP control contracts, the constant two-tool Control MCP catalog/token budget, bounded event retention, and sensitive trace confirmation;
@@ -44,7 +79,9 @@ The `test_bridge.py` suite verifies:
   preserves downstream initialization instructions, pages/searches the current catalog,
   returns exact schemas on selection, invokes the bound target, and projects one
   independent registration per peer rather than a global mega-tool;
-- explicit `multiProcessAllowed=false` enforcement with one shared spawn future,
+- `one-to-one` (the default) client admission refusing a second client with a
+  structured, retryable `client_admission_exclusive` open error, and releasing
+  the slot on detach, with one shared spawn future,
   one backend/profile owner, heterogeneous-client initialize virtualization using
   a deterministic Bridge profile, downstream instruction/capability replay,
   paginated tool-catalog agreement, capability-aware server-request routing,

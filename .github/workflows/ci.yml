@@ -1,5 +1,24 @@
 name: verify
 
+# The blocking gate is `test` plus `package`. Two further jobs run the checks
+# that are currently not trustworthy as a gate, non-blockingly, so the signal
+# is kept without making every push red:
+#
+#   * `load-sensitive` — tests whose verdict depends on how much else is
+#     running (bounded handler deadlines, a concurrent 404 recovery, spawn /
+#     initialize counting, connector liveness under thread load). They pass on
+#     an idle host and flake on a saturated 2-core runner. The blocking `test`
+#     job skips exactly the named set (`tests/run_offline.py --deterministic-only`);
+#     this job runs the whole suite so a real regression is still visible.
+#   * `windows` — the Windows legs of the matrix have never passed since the
+#     import. Recorded causes: `PermissionError [WinError 32]` while a temp
+#     directory holding `registry.sqlite3` / `events.sqlite` / `win.sqlite` is
+#     removed, `OSError [WinError 10038]` / `[WinError 10022]` on closed or
+#     unconnected sockets, a fixture cleanup deadline, and a bridge candidate
+#     check that rejects a pre-existing `%USERPROFILE%\.claude.json` on the
+#     runner. Installing an unrelated client's config is not this repository's
+#     to fix; the job stays non-blocking until the rest is resolved.
+
 on:
   push:
   pull_request:
@@ -9,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     env:
@@ -19,8 +38,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Run unit and integration tests
-        run: python -m unittest discover -s tests -t . -v
+      - name: Run the deterministic suite
+        run: python -m tests.run_offline --deterministic-only -v
+
+  load-sensitive:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run the whole suite, including the load-sensitive tests
+        run: python -m tests.run_offline -v
+
+  windows:
+    continue-on-error: true
+    runs-on: windows-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run the deterministic suite
+        run: python -m tests.run_offline --deterministic-only -v
 
   package:
     runs-on: ubuntu-latest

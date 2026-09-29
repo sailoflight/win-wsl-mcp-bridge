@@ -24,7 +24,7 @@ from typing import Any
 
 from bridge_runtime import (
     BridgeError, ID_PATTERN, SHARED_COMPATIBLE_PROTOCOL_VERSIONS,
-    _canonical_json, default_registry_path, local_registry_query,
+    _canonical_json, connect_sqlite, default_registry_path, local_registry_query,
 )
 
 # =========================================================================
@@ -260,7 +260,7 @@ class ProjectionDatabase:
         connection: sqlite3.Connection | None = None
         try:
             path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-            connection = sqlite3.connect(path, timeout=5)
+            connection = connect_sqlite(path)
             if os.name != "nt":
                 path.chmod(0o600)
             connection.execute("PRAGMA foreign_keys = ON")
@@ -335,9 +335,9 @@ class ProjectionDatabase:
         if write and self.observe_only:
             raise BridgeError("read-only projection database cannot be written")
         if self.observe_only:
-            connection = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+            connection = connect_sqlite(self.path.resolve().as_uri() + "?mode=ro", uri=True)
         else:
-            connection = sqlite3.connect(self.path, timeout=5)
+            connection = connect_sqlite(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
@@ -2590,7 +2590,7 @@ def _fetch_peer_projection_facts(
     if source == "registry-path":
         if peer_registry is None or not peer_registry.is_file():
             raise BridgeError("projection sync requires an existing --peer-registry path")
-        connection = sqlite3.connect(peer_registry, timeout=5)
+        connection = connect_sqlite(peer_registry)
         try:
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.execute("PRAGMA query_only = ON")
@@ -3943,9 +3943,9 @@ def projection_reconcile(
         with tempfile.TemporaryDirectory(prefix="bridge-projection-preview-") as temporary:
             preview = Path(temporary) / "projection.sqlite3"
             if projection.exists():
-                with closing(sqlite3.connect(
+                with closing(connect_sqlite(
                     projection.resolve().as_uri() + "?mode=ro", uri=True, timeout=5,
-                )) as source, closing(sqlite3.connect(preview, timeout=5)) as destination:
+                )) as source, closing(connect_sqlite(preview)) as destination:
                     source.backup(destination)
             ProjectionDatabase.ensure(preview)
             sync_result = None

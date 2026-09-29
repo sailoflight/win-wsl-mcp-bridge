@@ -36,7 +36,7 @@ class ProjectionDatabasePreviewTest(unittest.TestCase):
                         raise sqlite3.OperationalError("injected second ALTER failure")
                     return super().execute(sql, *args, **kwargs)
 
-            with mock.patch.object(bridge.sqlite3, "connect", side_effect=lambda *a, **k:
+            with mock.patch.object(bridge, "connect_sqlite", side_effect=lambda *a, **k:
                                    connect(*a, **k, factory=FailingConnection)):
                 with self.assertRaisesRegex(sqlite3.OperationalError, "injected"):
                     bridge.ProjectionDatabase.ensure(path)
@@ -82,7 +82,7 @@ class ProjectionDatabasePreviewTest(unittest.TestCase):
                 except Exception as exc:
                     errors.append(exc)
 
-            with mock.patch.object(bridge.sqlite3, "connect", side_effect=lambda *a, **k:
+            with mock.patch.object(bridge, "connect_sqlite", side_effect=lambda *a, **k:
                                    connect(*a, **k, factory=ConcurrentConnection)):
                 workers = [threading.Thread(target=upgrade) for _ in range(2)]
                 for worker in workers:
