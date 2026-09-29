@@ -37,7 +37,7 @@ sys.path.insert(0, str(ROOT))
 import bridge_runtime  # noqa: E402
 import stream_evidence  # noqa: E402
 
-from bridge_runtime import EventJournal, Registry  # noqa: E402
+from bridge_runtime import EventJournal, Registry, connect_sqlite  # noqa: E402
 
 
 _ALLOCATED_TEST_PORTS: set[int] = set()
@@ -667,10 +667,11 @@ def _wait_for_rows(journal_path: Path, *, minimum: int, timeout: float = 12.0) -
 
 
 def _recent_correlation_rows(journal_path: Path, limit: int = 200) -> list[dict]:
-    import sqlite3 as _sqlite
-
-    with _sqlite.connect(f"file:{journal_path}?mode=ro", uri=True, timeout=2) as connection:
-        connection.row_factory = _sqlite.Row
+    # ``connect_sqlite`` closes on context exit. The bare ``with connect(...)``
+    # idiom is a transaction context manager, so the handle survived this
+    # process and blocked Windows temporary-directory cleanup with ``Error 32``.
+    with connect_sqlite(f"file:{journal_path}?mode=ro", uri=True, timeout=2) as connection:
+        connection.row_factory = sqlite3.Row
         return [
             {key: row[key] for key in row.keys() if key != "metadata_json"}
             | {"metadata": json.loads(row["metadata_json"])}
