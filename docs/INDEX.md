@@ -11,6 +11,7 @@ are not current capabilities; fixture checks are not installed-client evidence.
 | Axis-based development, behavior combinations, dependencies and release gates | [未来开发总计划](DEVELOPMENT_PLAN.md) |
 | Current completion evidence and open gates | [Acceptance ledger](IMPLEMENTATION_STATUS.md) |
 | Offline checks and field acceptance | [Verification](VERIFICATION.md) |
+| Windows CI failure root causes and open fixes | [Windows CI diagnosis](CI_WINDOWS_FAILURES.md) |
 | Pinned official SDK interoperability | [SDK evidence](SDK_INTEROP.md) |
 | Harness capability probes and MCP tool exposure | [Tool exposure](MCP_TOOL_EXPOSURE.md) |
 | Ten behavior axes, composition constraints, environment evidence and implementation gaps | [桥行为轴与组合矩阵](MCP_EXPOSURE_TAXONOMY.md) |
