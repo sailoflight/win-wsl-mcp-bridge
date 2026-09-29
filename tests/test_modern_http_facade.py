@@ -518,10 +518,19 @@ class ModernFacadeTests(unittest.TestCase):
             self.assertEqual(json.loads(response.readline()[6:])["params"]["progressToken"], "cli-token")
             process.terminate()
             stdout, stderr = process.communicate(timeout=5)
-            self.assertEqual(process.returncode, 0, stderr.decode())
+            if os.name == "nt":
+                # ``Popen.terminate()`` is ``TerminateProcess`` on Windows: the
+                # child dies outright with exit code 1 and no signal handler
+                # runs, even one it installed for SIGTERM. The graceful-SIGTERM
+                # reaping path asserted below therefore exists only on POSIX;
+                # everything else this test covers still runs here.
+                self.assertEqual(process.returncode, 1, stderr.decode())
+            else:
+                self.assertEqual(process.returncode, 0, stderr.decode())
             self.assertEqual(stdout, b"")
             self.assertNotIn(SECRET, stderr.decode())
-            self.wait_until(lambda: all(self.pid_gone(e["pid"]) for e in self.events() if e["event"] == "spawn"))
+            if os.name != "nt":
+                self.wait_until(lambda: all(self.pid_gone(e["pid"]) for e in self.events() if e["event"] == "spawn"))
             self.assertEqual(len([e for e in self.events() if e["event"] == "executed" and e.get("id") == 121]), 1)
         finally:
             if response is not None:

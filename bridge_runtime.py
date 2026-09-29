@@ -12489,8 +12489,19 @@ def _write_registry_mcp_response(response: dict[str, Any]) -> None:
             },
             separators=(",", ":"),
         )
-    sys.stdout.write(encoded + "\n")
-    sys.stdout.flush()
+    payload = encoded.encode("utf-8") + b"\n"
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        # A captured stdout (a StringIO) is not a wire, so the text path is
+        # fine there; only a real stdout must carry bytes.
+        sys.stdout.write(encoded + "\n")
+        sys.stdout.flush()
+        return
+    # Protocol output is bytes. Handing the string to ``sys.stdout`` would
+    # encode it with the platform locale codec — the ANSI code page on Windows
+    # — so any non-ASCII payload would reach the client as invalid UTF-8.
+    stream.write(payload)
+    stream.flush()
 
 
 def registry_mcp(
