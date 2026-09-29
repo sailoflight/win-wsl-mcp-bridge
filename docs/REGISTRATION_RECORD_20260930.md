@@ -159,6 +159,8 @@ dsh: overlay entry 3 in …/cordis-bridge-overlay.json must be a mapping (a load
 
 即：一旦走正统路径，cadq/meshq 会同时进入 codex（`~/.codex/config.toml`）与 claude（`~/.claude.json`）。MeshQ 的 Windows 部署尚未完成，此时把空指针推进这两个客户端会带来启动噪声——**故暂缓，等 MeshQ 部署落地后再决定**。
 
+**已定（Operator 决定）**：保持现状（cadq/meshq 只挂在三个 dsh profile，手加但已证明对 reconcile 稳定）；等 MeshQ 的 Windows 部署完成、`--doctor` 与 MCP 验收通过之后，再一次性让桥的投影权威接管这两条（届时 codex/claude 一并受益，不会出现空指针）。在那之前不运行 `projection sync`，以免把未部署的 meshq 推进镜像。
+
 ## §6 已知缺口与回滚
 
 **缺口**
