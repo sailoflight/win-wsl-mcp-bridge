@@ -66,29 +66,33 @@ Initialize the WSL-local registry:
 The default database is beneath `$XDG_STATE_HOME/win-wsl-mcp-bridge` or
 `~/.local/state/win-wsl-mcp-bridge`. Never place it under `/mnt/c`.
 
-## Registration mode: dedicated by default
+## Registration mode: one backend by default
 
-A registration is a dedicated process by default. `multiProcessAllowed` is `true`
-once the MCP is verified to tolerate a second concurrent instance, and `null`
-while that is not yet verified; either way each logical client gets its own
-byte-transparent stream and the bridge never parses or rewrites the MCP's
-JSON-RPC. Prefer `true`: most business MCPs are ordinary per-process stdio
-servers, so several clients can each run their own instance instead of queueing
-behind one.
+A registration starts exclusive: one bridge-owned backend generation serves every
+logical client of that registration and node, declared as
+`multiProcessAllowed=false`. Multi-open (`true`) is earned, not assumed — promote a
+registration to it only after an observation shows the MCP tolerates a second
+concurrent instance. `null` stays the "not yet verified" value and behaves as a
+dedicated byte-transparent stream, so write `false` deliberately when exclusivity is
+what you mean instead of leaving the field unset.
 
-Dedicated is not by itself a claim that two instances can share state. An MCP that
-writes a fixed output path, or that is not safe under two simultaneous calls, can
-still collide with its own second instance. Declare `true` once that is settled,
-and treat "can it be opened twice" (process isolation) as a separate question from
-"can two runs interleave safely" (business state).
+Why exclusive first: the second instance is what breaks quietly. An MCP with a fixed
+output path, a single lock file, a device session, or a license that refuses a second
+seat can collide with its own copy, and the symptom is a wrong or half-written result
+rather than an error the caller can see. Promote only when you can name the evidence:
+two instances running concurrently through the surface you actually use, each
+producing the output it expects, with no interference observed.
 
-## Shared backend registration (explicit exception)
+What exclusive costs, so that promotion is a real decision: the bridge parses and
+rewrites JSON-RPC instead of passing bytes through; connection-scoped tool views need
+`sharedState.mode=fixed` (below); `inputDelivery` is rejected, so an Agent-local file
+can only be staged to a dedicated process; and calls from different clients are
+serialized, so one long call delays the others.
 
-Use explicit `multiProcessAllowed=false` only for an MCP that genuinely cannot be
-opened more than once: a single browser profile or device session, an exclusive
-cloud login, or any service whose account or license refuses a second concurrent
-instance. Those are the registrations for which one shared backend generation per
-registration and node is the honest model. The bridge normalizes enforcement to
+## Shared backend registration
+
+Use explicit `multiProcessAllowed=false` for the registrations that run one shared
+backend generation per registration and node. The bridge normalizes enforcement to
 `bridge-shared-backend`. This mode parses and rewrites JSON-RPC, needs
 `sharedState.mode=fixed` when the MCP exposes connection-scoped views, and cannot
 use `inputDelivery` (below). `true` and `null` retain dedicated byte-transparent
