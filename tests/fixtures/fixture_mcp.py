@@ -94,7 +94,11 @@ for raw in sys.stdin:
                     raise ValueError("create_artifact requires text")
                 stage = Path(os.environ["WIN_WSL_MCP_BRIDGE_ARTIFACT_STAGE"])
                 filename = "fixture-result.txt"
-                (stage / filename).write_text(text, encoding="utf-8")
+                # Bytes, not lines: the published sha256 covers exactly what is
+                # written here. Text mode would translate "\n" to os.linesep, so
+                # on Windows the delivered file would hash differently from the
+                # text the caller asked for while still reading back unchanged.
+                (stage / filename).write_text(text, encoding="utf-8", newline="\n")
                 publisher = subprocess.run(
                     [
                         os.environ["WIN_WSL_MCP_BRIDGE_ARTIFACT_PYTHON"],

@@ -10,8 +10,20 @@ repository was not modified by that run.
 
 Update since: root cause RC1 (a sqlite handle that is never closed) is fixed for
 the production runtime and the projection package in commit `7d366d5`, via
-`bridge_runtime.connect_sqlite` and `_ClosingConnection`. RC2 through RC9 remain
-open, as does the test-side half of RC1.
+`bridge_runtime.connect_sqlite` and `_ClosingConnection`. RC2 through RC9 are
+worked through separately, as is the test-side half of RC1.
+
+One item this report left open is now resolved. Its closing section could not
+determine why `test_windows_mcp_pushes_artifact_into_wsl_workspace` fails on an
+artifact SHA-256 mismatch rather than a path, and suspected a real Windows
+transfer defect. It is not one: `tests/fixtures/fixture_mcp.py` staged the
+artifact with `Path.write_text(text, encoding="utf-8")`, which translates `\n`
+to `os.linesep`, so on Windows the published bytes were CRLF while the caller
+compared against the LF digest. The delivered file still *read back* as the
+original text — universal newlines hide the difference — which is exactly why
+the mismatch showed up on the digest and not on the content. The write now
+passes `newline="\n"`, so the published digest covers the bytes the caller
+asked for.
 
 ---
 
