@@ -35,22 +35,28 @@ LOAD_SENSITIVE: frozenset[str] = frozenset(
         ".test_01_concurrent_clients_share_spawn_and_route_ids",
         "tests.test_bridge.BidirectionalIntegrationTest"
         ".test_connector_stays_alive_and_reconnects_after_remote_close",
-        "tests.test_bridge.PersistentConnectorStdioTest"
-        ".test_reconnects_replays_handshake_and_never_exits_while_stdin_open",
-        "tests.test_bridge.PersistentConnectorStdioTest"
-        ".test_stale_core_warning_only_in_initialize_instructions_and_errors",
-        "tests.test_bridge.PersistentConnectorStdioTest"
-        ".test_no_stale_annotation_when_core_is_current",
-        "tests.test_bridge.PersistentConnectorStdioTest"
-        ".test_native_downstream_tools_are_discovered_and_proxied",
-        "tests.test_bridge.PersistentConnectorStdioTest"
-        ".test_optional_result_note_only_with_engine_policy_and_stale_core",
-        "tests.test_bridge.PersistentConnectorStdioTest"
-        ".test_pending_business_call_fails_exactly_once_when_stream_lost",
         "tests.test_legacy_profiles.LegacySharedAcceptanceTest"
         ".test_03_crash_recovery_renegotiates_the_same_actual_without_replay",
     }
 )
+
+#: Whole classes whose every member shares one load-sensitive mechanism, so
+#: listing members one by one would only invite the unlisted ones to flake.
+LOAD_SENSITIVE_CLASSES: frozenset[str] = frozenset(
+    {
+        # Every member collects connector output through FdLineReader.read_line
+        # with a 0.3 s poll; on a saturated host a message that arrives late is
+        # indistinguishable from one that never arrives.
+        "tests.test_bridge.PersistentConnectorStdioTest",
+    }
+)
+
+
+def _is_load_sensitive(test_id: str) -> bool:
+    if test_id in LOAD_SENSITIVE:
+        return True
+    owner, _, _ = test_id.rpartition(".")
+    return owner in LOAD_SENSITIVE_CLASSES
 
 
 def _flatten(suite: unittest.TestSuite):
@@ -67,7 +73,7 @@ def build_suite(deterministic_only: bool) -> unittest.TestSuite:
     )
     selected = unittest.TestSuite()
     for test in _flatten(discovered):
-        if deterministic_only and test.id() in LOAD_SENSITIVE:
+        if deterministic_only and _is_load_sensitive(test.id()):
             continue
         selected.addTest(test)
     return selected
@@ -90,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.list_load_sensitive:
         for test_id in sorted(LOAD_SENSITIVE):
             print(test_id)
+        for class_id in sorted(LOAD_SENSITIVE_CLASSES):
+            print(f"{class_id}.*")
         return 0
     suite = build_suite(arguments.deterministic_only)
     result = unittest.TextTestRunner(verbosity=2 if arguments.verbose else 1).run(

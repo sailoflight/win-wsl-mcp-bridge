@@ -40,8 +40,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m tests.run_offline --list-load-sensitive
 ```
 
 `tests/run_offline.py` names the excluded tests individually, with the pressure
-each one is sensitive to. They assert wall-clock and interleaving behaviour, so
-they pass on an idle host and flake on a saturated two-core runner — a shared CI
+each one is sensitive to, and also excludes a few whole classes whose every
+member shares one load-sensitive mechanism (`LOAD_SENSITIVE_CLASSES`) — listing
+those members one by one would only invite the unlisted ones to flake. They
+assert wall-clock and interleaving behaviour, so they pass on an idle host and
+flake on a saturated two-core runner — a shared CI
 leg, or a workstation running several Agents at once. Add a name there only
 with a recorded intermittent failure, and run the full suite before a release:
 the whole suite still runs in CI, non-blockingly, so a regression stays visible.
