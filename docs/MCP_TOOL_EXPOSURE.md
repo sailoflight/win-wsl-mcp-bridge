@@ -76,9 +76,10 @@ a view the others share, so exactly one layer folds:
 
 What this does not claim: model-visible addition or removal still needs a
 per-turn tool-definition snapshot rather than a model self-report; a downstream
-fold is not a permission boundary; and the deferred entry does not forward client
-cancellation, so a cancelled or timed-out long call is not evidence that
-downstream work stopped. `rejectTools` also matches top-level tool names only, so
+fold is not a permission boundary; the deferred entry forwards a client
+cancellation for the call in flight, but a downstream that ignores it may still
+finish the work, so cancelling or timing out is not evidence that downstream work
+stopped. `rejectTools` also matches top-level tool names only, so
 a downstream call-by-name gate can still reach a rejected tool; rejecting a view
 tool declares that the business default never folds, and is not by itself an
 enforceable block on every path to that tool.

@@ -124,6 +124,15 @@ class FakeNode:
                                                 "result": self._call_result(original)})
                         continue
                     if "id" not in request:
+                        # A forwarded cancellation answers the call it names, which
+                        # lets a test observe both the rewrite and the relayed error.
+                        if request.get("method") == "notifications/cancelled":
+                            held = session.pop("held", None)
+                            if held is not None and \
+                                    request.get("params", {}).get("requestId") == held["id"]:
+                                self.send(session, {"jsonrpc": "2.0", "id": held["id"],
+                                                    "error": {"code": -32800,
+                                                              "message": "cancelled by fixture"}})
                         continue
                     method = request["method"]
                     if method == "initialize":
@@ -153,6 +162,7 @@ class FakeNode:
                         if self.close_on_call:
                             return
                         if self.hold_call:
+                            session["held"] = request
                             continue
                         if self.call_error is not None:
                             self.send(session, {"jsonrpc": "2.0", "id": request["id"],
@@ -624,6 +634,48 @@ class DeferredToolsTests(unittest.TestCase):
         self.node.hold_call = False
         self.assertIn("result", client.request("tools/list"))
         self.assertEqual(len(self.node.requests("tools/call")), 1)
+
+    def test_client_cancellation_is_forwarded_for_the_call_in_flight(self):
+        node = self.node
+        client = self.initialized(REQUEST_TIMEOUT=5)
+        client.library("expand")
+        client.notice()
+        node.hold_call = True
+        client.send({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                     "params": {"name": "fixture_echo", "arguments": {"value": "slow"}}})
+        deadline = time.monotonic() + 5
+        while not node.requests("tools/call") and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(len(node.requests("tools/call")), 1)
+        downstream_id = node.requests("tools/call")[0]["id"]
+        # A cancellation naming anything else must not touch the in-flight call.
+        client.send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                     "params": {"requestId": 999}})
+        time.sleep(.05)
+        self.assertEqual(node.requests("notifications/cancelled"), [])
+        client.send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                     "params": {"requestId": 7, "reason": "user"}})
+        reply = None
+        deadline = time.monotonic() + 5
+        while reply is None and time.monotonic() < deadline:
+            try:
+                incoming = client.messages.get(timeout=.5)
+            except queue.Empty:
+                continue
+            if incoming.get("id") == 7:
+                reply = incoming
+        self.assertIsNotNone(reply)
+        # The downstream error is relayed unchanged; the facade never invents one.
+        self.assertEqual(reply["error"]["code"], -32800)
+        self.assertEqual(reply["error"]["message"], "cancelled by fixture")
+        forwarded = node.requests("notifications/cancelled")
+        self.assertEqual(len(forwarded), 1)
+        self.assertEqual(forwarded[0]["params"]["requestId"], downstream_id)
+        self.assertNotEqual(forwarded[0]["params"]["requestId"], 7)
+        # The cancelled call is never replayed and the facade stays usable.
+        node.hold_call = False
+        self.assertIn("result", client.request("tools/list"))
+        self.assertEqual(len(node.requests("tools/call")), 1)
 
     def test_server_requests_refused_without_deadlock_or_id_collision(self):
         self.node.server_request = True

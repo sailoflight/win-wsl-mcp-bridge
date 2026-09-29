@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import json
+import queue
 import socket
 import sys
 import threading
@@ -59,8 +60,9 @@ PROFILE_NOTE = (
     "conversation history are not current callable definitions. refreshRequested describes this "
     "response's notification request, not an acknowledgement of client/model readiness; "
     "status and toolCount describe only the bridge. Resources, prompts, subscriptions, "
-    "tasks, sampling, elicitation, and roots are not forwarded. Client cancellation "
-    "notifications are not forwarded; a timeout does not prove execution stopped. "
+    "tasks, sampling, elicitation, and roots are not forwarded. A client cancellation "
+    "notification is forwarded for the call in flight; a downstream that ignores it "
+    "may still finish the work, and a timeout does not prove execution stopped. "
     "A disconnected call has an unknown outcome and is never replayed automatically."
 )
 
@@ -282,6 +284,25 @@ class _Peer:
             self._fail("downstream_unavailable")
             raise _Fault("downstream_unavailable", retryable=True)
 
+    def cancel_pending(self) -> bool:
+        """Forward one cancellation for the exchange in flight, if any.
+
+        Runs on the input reader thread while ``request`` waits, so it must not
+        take ``lock`` for the whole send: it only snapshots the pending id.
+        """
+        with self.lock:
+            pending = self.pending
+            closed = self.closed
+        if pending is None or closed:
+            return False
+        try:
+            self._send({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": pending.request_id}})
+        except (OSError, ValueError, _Fault):
+            self._fail("downstream_unavailable")
+            return False
+        return True
+
     def request(self, method: str, params: dict[str, Any], timeout: float | None = None) -> Any:
         if timeout is None:
             timeout = REQUEST_TIMEOUT
@@ -409,6 +430,9 @@ class DeferredSession:
         self.version: str | None = None
         self.client_ready = False
         self.closed = False
+        # The one client request the serialized loop is currently serving, so the
+        # input reader can match a cancellation to it and to the downstream id.
+        self.inflight_request_id: Any = None
         self.expanded = False
         self.catalog: list[dict[str, Any]] | None = None
         # Last bridge-published names, retained across invalidation only for
@@ -417,6 +441,22 @@ class DeferredSession:
         self.epoch = 0
         self.revision = 0
         self.reason = "unobserved"
+
+    def cancel(self, params: Any) -> bool:
+        """Forward one client cancellation for the request currently in flight.
+
+        A cancellation for any other id is ignored: nothing is in flight, or the
+        named request is still queued behind the current one.
+        """
+        if not isinstance(params, dict) or not _valid_id(params.get("requestId")):
+            return False
+        request_id = params["requestId"]
+        with self.lock:
+            peer = self.peer
+            matched = (not self.closed and self.inflight_request_id == request_id)
+        if peer is None or not matched:
+            return False
+        return peer.cancel_pending()
 
     def close(self) -> None:
         self.closed = True
@@ -671,6 +711,8 @@ class DeferredSession:
                 if not _valid_id(message["id"]):
                     raise _Fault("invalid_request_id", code=-32600)
                 request_id = message["id"]
+                with self.lock:
+                    self.inflight_request_id = request_id
             method = message["method"]
             params = message.get("params", {})
             if not isinstance(params, dict) or ("_meta" in params and not isinstance(params["_meta"], dict)):
@@ -747,6 +789,26 @@ class DeferredSession:
         except (ValueError, TypeError, RecursionError, OSError):
             return {"jsonrpc": "2.0", "id": request_id,
                     "error": _Fault("invalid_or_unavailable_downstream").error}
+        finally:
+            if request_id is not None:
+                with self.lock:
+                    if self.inflight_request_id == request_id:
+                        self.inflight_request_id = None
+
+
+class _InputEnded:
+    """Sentinel: stdin closed, so queued work drains before the loop returns."""
+
+
+class _OversizedFrame:
+    """Sentinel: one frame exceeded the limit; resynchronizing is unsafe."""
+
+
+class _RejectedFrame:
+    """One undecodable input line, reported in arrival order."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
 
 
 def run_deferred_mcp(local_host: str, local_port: int, target: str) -> int:
@@ -762,22 +824,52 @@ def run_deferred_mcp(local_host: str, local_port: int, target: str) -> int:
             sys.stdout.buffer.flush()
 
     session = DeferredSession(local_host, local_port, target, emit)
-    try:
+    # Requests stay serialized on this thread. Input is read on a second thread
+    # only so a cancellation can overtake the call it cancels, and decoded frames
+    # keep their arrival order through the queue.
+    inbound: queue.Queue[Any] = queue.Queue()
+
+    def read_input() -> None:
         while True:
-            raw = sys.stdin.buffer.readline(MAX_MESSAGE_BYTES + 1)
+            try:
+                raw = sys.stdin.buffer.readline(MAX_MESSAGE_BYTES + 1)
+            except (OSError, ValueError):
+                inbound.put(_InputEnded())
+                return
             if not raw:
-                return 0
+                inbound.put(_InputEnded())
+                return
             if len(raw) > MAX_MESSAGE_BYTES:
-                emit({"jsonrpc": "2.0", "id": None,
-                      "error": {"code": -32700, "message": "MCP message exceeds limit"}})
-                return 2  # Do not resynchronize an unbounded hostile input stream.
+                inbound.put(_OversizedFrame())
+                return
             try:
                 message = _decode(raw)
             except (ValueError, UnicodeError, RecursionError):
-                emit({"jsonrpc": "2.0", "id": None,
-                      "error": {"code": -32700, "message": "invalid JSON"}})
+                inbound.put(_RejectedFrame("invalid JSON"))
                 continue
-            response = session.handle(message)
+            if (isinstance(message, dict)
+                    and message.get("method") == "notifications/cancelled"
+                    and "id" not in message):
+                session.cancel(message.get("params"))
+                continue
+            inbound.put(message)
+
+    reader = threading.Thread(target=read_input, name="deferred-mcp-input", daemon=True)
+    reader.start()
+    try:
+        while True:
+            item = inbound.get()
+            if isinstance(item, _InputEnded):
+                return 0
+            if isinstance(item, _OversizedFrame):
+                emit({"jsonrpc": "2.0", "id": None,
+                      "error": {"code": -32700, "message": "MCP message exceeds limit"}})
+                return 2  # Do not resynchronize an unbounded hostile input stream.
+            if isinstance(item, _RejectedFrame):
+                emit({"jsonrpc": "2.0", "id": None,
+                      "error": {"code": -32700, "message": item.message}})
+                continue
+            response = session.handle(item)
             if response is not None:
                 emit(response)
     except (BrokenPipeError, OSError, _Fault):
