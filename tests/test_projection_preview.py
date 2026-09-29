@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest import mock
 
+from bridge_runtime import connect_sqlite
 from installer import projection as bridge
 from tests.test_bridge import ProjectionHarness
 
@@ -17,7 +18,7 @@ def make_v4(path: Path) -> None:
     schema = bridge.PROJECTION_SCHEMA.replace(
         "    tool_exposure TEXT NOT NULL DEFAULT 'native',\n", ""
     ).replace("    harness_verification_json TEXT NOT NULL DEFAULT '{}',\n", "")
-    with sqlite3.connect(path) as connection:
+    with connect_sqlite(path) as connection:
         connection.executescript(schema)
         connection.execute("PRAGMA user_version=4")
         connection.execute("INSERT INTO projection_meta VALUES ('fixture', 'retained')")
@@ -40,7 +41,7 @@ class ProjectionDatabasePreviewTest(unittest.TestCase):
                                    connect(*a, **k, factory=FailingConnection)):
                 with self.assertRaisesRegex(sqlite3.OperationalError, "injected"):
                     bridge.ProjectionDatabase.ensure(path)
-            with connect(path) as connection:
+            with connect_sqlite(path) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 4)
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_environments)")}
                 self.assertNotIn("tool_exposure", columns)
@@ -57,7 +58,7 @@ class ProjectionDatabasePreviewTest(unittest.TestCase):
             make_v4(path)
             # WAL is established before the contenders to isolate schema-lock
             # ordering from journal-mode transitions.
-            with sqlite3.connect(path) as connection:
+            with connect_sqlite(path) as connection:
                 connection.execute("PRAGMA journal_mode=WAL")
             barrier = threading.Barrier(2)
             connect = sqlite3.connect
@@ -98,7 +99,7 @@ class ProjectionDatabasePreviewTest(unittest.TestCase):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
                 path = Path(temporary) / "projection.sqlite3"
                 make_v4(path)
-                with sqlite3.connect(path) as connection:
+                with connect_sqlite(path) as connection:
                     connection.execute("ALTER TABLE agent_environments DROP COLUMN stdio_http_endpoints_json")
                     if version <= 2:
                         connection.execute("ALTER TABLE agent_environments DROP COLUMN relay_base_url")
@@ -170,7 +171,7 @@ class ProjectionRefreshPreviewTest(ProjectionHarness):
             path.chmod(0o640)
         before = path.read_bytes(), path.stat().st_mode
         configs = {item: item.read_bytes() for item in self.dsh_home.rglob("*.json")}
-        with sqlite3.connect(path) as connection:
+        with connect_sqlite(path) as connection:
             before_dump = list(connection.iterdump())
         result = bridge.projection_reconcile(
             projection=path, side="wsl", dry_run=True,
@@ -180,7 +181,7 @@ class ProjectionRefreshPreviewTest(ProjectionHarness):
         self.assertEqual(result["mirrorServers"], ["alpha"])
         self.assertTrue(result["environments"][0]["actions"], result)
         self.assertEqual((path.read_bytes(), path.stat().st_mode), before)
-        with sqlite3.connect(path) as connection:
+        with connect_sqlite(path) as connection:
             self.assertEqual(list(connection.iterdump()), before_dump)
         self.assertEqual({item: item.read_bytes() for item in self.dsh_home.rglob("*.json")}, configs)
 

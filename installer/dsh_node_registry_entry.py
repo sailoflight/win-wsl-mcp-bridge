@@ -36,6 +36,7 @@ port here.
 from __future__ import annotations
 
 import os
+import posixpath
 import signal
 import socket
 import subprocess
@@ -181,7 +182,9 @@ def _windows_path(node: Path, *suffix: str) -> str:
         drive = parts[2].upper()
         tail = list(parts[3:-install_tail]) + list(suffix)
         return drive + ":\\" + "\\".join(tail)
-    return str(node.parent.parent.parent.joinpath(*suffix))
+    # The contract is a POSIX path. ``Path.joinpath`` renders with the host
+    # separator, so a Windows-host check would return backslashes here.
+    return posixpath.join(str(node.parent.parent.parent).replace(os.sep, "/"), *suffix)
 
 
 def _discover_windows_node() -> Path:

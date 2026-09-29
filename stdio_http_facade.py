@@ -310,6 +310,11 @@ class BackendProcess:
     def start(self) -> None:
         env = dict(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # This facade frames every message as UTF-8. A Python backend spawned on
+        # a non-UTF-8 locale (the Windows ANSI code page) would otherwise decode
+        # stdin with that codec and corrupt non-ASCII payloads; non-Python
+        # backends ignore the variable.
+        env["PYTHONIOENCODING"] = "utf-8"
         try:
             self.process = subprocess.Popen(
                 self.argv,
@@ -1240,7 +1245,7 @@ class _ModernProxy:
             self.process = subprocess.Popen(
                 self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"},
                 start_new_session=os.name == "posix",
             )
         except OSError:

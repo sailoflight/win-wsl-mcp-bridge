@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 import time
 import unittest
 from unittest import mock
 
+from bridge_runtime import connect_sqlite
 from installer import projection as bridge
 import harness_verification as hv
 from tests import test_bridge as fixtures
@@ -331,7 +331,7 @@ class ClientEnrollmentVerificationTest(fixtures.ProjectionHarness):
         source = self.row()
         source.pop("tool_exposure")
         source.pop("harness_verification_json")
-        with sqlite3.connect(old) as connection:
+        with connect_sqlite(old) as connection:
             connection.executescript(schema)
             connection.execute("PRAGMA user_version=4")
             keys = list(source)

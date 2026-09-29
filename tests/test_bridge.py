@@ -9,6 +9,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import queue
 import select
 import signal
 import socket
@@ -69,6 +70,7 @@ from bridge_runtime import (
     _control_mcp_dispatch,
     build_parser,
     CONTROL_INSTRUCTIONS,
+    connect_sqlite,
     negotiate_mcp_protocol_version,
 )
 
@@ -78,11 +80,22 @@ from installer.projection import (
     projection_status, projection_sync_peer, projection_unenroll, projection_watch,
     _desired_entry_descriptors,
 )
+from tests.pid_liveness import pid_alive
 
 WIN = ROOT / "win-bridge-mcp" / "bridge.py"
 WSL = ROOT / "wsl-bridge-mcp" / "bridge.py"
 FIXTURE = ROOT / "tests" / "fixtures" / "fixture_mcp.py"
 SHARED_FIXTURE = ROOT / "tests" / "fixtures" / "shared_fixture_mcp.py"
+
+#: The end-to-end ``official_cli_*`` fixtures install a fake ``claude``/``codex``
+#: as an executable POSIX shell/python shim and exec it. There is no Windows CLI
+#: shim, so those cases are scoped to POSIX hosts (not deleted); the pure argv
+#: shape tests next to them stay cross-platform.
+posix_fake_cli_only = unittest.skipIf(
+    os.name == "nt",
+    "official_cli_* end-to-end fixtures exec POSIX fake claude/codex shims; "
+    "no Windows CLI shim exists",
+)
 
 
 _ALLOCATED_TEST_PORTS: set[int] = set()
@@ -398,27 +411,78 @@ def invoke_proxy(
 
 
 class FdLineReader:
-    """Line reader over a binary pipe using select, so tests never hang."""
+    """Line reader over a binary pipe, so tests never hang.
+
+    POSIX polls the fd with ``select``. Winsock ``select`` accepts sockets only,
+    so on Windows a daemon thread performs the blocking ``os.read`` and hands
+    chunks to this reader through a queue; the byte-buffer and newline handling
+    are identical on both platforms.
+    """
+
+    _EOF = object()
 
     def __init__(self, raw_stream: object) -> None:
         self.fd = raw_stream.fileno()  # type: ignore[attr-defined]
         self.buffer = bytearray()
+        self._eof = False
+        self._queue: queue.Queue[object] | None = None
+        if os.name == "nt":
+            self._queue = queue.Queue()
+            threading.Thread(target=self._pump, daemon=True).start()
 
-    def read_line(self, timeout: float = 10.0) -> bytes | None:
-        deadline = time.monotonic() + timeout
-        while b"\n" not in self.buffer:
-            if time.monotonic() >= deadline:
-                return None
-            ready, _, _ = select.select([self.fd], [], [], 0.2)
-            if not ready:
-                continue
+    def _pump(self) -> None:
+        """Windows only: blocking reads on a worker thread feed ``_queue``."""
+        while True:
             try:
                 chunk = os.read(self.fd, 65536)
             except OSError:
                 chunk = b""
             if not chunk:
-                return None
-            self.buffer.extend(chunk)
+                self._queue.put(self._EOF)  # type: ignore[union-attr]
+                return
+            self._queue.put(chunk)  # type: ignore[union-attr]
+
+    def _queue_chunk(self, timeout: float) -> bytes | None:
+        """Windows: next chunk, ``None`` at EOF, ``b""`` when idle."""
+        if self._eof:
+            return None
+        try:
+            item = self._queue.get(timeout=max(timeout, 0.0))  # type: ignore[union-attr]
+        except queue.Empty:
+            return b""
+        if item is self._EOF:
+            self._eof = True
+            return None
+        return item  # type: ignore[return-value]
+
+    def read_line(self, timeout: float = 10.0) -> bytes | None:
+        deadline = time.monotonic() + timeout
+        if self._queue is None:
+            # POSIX path kept verbatim: the 0.2 s poll is load-sensitive.
+            while b"\n" not in self.buffer:
+                if time.monotonic() >= deadline:
+                    return None
+                ready, _, _ = select.select([self.fd], [], [], 0.2)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(self.fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    return None
+                self.buffer.extend(chunk)
+        else:
+            while b"\n" not in self.buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                chunk = self._queue_chunk(min(remaining, 0.2))
+                if chunk is None:
+                    return None
+                if not chunk:
+                    continue
+                self.buffer.extend(chunk)
         index = self.buffer.find(b"\n")
         line = bytes(self.buffer[: index + 1])
         del self.buffer[: index + 1]
@@ -427,14 +491,22 @@ class FdLineReader:
     def drain(self, timeout: float = 1.0) -> bytes:
         out = bytearray()
         deadline = time.monotonic() + timeout
+        if self._queue is None:
+            # POSIX path kept verbatim.
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([self.fd], [], [], 0.1)
+                if not ready:
+                    break
+                try:
+                    chunk = os.read(self.fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out.extend(chunk)
+            return bytes(out)
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([self.fd], [], [], 0.1)
-            if not ready:
-                break
-            try:
-                chunk = os.read(self.fd, 65536)
-            except OSError:
-                break
+            chunk = self._queue_chunk(min(deadline - time.monotonic(), 0.1))
             if not chunk:
                 break
             out.extend(chunk)
@@ -472,7 +544,7 @@ class RegistryTest(unittest.TestCase):
             self.assertEqual(public["process"]["multiProcessAllowed"], False)
             for field in ("command", "args", "cwd", "env", "token"):
                 self.assertNotIn(field, public)
-            with sqlite3.connect(path) as connection:
+            with connect_sqlite(path) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], Registry.SCHEMA_VERSION)
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
@@ -580,7 +652,11 @@ class RegistryTest(unittest.TestCase):
                 timeout=20,
                 check=True,
             )
-            self.assertIn(str(database), process.stdout)
+            self.assertIn("initialized registry: ", process.stdout)
+            printed = process.stdout.split("initialized registry: ", 1)[1].strip()
+            # ``tempfile`` can hand back the 8.3 short form on Windows while the
+            # child prints the long form; compare the canonical paths.
+            self.assertEqual(os.path.realpath(printed), os.path.realpath(str(database)))
             public = Registry(database).public("example-wsl-mcp")
             self.assertEqual(public["id"], "example-wsl-mcp")
             # The shipped example declares no concurrency, so it gets the safe
@@ -660,7 +736,7 @@ class RegistryTest(unittest.TestCase):
             database = Path(temp) / "registry.sqlite3"
             manifest = Path(temp) / "empty.json"
             manifest.write_text('{"servers": []}', encoding="utf-8")
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 connection.execute(
                     """
                     CREATE TABLE servers (
@@ -695,7 +771,7 @@ class RegistryTest(unittest.TestCase):
             self.assertEqual(registry.public("legacy")["id"], "legacy")
             self.assertNotIn("artifactDelivery", registry.public("legacy"))
             self.assertNotIn("inputDelivery", registry.public("legacy"))
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], Registry.SCHEMA_VERSION)
 
     def test_registry_rejects_duplicate_and_invalid_ids(self) -> None:
@@ -2218,7 +2294,7 @@ class SharedProtocolNegotiationUnitTest(unittest.TestCase):
             self.assertEqual(rejected["outcome"], "rejected")
             self.assertIsNone(rejected["metadata"]["negotiatedVersion"])
             # Metadata-only: no payload column content and no trace session.
-            with sqlite3.connect(journal.path) as connection:
+            with connect_sqlite(journal.path) as connection:
                 trace_count = connection.execute(
                     "SELECT COUNT(*) FROM traces"
                 ).fetchone()[0]
@@ -2412,9 +2488,7 @@ class SharedBackendAcceptanceTest(unittest.TestCase):
     def _wait_pid_exit(self, pid: int, timeout: float = 10) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not pid_alive(pid):
                 return
             time.sleep(0.05)
         self.fail(f"owned child process {pid} did not exit")
@@ -3078,7 +3152,7 @@ class SharedBackendAcceptanceTest(unittest.TestCase):
             if not path.exists():
                 continue
             try:
-                with sqlite3.connect(path) as connection:
+                with connect_sqlite(path) as connection:
                     row = connection.execute(
                         "SELECT COALESCE(MAX(seq), 0) FROM events "
                         "WHERE category = 'shared-initialize'"
@@ -3094,7 +3168,7 @@ class SharedBackendAcceptanceTest(unittest.TestCase):
             if not path.exists():
                 continue
             try:
-                with sqlite3.connect(path) as connection:
+                with connect_sqlite(path) as connection:
                     connection.row_factory = sqlite3.Row
                     for row in connection.execute(
                         "SELECT side, category, target, outcome, metadata_json "
@@ -3434,8 +3508,7 @@ class SharedBackendStopEscalationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(phases[4]["outcome"], "used")
         self.assertEqual(backend.state, "exited")
         self.assertIsNone(backend.process)
-        with self.assertRaises(OSError):
-            os.kill(child_pid, 0)
+        self.assertFalse(pid_alive(child_pid))
 
     async def test_clean_exit_records_graceful_phases_without_force(self) -> None:
         if os.name == "nt":
@@ -3454,8 +3527,7 @@ class SharedBackendStopEscalationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(phases[2]["outcome"], "exited")
         self.assertEqual(phases[3]["outcome"], "not-needed")
         self.assertEqual(backend.state, "exited")
-        with self.assertRaises(OSError):
-            os.kill(child_pid, 0)
+        self.assertFalse(pid_alive(child_pid))
 
 
 class BridgeLifecycleUnitTest(unittest.TestCase):
@@ -3780,14 +3852,11 @@ class BridgeLifecycleControlTest(unittest.TestCase):
         self.fail(f"timed out waiting for {what}")
 
     def _wait_pid_exit(self, pid: int, timeout: float = 10) -> None:
-        def gone() -> bool:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                return True
-            return False
-
-        self._wait_for(gone, timeout=timeout, what=f"child pid {pid} to exit")
+        self._wait_for(
+            lambda: not pid_alive(pid),
+            timeout=timeout,
+            what=f"child pid {pid} to exit",
+        )
 
     def _cli(
         self,
@@ -5124,7 +5193,17 @@ class ProjectionHarness(unittest.TestCase):
     def setUp(self) -> None:
         self._env_snapshot = {
             key: os.environ.get(key)
-            for key in ("HOME", "CODEX_HOME", "DSH_HOME", "PATH", "FAKE_STATE", "FAKE_KIND")
+            for key in (
+                "HOME",
+                "USERPROFILE",
+                "HOMEDRIVE",
+                "HOMEPATH",
+                "CODEX_HOME",
+                "DSH_HOME",
+                "PATH",
+                "FAKE_STATE",
+                "FAKE_KIND",
+            )
         }
         self.root = Path(tempfile.mkdtemp(prefix="p0b-test-"))
         self.addCleanup(self._restore_environment)
@@ -5135,6 +5214,12 @@ class ProjectionHarness(unittest.TestCase):
         profiles.mkdir(parents=True)
         (profiles / "cordis.patch.yml").write_bytes(b"# empty bridge cordis patch\n")
         os.environ["HOME"] = str(self.home)
+        # ``Path.home()`` reads HOME on POSIX but USERPROFILE / HOMEDRIVE +
+        # HOMEPATH on Windows; without these the "hermetic" home is ignored
+        # there and tests read the runner's real profile.
+        os.environ["USERPROFILE"] = str(self.home)
+        os.environ["HOMEDRIVE"] = self.home.drive
+        os.environ["HOMEPATH"] = str(self.home)[len(self.home.drive):]
         os.environ["CODEX_HOME"] = str(self.home / ".codex")
         os.environ["DSH_HOME"] = str(self.dsh_home)
         os.environ.pop("FAKE_STATE", None)
@@ -5323,7 +5408,7 @@ class ProjectionScannerOutboxEnrollTest(ProjectionHarness):
         return matches[0]
 
     def recorded_exposure(self, kind: str) -> str:
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             row = connection.execute(
                 "SELECT tool_exposure FROM agent_environments WHERE client_kind = ?",
                 (kind,),
@@ -5365,7 +5450,7 @@ class ProjectionScannerOutboxEnrollTest(ProjectionHarness):
         manifest.write_text(json.dumps({"servers": [self.server("alpha"), self.server("beta")]}))
         registry = self.root / "peer.sqlite3"
         Registry.initialize_database(registry, manifest, replace=True, projection_path=projection)
-        with sqlite3.connect(projection) as connection:
+        with connect_sqlite(projection) as connection:
             events = connection.execute(
                 "SELECT event_type FROM registry_projection_outbox"
             ).fetchall()
@@ -5383,7 +5468,7 @@ class ProjectionScannerOutboxEnrollTest(ProjectionHarness):
             )
         )
         Registry.initialize_database(registry, manifest, replace=True, projection_path=projection)
-        with sqlite3.connect(projection) as connection:
+        with connect_sqlite(projection) as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM registry_projection_outbox"
             ).fetchone()[0]
@@ -5393,7 +5478,7 @@ class ProjectionScannerOutboxEnrollTest(ProjectionHarness):
             json.dumps({"servers": [self.server("alpha", "Alpha Renamed"), self.server("beta")]})
         )
         Registry.initialize_database(registry, manifest, replace=True, projection_path=projection)
-        with sqlite3.connect(projection) as connection:
+        with connect_sqlite(projection) as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM registry_projection_outbox"
             ).fetchone()[0]
@@ -5405,19 +5490,19 @@ class ProjectionScannerOutboxEnrollTest(ProjectionHarness):
         manifest.write_text(json.dumps({"servers": [self.server("alpha")]}))
         registry = self.root / "peer.sqlite3"
         Registry.initialize_database(registry, manifest, replace=True, projection_path=projection)
-        with sqlite3.connect(projection) as connection:
+        with connect_sqlite(projection) as connection:
             revision = connection.execute(
                 "SELECT MAX(revision) FROM registry_projection_outbox"
             ).fetchone()[0]
         manifest.write_text("{not valid json")
         with self.assertRaises(Exception):
             Registry.initialize_database(registry, manifest, replace=True, projection_path=projection)
-        with sqlite3.connect(projection) as connection:
+        with connect_sqlite(projection) as connection:
             after = connection.execute(
                 "SELECT MAX(revision) FROM registry_projection_outbox"
             ).fetchone()[0]
         self.assertEqual(after, revision)
-        with sqlite3.connect(registry) as connection:
+        with connect_sqlite(registry) as connection:
             servers = connection.execute("SELECT id FROM servers").fetchall()
         self.assertEqual([row[0] for row in servers], ["alpha"])
 
@@ -5454,7 +5539,7 @@ class ProjectionReconcileTest(ProjectionHarness):
             paths.append(Path(enrolled["environment"]["configPath"]))
         self.assertTrue(self._reconcile()["ok"])
         before = {path: path.read_bytes() for path in paths}
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             fingerprints = connection.execute(
                 "SELECT environment_id, server_id, entry_fingerprint "
                 "FROM agent_mcp_projections ORDER BY environment_id, server_id"
@@ -5468,7 +5553,7 @@ class ProjectionReconcileTest(ProjectionHarness):
             },
         }
         self.sync_mirror(self.make_peer([http, self.server("new-server")]))
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             before_preview = list(connection.iterdump())
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run):
@@ -5492,7 +5577,7 @@ class ProjectionReconcileTest(ProjectionHarness):
                 self.assertNotIn("private-transition-secret", json.dumps(result))
                 self.assertNotIn("39001", json.dumps(result))
                 self.assertEqual({path: path.read_bytes() for path in paths}, before)
-                with sqlite3.connect(self.projection()) as connection:
+                with connect_sqlite(self.projection()) as connection:
                     self.assertEqual(connection.execute(
                         "SELECT environment_id, server_id, entry_fingerprint "
                         "FROM agent_mcp_projections ORDER BY environment_id, server_id"
@@ -5656,6 +5741,7 @@ class ProjectionReconcileTest(ProjectionHarness):
         # failed write was rolled back to the previous document
         self.assertEqual(self.claude_json.read_bytes(), before)
 
+    @posix_fake_cli_only
     def test_official_cli_add_list_remove_with_fake_binaries(self) -> None:
         state = self.install_fake_cli("claude")
         peer = self.make_peer([self.server("alpha"), self.server("beta")])
@@ -5679,6 +5765,7 @@ class ProjectionReconcileTest(ProjectionHarness):
         self.assertTrue(removed["ok"], removed["errors"])
         self.assertEqual(sorted(json.loads(state.read_text())["mcpServers"]), ["beta"])
 
+    @posix_fake_cli_only
     def test_official_cli_drift_never_removes_tampered_entry(self) -> None:
         state = self.install_fake_cli("claude")
         self.sync_mirror(self.make_peer([self.server("alpha")]))
@@ -5907,7 +5994,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         )
 
     def _set_env(self, sql, environment_id: str, **columns) -> None:
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             assignments = ", ".join(f"{key} = ?" for key in columns)
             connection.execute(
                 f"UPDATE agent_environments SET {assignments}, updated_at_ns = ? "
@@ -6026,7 +6113,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.sync_mirror(peer)
         self.enroll_http("codex")
         self._reconcile()
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             stored = dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall())
@@ -6050,7 +6137,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.assertEqual(result["environments"][0]["status"], "drift")
         self.assertIn("alpha", result["environments"][0]["drift"])
         self.assertIn("http://127.0.0.1:9999/custom", config.read_text())
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             self.assertEqual(dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()), stored)
@@ -6130,7 +6217,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             projection_path=self.root / "peer.sqlite3.proj.sqlite3",
         )
         self.sync_mirror(peer)
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             stored = dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall())
@@ -6140,7 +6227,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.assertEqual(
             final["mcpServers"]["alpha"]["url"], "http://127.0.0.1:9999/user-url"
         )
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             self.assertEqual(dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()), stored)
@@ -6233,6 +6320,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             ["claude", "mcp", "add", "beta", "--", "/bin/x"],
         )
 
+    @posix_fake_cli_only
     def test_official_cli_stdio_add_survives_variadic_env_fake_claude(self) -> None:
         """End-to-end: the projected stdio add works against variadic `-e`."""
         state = self.install_fake_cli("claude")
@@ -6254,6 +6342,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.assertTrue(self._reconcile()["ok"])
         self.assertEqual(sorted(json.loads(state.read_text())["mcpServers"]), ["alpha"])
 
+    @posix_fake_cli_only
     def test_official_cli_native_http_projection_with_fake_claude(self) -> None:
         state = self.install_fake_cli("claude")
         self.sync_mirror(self.make_peer([self.http_server("alpha")]))
@@ -6358,7 +6447,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         environment_id = environment["environmentId"]
         self._reconcile()
         path = self.projection()
-        with sqlite3.connect(path) as connection:
+        with connect_sqlite(path) as connection:
             connection.execute(
                 "ALTER TABLE agent_environments DROP COLUMN relay_base_url"
             )
@@ -6432,7 +6521,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.enroll_http("claude")
         self._reconcile()
         original = self.claude_json.read_bytes()
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             stored_before = dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall())
@@ -6449,7 +6538,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.assertEqual(env_result["actions"], [])
         kept = json.loads(self.claude_json.read_text(encoding="utf-8"))
         self.assertEqual(kept["mcpServers"]["alpha"]["headers"], {"X-User": "edited"})
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             self.assertEqual(dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()), stored_before)
@@ -6481,7 +6570,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.enroll_http("claude")
         self._reconcile()
         original = self.claude_json.read_bytes()
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             stored_before = dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall())
@@ -6502,7 +6591,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.assertIn("beta", env_result["drift"])
         kept = json.loads(self.claude_json.read_text(encoding="utf-8"))
         self.assertIn("--user", kept["mcpServers"]["beta"]["args"])
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             self.assertEqual(dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()), stored_before)
@@ -6516,6 +6605,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             final["mcpServers"]["beta"]["url"], "http://127.0.0.1:8877/mcp/beta"
         )
 
+    @posix_fake_cli_only
     def test_official_cli_unparseable_get_blocks_add_not_missing(self) -> None:
         # a listed name whose official `get` output cannot be parsed must never
         # be treated as missing: reconcile fails closed instead of blind adding
@@ -6551,7 +6641,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         # nothing was added to the client's own store (the state file is only
         # created by a mutation, so its absence proves no add/update happened)
         self.assertFalse(state.exists())
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             rows = connection.execute(
                 "SELECT entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()
@@ -6563,7 +6653,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.enroll_http("claude")
         self._reconcile()
         before_doc = self.claude_json.read_bytes()
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             stored_before = dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall())
@@ -6588,7 +6678,7 @@ class ProjectionNativeHttpTest(ProjectionHarness):
         self.assertIn("not valid JSON", env_result["errorDetail"])
         self.assertEqual(env_result["actions"], [])
         self.assertEqual(self.claude_json.read_bytes(), before_doc)
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             self.assertEqual(dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()), stored_before)
@@ -6652,7 +6742,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
         }
 
     def _set_env(self, sql, environment_id: str, **columns) -> None:
-        with sqlite3.connect(sql) as connection:
+        with connect_sqlite(sql) as connection:
             assignments = ", ".join(f"{key} = ?" for key in columns)
             connection.execute(
                 f"UPDATE agent_environments SET {assignments}, updated_at_ns = ? "
@@ -6937,7 +7027,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
             "claude", mapping={"alpha": self.ALPHA_ENDPOINT}
         )["environment"]
         self._reconcile()
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             stored_before = dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall())
@@ -6954,7 +7044,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
         kept = self._doc()
         self.assertEqual(kept["mcpServers"]["alpha"]["url"], "http://127.0.0.1:9999/mcp")
         # stored fingerprint is preserved through the conflict
-        with sqlite3.connect(self.projection()) as connection:
+        with connect_sqlite(self.projection()) as connection:
             self.assertEqual(dict(connection.execute(
                 "SELECT server_id, entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()), stored_before)
@@ -6969,6 +7059,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
             self._doc()["mcpServers"]["alpha"]["url"], self.ALPHA_ENDPOINT
         )
 
+    @posix_fake_cli_only
     def test_official_cli_converted_projection_idempotent_and_remove(self) -> None:
         state = self.install_fake_cli("claude")
         self.sync_mirror(self.make_peer([self.server("alpha")]))
@@ -7005,7 +7096,7 @@ class ProjectionStdioToHttpTest(ProjectionHarness):
         environment_id = environment["environmentId"]
         self._reconcile()
         path = self.projection()
-        with sqlite3.connect(path) as connection:
+        with connect_sqlite(path) as connection:
             connection.execute(
                 "ALTER TABLE agent_environments DROP COLUMN stdio_http_endpoints_json"
             )
@@ -8121,7 +8212,7 @@ class EventJournalTraceRecordTest(unittest.TestCase):
 
     @staticmethod
     def _column_names(database: Path, table: str) -> set[str]:
-        with sqlite3.connect(database) as connection:
+        with connect_sqlite(database) as connection:
             return {
                 str(row[1])
                 for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -8173,7 +8264,7 @@ class EventJournalTraceRecordTest(unittest.TestCase):
             root = Path(temp)
             fresh = EventJournal(root / "fresh.sqlite3")
             self.assertEqual(fresh.SCHEMA_VERSION, 2)
-            with sqlite3.connect(fresh.path) as connection:
+            with connect_sqlite(fresh.path) as connection:
                 version = int(connection.execute("PRAGMA user_version").fetchone()[0])
                 self.assertEqual(version, 2)
             traces = self._column_names(fresh.path, "traces")
@@ -8185,7 +8276,7 @@ class EventJournalTraceRecordTest(unittest.TestCase):
             # A legacy v1 database (old traces + old trace_records, no producer
             # ever existed) upgrades in place to the v2 record shape.
             legacy = root / "legacy.sqlite3"
-            with sqlite3.connect(legacy) as connection:
+            with connect_sqlite(legacy) as connection:
                 connection.executescript(
                     "CREATE TABLE traces (trace_id TEXT PRIMARY KEY, target TEXT NOT NULL, "
                     "level TEXT NOT NULL, byte_budget INTEGER NOT NULL, bytes_used INTEGER NOT NULL "
@@ -8265,14 +8356,14 @@ class EventJournalTraceRecordTest(unittest.TestCase):
             self.assertEqual(rows[0]["payload_bytes"], 100)
             # Expiry ends capture and prunes the session.
             expired = journal.start_trace("shortlived", "envelope", 3600, 4096)
-            with sqlite3.connect(journal.path) as connection:
+            with connect_sqlite(journal.path) as connection:
                 connection.execute(
                     "UPDATE traces SET expires_at_ns = ? WHERE trace_id = ?",
                     (time.time_ns() - 1, expired["traceId"]),
                 )
             self.assertNotIn("shortlived", journal.active_targets())
             self.assertEqual(journal.capture(target="shortlived", direction="outbound", data=self.REQUEST), 0)
-            with sqlite3.connect(journal.path) as connection:
+            with connect_sqlite(journal.path) as connection:
                 remaining = connection.execute(
                     "SELECT COUNT(*) FROM traces WHERE trace_id = ?", (expired["traceId"],)
                 ).fetchone()[0]
@@ -8452,14 +8543,14 @@ class EventJournalRetentionTest(unittest.TestCase):
                 self.assertEqual(
                     journal.capture(target="bulk", direction="outbound", data=payload), 1
                 )
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 newest_before = int(
                     connection.execute(
                         "SELECT COALESCE(MAX(seq), 0) FROM trace_records"
                     ).fetchone()[0]
                 )
             journal.prune()
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 count, newest_after = connection.execute(
                     "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM trace_records"
                 ).fetchone()
@@ -8512,7 +8603,7 @@ class EventJournalRetentionTest(unittest.TestCase):
             # newest evidence; byte-budget eviction must trim the older trace
             # records instead of evicting the event.
             journal.record(side="wsl", category="fresh", metadata={"kept": True})
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 events = int(
                     connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
                 )
@@ -8529,7 +8620,7 @@ class EventJournalRetentionTest(unittest.TestCase):
             journal = EventJournal(database, max_age_seconds=3600)
             journal.record(side="wsl", category="old", metadata={"n": 1})
             now = time.time_ns()
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 connection.execute(
                     "UPDATE events SET occurred_at_ns = ?", (now - 7200 * 10 ** 9,)
                 )
@@ -8538,7 +8629,7 @@ class EventJournalRetentionTest(unittest.TestCase):
             # and past the record age window removes it with its records.
             session = journal.start_trace("gone", "complete", 3600, 65536, confirm_sensitive=True)
             journal.capture(target="gone", direction="outbound", data=b"x" * 512)
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 connection.execute(
                     "UPDATE traces SET expires_at_ns = ? WHERE trace_id = ?",
                     (now - 1, session["traceId"]),
@@ -8548,7 +8639,7 @@ class EventJournalRetentionTest(unittest.TestCase):
                     (now - 7200 * 10 ** 9,),
                 )
             journal.prune()
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 expired = int(
                     connection.execute(
                         "SELECT COUNT(*) FROM traces WHERE trace_id = ?",
@@ -8582,7 +8673,7 @@ class EventJournalRetentionTest(unittest.TestCase):
                 journal.capture(target="live", direction="outbound", data=b"a" * 512), 1
             )
             now = time.time_ns()
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 # One old record and one recent record; the session stays live.
                 connection.execute(
                     "UPDATE trace_records SET occurred_at_ns = ? WHERE seq = "
@@ -8593,7 +8684,7 @@ class EventJournalRetentionTest(unittest.TestCase):
                 journal.capture(target="live", direction="outbound", data=b"b" * 512), 1
             )
             journal.prune()
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 records = int(
                     connection.execute(
                         "SELECT COUNT(*) FROM trace_records WHERE trace_id = ?",
@@ -8645,7 +8736,7 @@ class EventJournalDurabilityTest(unittest.TestCase):
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 list(executor.map(writer, range(workers)))
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 total = int(
                     connection.execute(
                         "SELECT COUNT(*) FROM events WHERE category = 'writer'"
@@ -8673,7 +8764,7 @@ class EventJournalDurabilityTest(unittest.TestCase):
                 journal.record(side="win", category="boot", metadata={"n": number})
             # A second writer (like a crashed process) committed a row and
             # closed without any explicit checkpoint; WAL frames hold it.
-            with sqlite3.connect(database, timeout=5) as connection:
+            with connect_sqlite(database, timeout=5) as connection:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute(
                     "INSERT INTO events (occurred_at_ns, monotonic_ns, side, category, "
@@ -8693,7 +8784,7 @@ class EventJournalDurabilityTest(unittest.TestCase):
             self.assertIn("crash-persist", categories)
             self.assertEqual(categories.count("boot"), 5)
             reopened.record(side="win", category="after-reopen", metadata={"ok": True})
-            with sqlite3.connect(database) as connection:
+            with connect_sqlite(database) as connection:
                 total = int(
                     connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
                 )

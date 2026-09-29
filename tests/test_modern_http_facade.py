@@ -22,6 +22,7 @@ from unittest.mock import patch
 
 import stdio_http_facade as facade
 from bridge_runtime import Registry, BridgeError, local_registry_query
+from tests.pid_liveness import pid_alive
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "2026-07-28"
@@ -31,6 +32,10 @@ SECRET = "synthetic-private-http-header"
 
 BACKEND = r'''
 import json, os, signal, sys, threading, time
+# The facade frames protocol messages as UTF-8; decode/encode stdio as UTF-8
+# explicitly instead of the platform locale codec (mojibake outside UTF-8 locales).
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
 state = sys.argv[1]
 blocked = len(sys.argv) > 2
 write_lock = threading.Lock()
@@ -213,11 +218,8 @@ class ModernFacadeTests(unittest.TestCase):
 
     @staticmethod
     def pid_gone(pid):
-        try:
-            os.kill(pid, 0)
-            return False
-        except ProcessLookupError:
-            return True
+        # ``os.kill(pid, 0)`` is not a liveness test on Windows; pid_alive is.
+        return not pid_alive(pid)
 
     def all_events(self):
         events = []

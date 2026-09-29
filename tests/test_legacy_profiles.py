@@ -61,6 +61,7 @@ from bridge_runtime import (
     SHARED_COMPATIBLE_PROTOCOL_VERSIONS,
     SHARED_MCP_PROTOCOL_VERSION,
     _event_journal_path,
+    connect_sqlite,
     local_registry_query,
 )
 
@@ -846,7 +847,7 @@ class LegacySharedAcceptanceTest(unittest.TestCase):
         if not path.exists():
             return rows
         try:
-            with sqlite3.connect(path) as connection:
+            with connect_sqlite(path) as connection:
                 connection.row_factory = sqlite3.Row
                 for row in connection.execute(
                     "SELECT category, target, outcome, metadata_json "

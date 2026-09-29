@@ -68,7 +68,9 @@ def _write_bundle(
         declared_core if declared_core is not None else core_version,
     )
     digest = hashlib.sha256(pristine.encode("utf-8")).hexdigest()
-    module.write_text(pristine, encoding="utf-8")
+    # LF on disk regardless of platform: the manifest hashes the exact bytes,
+    # so text-mode newline translation (CRLF on Windows) must not edit them.
+    module.write_text(pristine, encoding="utf-8", newline="\n")
     if tamper:
         data = bytearray(module.read_bytes())
         data[0] = ord("\n") if data[0] != ord("\n") else ord("#")

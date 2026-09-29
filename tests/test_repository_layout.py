@@ -37,7 +37,7 @@ class RepositoryLayoutTest(unittest.TestCase):
 
     def test_canonical_document_index_links_exist(self):
         index = ROOT / "docs" / "INDEX.md"
-        for link in re.findall(r"\]\(([^)]+)\)", index.read_text()):
+        for link in re.findall(r"\]\(([^)]+)\)", index.read_text(encoding="utf-8")):
             self.assertTrue((index.parent / link).is_file(), link)
         for name in ("ARCHITECTURE", "DEVELOPMENT_PLAN", "VERIFICATION", "DEPLOYMENT",
                      "MCP_COVERAGE", "IMPLEMENTATION_STATUS", "MILESTONE_DESIGN"):
