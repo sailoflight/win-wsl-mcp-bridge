@@ -89,6 +89,18 @@ rewrites JSON-RPC instead of passing bytes through; connection-scoped tool views
 can only be staged to a dedicated process; and calls from different clients are
 serialized, so one long call delays the others.
 
+Exclusive is not a higher security level. The supported profile already trusts the
+local OS user, Agents, and registered business MCPs, and does not defend them against
+one another; exclusive changes fidelity and capability, not trust. It buys exactly one
+thing — a second instance never appears — which is why it is the right default when the
+MCP's concurrent behavior is unobserved. It also loses things, and one of them is a
+long-term debt rather than a one-time cost: because the bridge interprets the protocol
+instead of forwarding bytes, it must keep up with every protocol detail the MCP uses
+(cancellation, progress, `_meta`, JSON-RPC error shape, future methods), and every gap
+is a compatibility defect the transparent path cannot have. Dedicated (`true`) is not
+the unsafe choice it can look like; it is byte-transparent and isolates clients, at the
+price of N processes, N licenses or caches, and exposure to the MCP's own concurrency.
+
 ## Shared backend registration
 
 Use explicit `multiProcessAllowed=false` for the registrations that run one shared
