@@ -120,6 +120,45 @@ meshq {"concurrency":"one-to-one","enforcement":"bridge-shared-backend","multiPr
 
 **生效需要人工重启对应 profile**（web / dsh-tui / headless）：overlay 只在会话启动时加载。
 
+### §5.1 overlay 的形状契约（首次落地时踩坏过，勿重犯）
+
+这三份 overlay 的所有者是桥的 projection 子系统（`installer/projection.py`；其自己的注释把 DSH overlay 描述为 "wholly Bridge-owned and regenerated deterministically"）。顶层每一项必须是 **mapping**：
+
+```json
+{"insert":[{"id":"mcp-cadq","name":"@deepseek-ai/dsh-mcp-client","config":{…}}]}
+```
+
+第一次追加时写成了**裸数组**（缺 `{"insert":…}` 外壳），后果是 **dsh-tui / web / headless 三个 profile 全部无法启动**：
+
+```
+dsh: overlay entry 3 in …/cordis-bridge-overlay.json must be a mapping (a loader patch entry)
+  at parsePatchList (…/dsh-app-boot/lib/index.js:1200)
+```
+
+（条目编号是 1-based；entry 3 = 第一个裸数组。）修法 = 补外壳，并按 `json.dumps(..., sort_keys=True, separators=(",",":")) + "\n"` 写回，与 `_dsh_overlay_text()`（`projection.py:1999`）的产出字节格式一致。校验手段（不必启动会话）：`dsh --profile <p> [--patch <overlay>] --dump-config`；或直接调用加载器 `loadOverlayPatches(binName, file)`。
+
+注意 `dsh --profile web --dump-config` **不带** `--patch` 时看不到这些条目——web 的 overlay 由 `~/.local/bin/dshweb` 传入，dsh-tui/headless 的由 `~/.local/bin/dsh` 传入。两个包装脚本才是"谁加载哪份 overlay"的权威。
+
+### §5.2 手加条目能不能活过一次 reconcile（已实测）
+
+`projection reconcile` 对 DSH 是**合并**而非整体重建：它读回现有 overlay（`_dsh_overlay_entries`），只移除**桥自己账上**且不再需要的条目（`agent_mcp_projections` + 指纹匹配，`projection.py:2535-2552`），再写入期望条目，最后整体重写。因此**手加的、非桥归属的条目会被保留**（只是被重新排序/规范化）。
+
+验证方式（零生产影响）：把三份 overlay 与 `projection.sqlite3` 拷进 `/tmp`，把副本里 env 行的 `config_path` 改指副本、并停用 codex/claude 两个 env，然后 `projection reconcile --projection <副本>`。结果：`mcp-cadq` / `mcp-meshq` 在三个副本里**都存活**（web/headless 被重排为字母序，dsh-tui 字节不变）。
+
+但**代价是账目不完整**：这两条不在桥的投影账里，所以 `projection status` 不报告它们、`unenroll --remove-entries` 也不会清理它们。
+
+### §5.3 若改由桥的投影权威接管（尚未执行）
+
+桥的投影镜像是**全局**的：`peer_projection_state` 只认 `servers.enabled=1`，`_desired_entry_descriptors` 对每个环境套用**全部**镜像条目（`projection.py:3423`），没有"按环境筛选 server"的开关。当前镜像仍是 2026-09-14 的内容（只有 onshape/taobao）。
+
+`projection reconcile --dry-run --refresh-from registry-path --peer-registry <Windows 注册表>` 的预演结果：
+
+- 镜像 → `['cadq','meshq','onshape','taobao']`
+- **codex** 与 **claude** 两个环境也会被 `add-or-update` cadq / meshq（超出本轮批准的"三个 profile"范围）
+- web / dsh-tui / headless 的 overlay 被规范化重写
+
+即：一旦走正统路径，cadq/meshq 会同时进入 codex（`~/.codex/config.toml`）与 claude（`~/.claude.json`）。MeshQ 的 Windows 部署尚未完成，此时把空指针推进这两个客户端会带来启动噪声——**故暂缓，等 MeshQ 部署落地后再决定**。
+
 ## §6 已知缺口与回滚
 
 **缺口**
@@ -128,6 +167,7 @@ meshq {"concurrency":"one-to-one","enforcement":"bridge-shared-backend","multiPr
 2. **CadQ 的 `artifactDelivery` 仍关闭**：CadQ 的输出根固定且故意不可配置，v1 不做产物回传，调用方按它自己声明的 `output_dir` 取件（WSL 侧走 `/mnt/c/...` 直读）。这不是桥的产物保证。
 3. **失败转移缺陷**（§2 坑 3）未修。
 4. 换码后 **Windows 侧运行时目录名换过**：以后要再原地升级，请按 §2 坑 1 在最终目录里重装一次。
+5. **overlay 里的 cadq/meshq 是"手加、桥不知情"的**：它们能活过一次 reconcile（§5.2 已实测），但不在桥的投影账里——`projection status` 不报告、`unenroll --remove-entries` 不清理。消除这处不一致的唯一途径是让桥的投影权威接管，而那会波及 codex/claude（§5.3），故挂起。
 
 **回滚**
 
