@@ -5541,6 +5541,35 @@ class ProjectionScannerOutboxEnrollTest(ProjectionHarness):
         with self.assertRaisesRegex(BridgeError, "already enrolled"):
             self.enroll(self.candidate("claude"))
 
+    @posix_fake_cli_only
+    def test_a_stopped_environment_can_be_reenrolled_on_another_adapter(self) -> None:
+        self.install_fake_cli("claude")
+        self.sync_mirror(self.make_peer([self.server("alpha")]))
+        enrolled = self.enroll(self.candidate("claude"))
+        environment_id = enrolled["environment"]["environmentId"]
+        self.assertEqual(enrolled["environment"]["applyAdapter"], "official-cli")
+        projection_unenroll(
+            projection=self.projection(),
+            environment_id=environment_id,
+            remove_entries=False,
+            confirm=True,
+        )
+        stopped = {
+            item["environmentId"]: item
+            for item in projection_status(projection=self.projection())["environments"]
+        }
+        self.assertFalse(stopped[environment_id]["enabled"])
+        # --keep-entries leaves the client document alone, so the stopped
+        # environment must not block re-enrollment: that is how an Operator
+        # restarts it, and the only way to move it to another adapter.
+        self.set_path([])
+        again = self.enroll(self.candidate("claude"))["environment"]
+        self.assertEqual(again["applyAdapter"], "bridge-file")
+        self.assertTrue(again["enabled"])
+        self.assertEqual(
+            len(projection_status(projection=self.projection())["environments"]), 1
+        )
+
 
 class ProjectionReconcileTest(ProjectionHarness):
     def _reconcile(self, **kwargs):

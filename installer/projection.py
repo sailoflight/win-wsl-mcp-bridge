@@ -2903,14 +2903,30 @@ def projection_enroll(
     now = time.time_ns()
     with database._connect(write=True) as connection:
         existing = connection.execute(
-            "SELECT environment_id FROM agent_environments "
+            "SELECT environment_id, enabled FROM agent_environments "
             "WHERE client_kind = ? AND config_path = ?",
             (kind, str(config_path)),
         ).fetchone()
-        if existing is not None:
+        if existing is not None and int(existing["enabled"]) == 1:
             raise BridgeError(
                 f"an environment for {kind} at {config_path} is already enrolled "
                 f"({existing['environment_id']}); unenroll it first"
+            )
+        if existing is not None:
+            # ``unenroll --keep-entries`` stops an environment and leaves it
+            # stopped: its entries stay in the client document, but nothing
+            # synchronizes them any more. Re-enrollment is how an Operator
+            # starts one again, possibly on a different adapter, so replace the
+            # stopped row instead of refusing forever. The client's entries are
+            # not touched here; the next reconcile re-verifies and adopts them.
+            stopped_id = str(existing["environment_id"])
+            connection.execute(
+                "DELETE FROM agent_mcp_projections WHERE environment_id = ?",
+                (stopped_id,),
+            )
+            connection.execute(
+                "DELETE FROM agent_environments WHERE environment_id = ?",
+                (stopped_id,),
             )
         connection.execute(
             "INSERT INTO agent_environments ("
