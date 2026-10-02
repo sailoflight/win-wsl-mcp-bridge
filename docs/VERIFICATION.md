@@ -49,11 +49,12 @@ leg, or a workstation running several Agents at once. Add a name there only
 with a recorded intermittent failure, and run the full suite before a release:
 the whole suite still runs in CI, non-blockingly, so a regression stays visible.
 
-Windows CI is not a gate yet: every recorded cause is fixed, and the leg stays
-non-blocking only until one run confirms it. The failure count on that leg went
-from 4 (`873e67a`, one environment difference) to 1 (`89876a6`) to 3
-(`b6ae38e`); each round removed a cause and exposed the next test whose verdict
-depended on wall-clock room. The single failure was
+Windows CI is a gate as of run 36990671066 (commit `5f3ba90`): the leg ran the
+same 638 tests the blocking `test` job runs, in 264 s against 170 s here, with 13
+platform-conditional skips. Getting there took four rounds, each of which removed
+a cause and exposed the next test whose verdict depended on wall-clock room: the
+failure count went from 4 (`873e67a`, one environment difference) to 1
+(`89876a6`) to 3 (`b6ae38e`) to 0. The single failure was
 `tests.test_modern_http_adapter.ModernAdapterTests.test_shutdown_interrupts_tls_handshake_before_response_exists`,
 which tripped `started.wait(2)` on a runner where the whole suite took 363 s
 against 163 s here — the same code passed the previous Windows run, so its

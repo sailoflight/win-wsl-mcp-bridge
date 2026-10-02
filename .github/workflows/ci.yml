@@ -1,26 +1,25 @@
 name: verify
 
-# The blocking gate is `test` plus `package`. Two further jobs run the checks
-# that are not yet trustworthy as a gate, non-blockingly, so the signal is kept
-# without making every push red:
+# The blocking gate is `test`, `windows`, and `package`. One further job runs the
+# checks that are not yet trustworthy as a gate, non-blockingly, so the signal is
+# kept without making every push red:
 #
 #   * `load-sensitive` — tests whose verdict depends on how much else is
 #     running (a concurrent 404 recovery, spawn / initialize counting, connector
 #     liveness under thread load). They pass on an idle host and flake on a
-#     saturated 2-core runner. The blocking `test` job skips exactly the named set
+#     saturated 2-core runner. The blocking jobs skip exactly the named set
 #     (`tests/run_offline.py --deterministic-only`); this job runs the whole suite
 #     so a real regression is still visible.
-#   * `windows` — the Windows leg never passed. Every recorded cause is now
-#     fixed: an unclosed `sqlite3` handle blocking temporary-directory removal
-#     with `WinError 32`, two loopback socket errors on closed or unconnected
-#     sockets, a fixture cleanup deadline, a bridge candidate check that rejected
-#     the runner's own `%USERPROFILE%\.claude.json`, fixture temporary roots
-#     that were not their own `resolve()` because the runner sets `TEMP` to an
-#     8.3 short name, one scene-setting timeout in a TLS-handshake test that the
-#     same code passed on the previous run, and facade deadlines that doubled as
-#     a cold-spawn budget (now named constants in `tests/test_modern_http_facade.py`).
-#     It stays non-blocking until one run confirms that, then it becomes a hard
-#     gate.
+#
+# The `windows` leg became a gate in run 36990671066 (commit 5f3ba90). Every
+# recorded cause of its earlier failures is fixed: an unclosed `sqlite3` handle
+# blocking temporary-directory removal with `WinError 32`, two loopback socket
+# errors on closed or unconnected sockets, a fixture cleanup deadline, a bridge
+# candidate check that rejected the runner's own `%USERPROFILE%\.claude.json`,
+# fixture temporary roots that were not their own `resolve()` because the runner
+# sets `TEMP` to an 8.3 short name, one scene-setting timeout in a TLS-handshake
+# test, and facade deadlines that doubled as a cold-spawn budget (now named
+# constants in `tests/test_modern_http_facade.py`).
 
 on:
   push:
@@ -58,9 +57,9 @@ jobs:
         run: python -m tests.run_offline -v
 
   windows:
-    # Remove `continue-on-error` once a run is green: that is the only step left
-    # between this leg and a hard gate.
-    continue-on-error: true
+    # A hard gate since run 36990671066 (commit 5f3ba90) passed with the same 638
+    # tests the blocking `test` job runs, in 264 s against 170 s here, with 13
+    # platform-conditional skips.
     runs-on: windows-latest
     env:
       PYTHONDONTWRITEBYTECODE: "1"
