@@ -2,11 +2,11 @@
 
 ## 结论先行
 
-1. 两台主机的运行时已换到含**并发轴**的版本；两侧 `site-packages/bridge_runtime.py` 与工作区 HEAD `873e67a` 是同一份（sha256 `f83bd801b435aa8c…`）。
-2. Windows 注册表新增两行：**cadq**（多对单，带实测依据）、**meshq**（单对单，尚未部署）。
+1. 两台主机的运行时已换到含**并发轴**的版本；两侧 `site-packages/bridge_runtime.py` 与当时的 HEAD `873e67a` 是同一份（sha256 `f83bd801b435aa8c…`）。
+2. Windows 注册表新增两行：**cadq**（多对单，带实测依据）、**meshq**（单对单；Windows 侧已于 2026-10-02 部署并实测通过）。
 3. 三个 DSH profile 的 overlay 各加 `mcp-cadq` / `mcp-meshq`；**要重启 profile 才在模型侧生效**（人工步骤）。
 4. 旧运行时被原子拒掉的结构化 `rejectTools` 现已生效，且**已用对照实验证明它是按工具精确生效的**。
-5. 备份与回滚点见 §6。
+5. 2026-10-02：桥的投影权威**已接管** cadq/meshq——claude、codex 与三个 dsh profile（共 5 个环境）现在都在桥的账里，见 §5.3；备份与回滚点见 §6。
 
 ---
 
@@ -147,7 +147,7 @@ dsh: overlay entry 3 in …/cordis-bridge-overlay.json must be a mapping (a load
 
 但**代价是账目不完整**：这两条不在桥的投影账里，所以 `projection status` 不报告它们、`unenroll --remove-entries` 也不会清理它们。
 
-### §5.3 若改由桥的投影权威接管（尚未执行）
+### §5.3 改由桥的投影权威接管（2026-10-02 已执行）
 
 桥的投影镜像是**全局**的：`peer_projection_state` 只认 `servers.enabled=1`，`_desired_entry_descriptors` 对每个环境套用**全部**镜像条目（`projection.py:3423`），没有"按环境筛选 server"的开关。当前镜像仍是 2026-09-14 的内容（只有 onshape/taobao）。
 
@@ -161,7 +161,7 @@ dsh: overlay entry 3 in …/cordis-bridge-overlay.json must be a mapping (a load
 
 **已定（Operator 决定）**：保持现状（cadq/meshq 只挂在三个 dsh profile，手加但已证明对 reconcile 稳定）；等 MeshQ 的 Windows 部署完成、`--doctor` 与 MCP 验收通过之后，再一次性让桥的投影权威接管这两条（届时 codex/claude 一并受益，不会出现空指针）。在那之前不运行 `projection sync`，以免把未部署的 meshq 推进镜像。
 
-**前置条件已满足（2026-10-02）**：MeshQ 已在 Windows 部署（`C:\MCP\MeshQ` + `.venv`）并经桥实测可用（见缺口 1）。因此"一起接管"这一步现在可执行；它会把 cadq/meshq 一并写进 codex 与 claude 两个客户端，**待 Operator 点头后再动手**。
+**前置条件已满足（2026-10-02）**：MeshQ 已在 Windows 部署（`C:\MCP\MeshQ` + `.venv`）并经桥实测可用（见缺口 1）。因此"一起接管"这一步现在可执行；它会把 cadq/meshq 一并写进 codex 与 claude 两个客户端。
 
 #### 2026-10-02 实测预演（dry-run，未落盘）
 
@@ -195,7 +195,29 @@ python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl --dry-run \
 - **一个客户端 CLI 装坏会中断整次 reconcile**：`_run_tool` 原先让 `FileNotFoundError` 直接冒泡，绕过 `_reconcile_one_environment` 的 per-environment `except BridgeError`，于是 codex 的断链把 claude 与三个 dsh 环境一起卡住。现改为抛 `BridgeError`（`OSError` 与 `TimeoutExpired` 都转），缺失/不可执行/超时都记到**那个环境自己**的 `errorDetail` 上。
 - **`--dry-run` 把冲突和 drift 一律报成 configured**：干跑分支无条件写 `ENV_STATUS_CONFIGURED`，于是预演永远看不到 conflicts/drift，而实跑是 error/drift——正是预演该暴露的东西被它藏起来。现在干跑与实跑共用 `_environment_verdict()`，两侧结论必须一致。
 
-**结论：接管仍未执行。** 除了需要 Operator 点头，现在还有两个前置要定：codex 的 CLI 要么修好要么 unenroll；claude 的适配器要么接受"每次 reconcile 常驻冲突"，要么改成 `bridge-file`。
+**已于 2026-10-02 执行。** 执行前把两个前置都清掉了（见下），并把两个客户端配置、投影库、三份 overlay 备份到
+`~/.local/share/win-wsl-mcp-bridge/backups/20261002T091625Z-projection-takeover/`。
+
+#### 执行内容与结果
+
+1. **修好 codex（用户环境）**：`~/.codex/packages/standalone/` 是扩展随附 codex 的**影子安装**，旧 release 目录整条符号链指向已被删除的 VS Code 扩展版本。按扩展当前的 `codex-package.json`（`0.159.0-alpha.12.1` / `x86_64-unknown-linux-musl`）重建同名 release 目录并把 `current` 指过去 → `codex --version` 报 `codex-cli 0.159.0-alpha.12.1`。旧目录与旧 `current` 值保留，回滚 = `ln -sfn …/releases/0.155.0-alpha.16.3-x86_64-unknown-linux-musl …/standalone/current`。
+2. **claude 换适配器**：`official-cli` → `bridge-file`（`unenroll --keep-entries` 后重新 enroll；适配器由 enroll 时的 PATH 决定，`claude` 不在 PATH 上时解析为 `bridge-file`）。新环境 `env-49943aa070718ce727b2ef35`，launcher 仍是 runtime python，因此与文档里既有条目**逐字节同形**，reconcile 直接认领而不重写。
+   - 顺带修了一个把换适配器变成死路的缺陷：`--keep-entries` 只把环境置为 `enabled=0`，而 enroll 见到任何同 (client, config_path) 的行就拒绝——于是停下就再也起不来，唯一的出口 `--remove-entries` 又要求官方 CLI 模式**提供不了**的逐条校验。现在"停下的环境可被新 enroll 取代"。
+3. **`projection reconcile --refresh-from registry-remote --local-port 8769`**：`ok: true`、`errors: []`、无 drift。五份配置的落点：
+
+   | 客户端 | 结果 |
+   | --- | --- |
+   | `~/.claude.json` | 新增 cadq / meshq（43 个顶层键前后一致，只有 `mcpServers` 变化；cadq/meshq 旧的两条原样保留） |
+   | `~/.codex/config.toml` | 新增全部四条（**并修复了此前丢失的 onshape/taobao**） |
+   | dsh-tui overlay | 无需改动 |
+   | headless overlay | 四条统一为 `/usr/bin/python3` 启动器（消除 2026-09-30 手改留下的不一致） |
+   | web overlay | 重写 onshape/taobao；cadq/meshq 仍是 conflict（见 §6 缺口 5） |
+
+4. **幂等性**：紧接着再跑一次 `reconcile`（不带 `--refresh-from`）→ 五个环境全 `configured`/`next_session`、**动作 0 条**。
+5. **功能验收**：`claude mcp list` 四条全部 `✔ Connected`；`codex mcp list` 四条 `enabled`（env 值按 codex 惯例打码），未受管的 `gitnexus` 依旧 `enabled`（`codex mcp get gitnexus` 报 `transport: stdio` 正常——写入口径只是省掉了冗余的 `type = "stdio"` 行，那是 codex 自己重写 config 的规范化结果）；`bridge_control status` 四个服务在册，onshape/taobao 的 generation 计数在健康检查中推进。
+
+**回滚**：`backups/20261002T091625Z-projection-takeover/` 里是 `~/.claude.json`、`~/.codex/config.toml`、`projection.sqlite3` 与三份 overlay 的执行前副本；覆盖回去后 `projection status` 会显示环境与文档不一致，按 §5.2 的结论（reconcile 是 merge，不会删手加条目）重新对齐即可。codex 的影子安装回滚见上。
+
 
 ## §6 已知缺口与回滚
 
@@ -205,8 +227,8 @@ python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl --dry-run \
 2. **CadQ 的 `artifactDelivery` 仍关闭**：CadQ 的输出根固定且故意不可配置，v1 不做产物回传，调用方按它自己声明的 `output_dir` 取件（WSL 侧走 `/mnt/c/...` 直读）。这不是桥的产物保证。
 3. **失败转移缺陷**（§2 坑 3）未修。
 4. 换码后 **Windows 侧运行时目录名换过**：以后要再原地升级，请按 §2 坑 1 在最终目录里重装一次。
-5. **overlay 里的 cadq/meshq 是"手加、桥不知情"的**：它们能活过一次 reconcile（§5.2 已实测），但不在桥的投影账里——`projection status` 不报告、`unenroll --remove-entries` 不清理。消除这处不一致的唯一途径是让桥的投影权威接管，而那会波及 codex/claude（§5.3），故挂起。2026-10-02 预演证实了代价：web overlay 的这两条会被判为 conflict（`next_session` + `conflicts=['cadq','meshq']`），headless 的四条则会被规范化重写。
-6. **`official-cli` 适配器下 stdio 条目永远无法反证**（§5.3 实测，`projection.py:2194-2217`）：claude 环境因此每次 reconcile 都报 onshape/taobao 冲突、`ok` 恒为 False。既未改适配器（→`bridge-file`），也未改解析。另：`_cli_list_entry_names` 会把 `claude mcp list` 的 "Checking MCP server health…" 首行当成条目名。
+5. **web overlay 的 cadq/meshq 仍是"手加、桥不知情"的**：接管已执行（§5.3），但那两条在 **web** 里被判为 conflict（`next_session` + `conflicts=['cadq','meshq']`），因此桥既认领也不改写它们。功能不受影响（两条照常可用），但 `unenroll --remove-entries` 不会清理它们，`projection status` 也不把它们记进账。dsh-tui 与 headless 没有这个问题。
+6. **`official-cli` 适配器下 stdio 条目永远无法反证**（`projection.py:2194-2217`）：`claude mcp get` 的 `Args:` 是空格拼接、env 是自由文本，解析器故意不猜，于是条目进 `unverifiable` → 每次 reconcile 报冲突、`ok` 恒为 False。**claude 环境已改走 `bridge-file` 绕开它**（§5.3），但缺陷本身仍在：任何再次以 `official-cli` 注册的 claude/codex stdio 环境都会复现。另：`_cli_list_entry_names` 会把 `claude mcp list` 的 "Checking MCP server health…" 首行当成条目名。
 
 **回滚**
 
