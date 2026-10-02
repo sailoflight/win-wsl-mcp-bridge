@@ -20,6 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGET = "fixture-library"
 VERSION = "2025-11-25"
 INSTRUCTIONS = "Canonical fixture policy: confirmation gates remain downstream."
+#: Downstream budget one test forces a timeout with.  The fixture child is a
+#: real process (spawn, import, connect, forward), and this budget also bounds
+#: its ``initialize`` forward, so a tighter value measures spawn latency on a
+#: loaded host instead of the timeout contract: with 0.2 the setup failed with
+#: a retryable ``downstream_unavailable`` while the module passed in isolation.
+FORCED_DOWNSTREAM_TIMEOUT_S = 1.0
 
 
 def tool(name: str = "fixture_echo") -> dict:
@@ -624,7 +630,10 @@ class DeferredToolsTests(unittest.TestCase):
         self.assertEqual(len(self.node.requests("tools/call")), 1)
 
     def test_timeout_has_unknown_outcome_and_no_replay(self):
-        client = self.initialized(REQUEST_TIMEOUT=.2, CONNECT_TIMEOUT=.2)
+        client = self.initialized(
+            REQUEST_TIMEOUT=FORCED_DOWNSTREAM_TIMEOUT_S,
+            CONNECT_TIMEOUT=FORCED_DOWNSTREAM_TIMEOUT_S,
+        )
         client.library("expand")
         client.notice()
         self.node.hold_call = True
