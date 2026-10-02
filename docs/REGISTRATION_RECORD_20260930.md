@@ -161,7 +161,41 @@ dsh: overlay entry 3 in …/cordis-bridge-overlay.json must be a mapping (a load
 
 **已定（Operator 决定）**：保持现状（cadq/meshq 只挂在三个 dsh profile，手加但已证明对 reconcile 稳定）；等 MeshQ 的 Windows 部署完成、`--doctor` 与 MCP 验收通过之后，再一次性让桥的投影权威接管这两条（届时 codex/claude 一并受益，不会出现空指针）。在那之前不运行 `projection sync`，以免把未部署的 meshq 推进镜像。
 
-**前置条件已满足（2026-10-02）**：MeshQ 已在 Windows 部署（`C:\MCP\MeshQ` + `.venv`）并经桥实测可用（见缺口 1）。因此"一起接管"这一步现在可执行；它会把 cadq/meshq 一并写进 codex 与 claude 两个客户端，**待 Operator 点头后再动手**（命令：`projection sync --refresh-from registry-path --peer-registry <Windows registry.sqlite3>` 然后 `projection reconcile`，先加 `--dry-run` 复核）。
+**前置条件已满足（2026-10-02）**：MeshQ 已在 Windows 部署（`C:\MCP\MeshQ` + `.venv`）并经桥实测可用（见缺口 1）。因此"一起接管"这一步现在可执行；它会把 cadq/meshq 一并写进 codex 与 claude 两个客户端，**待 Operator 点头后再动手**。
+
+#### 2026-10-02 实测预演（dry-run，未落盘）
+
+`reconcile --dry-run` 自带 `--refresh-from`：刷新与对账都只作用于一份临时副本，源库、outbox、权限、甚至缺失的源目录都不动（`projection.py:3944-3976`）。所以整条接管链可以在零写入的前提下预演：
+
+```bash
+PATH="$HOME/.local/bin:$PATH" \
+python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl --dry-run \
+  --refresh-from registry-remote --local-port 8769      # 8769 = WSL 节点本地控制口
+```
+
+`PATH` 不是可有可无：`official-cli` 适配器直接 exec `codex`/`claude`，这两个 CLI 不在 PATH 上时整个 reconcile 会以 `[Errno 2]` 中断（该缺陷已修，见本节末）。
+
+| 环境 | 结论 | conflicts | 会写的动作 |
+| --- | --- | --- | --- |
+| `~/.claude.json` (claude) | **error** | onshape, taobao | add cadq, meshq |
+| `~/.codex/config.toml` (codex) | **error** | — | — |
+| dsh-tui overlay | next_session | — | 无（四条都已 configured） |
+| headless overlay | next_session | — | 规范化全部四条（launcher 统一为 `/usr/bin/python3`） |
+| web overlay | next_session | cadq, meshq | update onshape, taobao |
+
+镜像 → `['cadq','meshq','onshape','taobao']`。两个 `error` 各有原因，**都不是桥的文档损坏**：
+
+1. **codex 的 CLI 现在跑不起来（用户环境问题，与桥无关）**：`~/.local/bin/codex` → `~/.codex/packages/standalone/current/bin/codex` → `…/releases/0.155.0-alpha.16.3-x86_64-unknown-linux-musl/bin` → `~/.vscode-server/extensions/openai.chatgpt-26.917.62051-linux-x64/bin/linux-x86_64`，而该 VS Code 扩展已升到 `…-26.930.21537-…`，旧版本目录被删，整条符号链接链断掉（`shutil.which("codex")` 返回 None）。修它属于用户环境（重装 codex / 重指链接），或把 codex 环境 `unenroll`。
+2. **claude 的 stdio 条目无法被官方 CLI 反证（已知设计，此前未记录）**：`_cli_parse_claude_text` 只精确解析单行 `URL:` 的 native-HTTP 文本块；stdio 的 `Args:` 是空格拼接、env 是自由文本，无法无损还原，于是返回 None → 名字进 `unverifiable` → 每次 reconcile 按 "unmanaged name collision" 报冲突（`projection.py:3678-3685`）。实测 `claude mcp get onshape` 输出完全正常（能看到 `WIN_WSL_MCP_BRIDGE_OWNED=1`），是**解析侧**取不到，不是文档丢了。推论：claude 环境在 `official-cli` 适配器下**永远不会收敛干净**，`ok` 恒为 False。可选出路是把 claude 环境改回 `bridge-file` 适配器（桥直接拥有 `~/.claude.json` 的 `mcpServers`，可读回校验——测试里跑的就是这条）。
+
+顺带发现：`_cli_list_entry_names` 会把 `claude mcp list` 的首行 "Checking MCP server health…" 也当成条目名（实测返回 `['Checking','onshape','taobao']`）。name 不在镜像里所以不污染 desired 集合，但它会进 `unverifiable`，是处解析脆弱点。
+
+#### 预演过程中修掉的两个缺陷（`installer/projection.py`）
+
+- **一个客户端 CLI 装坏会中断整次 reconcile**：`_run_tool` 原先让 `FileNotFoundError` 直接冒泡，绕过 `_reconcile_one_environment` 的 per-environment `except BridgeError`，于是 codex 的断链把 claude 与三个 dsh 环境一起卡住。现改为抛 `BridgeError`（`OSError` 与 `TimeoutExpired` 都转），缺失/不可执行/超时都记到**那个环境自己**的 `errorDetail` 上。
+- **`--dry-run` 把冲突和 drift 一律报成 configured**：干跑分支无条件写 `ENV_STATUS_CONFIGURED`，于是预演永远看不到 conflicts/drift，而实跑是 error/drift——正是预演该暴露的东西被它藏起来。现在干跑与实跑共用 `_environment_verdict()`，两侧结论必须一致。
+
+**结论：接管仍未执行。** 除了需要 Operator 点头，现在还有两个前置要定：codex 的 CLI 要么修好要么 unenroll；claude 的适配器要么接受"每次 reconcile 常驻冲突"，要么改成 `bridge-file`。
 
 ## §6 已知缺口与回滚
 
@@ -171,7 +205,8 @@ dsh: overlay entry 3 in …/cordis-bridge-overlay.json must be a mapping (a load
 2. **CadQ 的 `artifactDelivery` 仍关闭**：CadQ 的输出根固定且故意不可配置，v1 不做产物回传，调用方按它自己声明的 `output_dir` 取件（WSL 侧走 `/mnt/c/...` 直读）。这不是桥的产物保证。
 3. **失败转移缺陷**（§2 坑 3）未修。
 4. 换码后 **Windows 侧运行时目录名换过**：以后要再原地升级，请按 §2 坑 1 在最终目录里重装一次。
-5. **overlay 里的 cadq/meshq 是"手加、桥不知情"的**：它们能活过一次 reconcile（§5.2 已实测），但不在桥的投影账里——`projection status` 不报告、`unenroll --remove-entries` 不清理。消除这处不一致的唯一途径是让桥的投影权威接管，而那会波及 codex/claude（§5.3），故挂起。
+5. **overlay 里的 cadq/meshq 是"手加、桥不知情"的**：它们能活过一次 reconcile（§5.2 已实测），但不在桥的投影账里——`projection status` 不报告、`unenroll --remove-entries` 不清理。消除这处不一致的唯一途径是让桥的投影权威接管，而那会波及 codex/claude（§5.3），故挂起。2026-10-02 预演证实了代价：web overlay 的这两条会被判为 conflict（`next_session` + `conflicts=['cadq','meshq']`），headless 的四条则会被规范化重写。
+6. **`official-cli` 适配器下 stdio 条目永远无法反证**（§5.3 实测，`projection.py:2194-2217`）：claude 环境因此每次 reconcile 都报 onshape/taobao 冲突、`ok` 恒为 False。既未改适配器（→`bridge-file`），也未改解析。另：`_cli_list_entry_names` 会把 `claude mcp list` 的 "Checking MCP server health…" 首行当成条目名。
 
 **回滚**
 

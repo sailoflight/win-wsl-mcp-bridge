@@ -5763,6 +5763,42 @@ class ProjectionReconcileTest(ProjectionHarness):
         self.assertEqual(self.claude_json.read_bytes(), before)
 
     @posix_fake_cli_only
+    def test_vanished_client_cli_fails_only_its_own_environment(self) -> None:
+        self.install_fake_cli("claude")
+        self.sync_mirror(self.make_peer([self.server("alpha")]))
+        claude = self.enroll(self.candidate("claude"))["environment"]
+        dsh = self.enroll(self.candidate("dsh"))["environment"]
+        self.assertEqual(claude["applyAdapter"], "official-cli")
+        self.assertEqual(dsh["applyAdapter"], "bridge-file")
+        self.assertTrue(self._reconcile()["ok"])
+        dsh_document = Path(dsh["configPath"]).read_bytes()
+        claude_before = self.claude_json.read_bytes()
+        # The client binary disappears between runs: uninstalled, or left behind
+        # as a dangling launcher. One client's broken install must not stop the
+        # reconcile before the other environments have converged.
+        self.set_path([])
+        result = self._reconcile()
+        self.assertFalse(result["ok"])
+        by_kind = {item["clientKind"]: item for item in result["environments"]}
+        self.assertEqual(by_kind["claude"]["status"], "error")
+        self.assertIn("claude command is unavailable", by_kind["claude"]["errorDetail"])
+        self.assertEqual(by_kind["claude"]["actions"], [])
+        self.assertNotEqual(by_kind["dsh"]["status"], "error")
+        self.assertEqual(Path(dsh["configPath"]).read_bytes(), dsh_document)
+        self.assertEqual(self.claude_json.read_bytes(), claude_before)
+        status = projection_status(projection=self.projection())
+        kind_of = {
+            item["environmentId"]: item["clientKind"] for item in status["environments"]
+        }
+        recorded = {
+            kind_of[item["environmentId"]]: item["errorDetail"]
+            for item in status["projections"]
+            if item["serverId"] == "alpha"
+        }
+        self.assertIn("claude command is unavailable", recorded["claude"])
+        self.assertIsNone(recorded["dsh"])
+
+    @posix_fake_cli_only
     def test_official_cli_add_list_remove_with_fake_binaries(self) -> None:
         state = self.install_fake_cli("claude")
         peer = self.make_peer([self.server("alpha"), self.server("beta")])
@@ -5805,6 +5841,34 @@ class ProjectionReconcileTest(ProjectionHarness):
         final = json.loads(state.read_text())
         self.assertIn("alpha", final["mcpServers"])
         self.assertEqual(final["mcpServers"]["alpha"]["args"], ["--user-edited"])
+
+    @posix_fake_cli_only
+    def test_dry_run_reports_the_same_verdict_as_the_real_reconcile(self) -> None:
+        state = self.install_fake_cli("claude")
+        self.sync_mirror(self.make_peer([self.server("alpha")]))
+        self.enroll(self.candidate("claude"))
+        self.assertTrue(self._reconcile()["ok"])
+        doc = json.loads(state.read_text())
+        doc["mcpServers"]["alpha"]["args"] = ["--user-edited"]
+        state.write_text(json.dumps(doc, ensure_ascii=False))
+        # A preview exists to surface conflicts and drift, so it must not report
+        # "configured" for a state the apply pass calls drift.
+        preview = self._reconcile(dry_run=True)
+        self.assertFalse(preview["ok"])
+        self.assertEqual([item["status"] for item in preview["environments"]], ["drift"])
+        self.assertEqual(preview["environments"][0]["drift"], ["alpha"])
+        real = self._reconcile()
+        self.assertFalse(real["ok"])
+        self.assertEqual(
+            [
+                (item["status"], item["conflicts"], item["drift"])
+                for item in preview["environments"]
+            ],
+            [
+                (item["status"], item["conflicts"], item["drift"])
+                for item in real["environments"]
+            ],
+        )
 
     def test_codex_owned_document_mode_when_cli_absent(self) -> None:
         config = self.home / ".codex" / "config.toml"

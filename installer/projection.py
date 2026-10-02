@@ -1589,20 +1589,33 @@ def _claude_cli_available() -> bool:
 
 def _run_tool(argv: list[str], timeout: int = 30) -> tuple[int, str, str]:
     """Run an allowlisted official client read/mutation command (no shell)."""
-    completed = subprocess.run(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        # The client CLIs are Node programs: they emit UTF-8. Without an
-        # explicit codec this decodes with the platform locale codec, which on
-        # Windows is the ANSI code page — a non-ASCII entry name would raise
-        # UnicodeDecodeError or, worse, silently parse as mojibake.
-        encoding="utf-8",
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # The client CLIs are Node programs: they emit UTF-8. Without an
+            # explicit codec this decodes with the platform locale codec, which
+            # on Windows is the ANSI code page — a non-ASCII entry name would
+            # raise UnicodeDecodeError or, worse, silently parse as mojibake.
+            encoding="utf-8",
+            timeout=timeout,
+            check=False,
+        )
+    except OSError as exc:
+        # The client was uninstalled, or its PATH entry is a dangling launcher.
+        # That is this one environment's problem: as a ``BridgeError`` it reaches
+        # the per-environment handler and is recorded there, instead of aborting
+        # the reconcile before every other client has converged.
+        raise BridgeError(
+            f"{argv[0]} command is unavailable: {exc.strerror or exc}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise BridgeError(
+            f"{argv[0]} command did not answer within {timeout}s"
+        ) from exc
     return completed.returncode, completed.stdout, completed.stderr
 
 
@@ -3555,6 +3568,30 @@ def _mark_outbox_processed(connection: sqlite3.Connection) -> None:
     )
 
 
+def _environment_verdict(
+    client_kind: str,
+    conflicts: list[str],
+    drift_names: list[str],
+) -> str:
+    """The converged verdict of one environment, from what the apply pass found.
+
+    Both the real run and the dry run call this: a preview that reported
+    ``configured`` while the apply reported ``error`` would hide the conflicts
+    and drift it exists to surface.
+    """
+    if not conflicts and not drift_names:
+        status = ENV_STATUS_CONFIGURED
+    elif drift_names and not conflicts:
+        status = ENV_STATUS_DRIFT
+    else:
+        status = ENV_STATUS_ERROR
+    # A DSH overlay only ever takes effect in the next session, so its verdict
+    # names that instead; ``conflicts`` and ``drift`` still carry what was found.
+    if client_kind == CLIENT_KIND_DSH:
+        status = ENV_STATUS_NEXT_SESSION
+    return status
+
+
 def _reconcile_one_environment(
     database: ProjectionDatabase,
     connection: sqlite3.Connection,
@@ -3877,13 +3914,9 @@ def _reconcile_one_environment(
                             name,
                         ),
                     )
-        environment_status = ENV_STATUS_CONFIGURED
-        if conflicts or drift_names:
-            environment_status = (
-                ENV_STATUS_DRIFT if drift_names and not conflicts else ENV_STATUS_ERROR
-            )
-        if str(env_row["client_kind"]) == CLIENT_KIND_DSH:
-            environment_status = ENV_STATUS_NEXT_SESSION
+        environment_status = _environment_verdict(
+            str(env_row["client_kind"]), conflicts, drift_names
+        )
         connection.execute(
             "UPDATE agent_environments SET updated_at_ns = ? WHERE environment_id = ?",
             (now, environment_id),
@@ -3917,7 +3950,12 @@ def _reconcile_one_environment(
             ),
         )
     else:
-        environment_status = ENV_STATUS_CONFIGURED
+        # A dry run persists nothing but must still predict the verdict the real
+        # run would report, otherwise a preview hides exactly the conflicts and
+        # drift it exists to surface.
+        environment_status = _environment_verdict(
+            str(env_row["client_kind"]), conflicts, drift_names
+        )
     environment_summary["status"] = environment_status
     environment_summary["unsupportedTransports"] = []
     environment_summary["conflicts"] = conflicts
