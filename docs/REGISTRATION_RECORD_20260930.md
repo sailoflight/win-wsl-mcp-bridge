@@ -46,7 +46,9 @@
 
 1. **pip 生成的 `.exe` 启动器把解释器的绝对路径写在文件里。** 把 venv 目录改名（`runtime.next` → `runtime`）会让启动器**直接退 1 且没有任何输出**，现象是 supervisor 报 `Windows bridge node exited during startup (1)`。取证方式：`strings runtime/Scripts/win-wsl-mcp-win.exe` 里能看到 `#!C:\...\runtime.next\Scripts\python.exe`。**修法：改名之后在新目录里原地重装一次 wheel，重生成启动器。**
 2. **改名切换与 DSH 重连有竞态。** 停掉栈所有者后，6 个 profile 的 supervisor 会在 ~0.5s 内同时重连并抢 8769 / 8768 / 8770；抢输的一方各自绑端口失败退出，**赢家也可能被输家的对端链路顶掉**，结果是"WSL 节点在听、Windows 节点全退"。下次换码应让 DSH 侧先停（或只留一个入口）再切。
-3. **文档里写的失败转移没有发生。** supervisor 的设计是：attach 模式的 `registry-mcp` 失去节点后退出，Harness 重连把这个条目重启成所有者。实测：所有者死后，attach 侧的 `registry-mcp` **没有退出**，而是回 `MCP error -32603 internal registry error`（控制面回 `internal control error`），栈在 24 秒后仍然全停；五个 attach supervisor 都还活着。**这很可能就是那组 `-32603` 的真正来源**：不是"控制面坏了"，是"栈的所有者不在了，而失效的包装器不退出、所以永远不会自我恢复"。要恢复必须让那些 `registry-mcp` 退出（它们退出 → supervisor 退出 → Harness 重连 → 端口空闲者成为所有者）。这是一条**待修**项。
+3. **文档里写的失败转移没有发生。** supervisor 的设计是：attach 模式的 `registry-mcp` 失去节点后退出，Harness 重连把这个条目重启成所有者。实测：所有者死后，attach 侧的 `registry-mcp` **没有退出**，而是回 `MCP error -32603 internal registry error`（控制面回 `internal control error`），栈在 24 秒后仍然全停；五个 attach supervisor 都还活着。**这很可能就是那组 `-32603` 的真正来源**：不是"控制面坏了"，是"栈的所有者不在了，而失效的包装器不退出、所以永远不会自我恢复"。要恢复必须让那些 `registry-mcp` 退出（它们退出 → supervisor 退出 → Harness 重连 → 端口空闲者成为所有者）。~~这是一条**待修**项。~~
+
+   两半都已修，见 `docs/INCIDENT_HALF_DEAD_STACK_20261002.md`：attach 侧由 supervisor 增加节点看门狗主动退出（`installer/dsh_node_registry_entry.py`，commit `1dba039`/`4b1e023`），而 `-32603` 本身是因为两个前端把"节点不可达"混进了内部错误；现在节点不可达回报可区分的工具级 `isError`（`node_absent` / `node_unreachable`，含 endpoint），见该文"附带修复 2"。
 
 ## §3 登记行（Windows 注册表）
 

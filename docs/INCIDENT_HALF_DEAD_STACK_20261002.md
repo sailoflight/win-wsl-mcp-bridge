@@ -59,6 +59,18 @@ def _plan(occupied, stack_ready, peer_ready=False):
 
 attach 侧看不到自己借来的节点的进程句柄，所以补一个看门狗：每 `LOCAL_NODE_CHECK_SECONDS`（5s）向本节点发一次真实 registry 查询，连续 `LOCAL_NODE_LOSS_LIMIT`（2）次不应答就以非零码退出。健康时不退出（查询与轮询频率无关，不会给节点刷日志）。只有 attach 模式启用——`own`/`reclaim` 模式本来就有子进程句柄可判断。
 
+## 附带修复 2：节点不可达的诊断（那组 `-32603` 的根因）
+
+上一条只解决了"attach 侧不退出"。用户看到的字面症状——控制面 `-32603 internal control error`、注册表 `-32603 internal registry error`——来自另一处：两个前端把**节点不可达**（`ConnectionRefusedError` 之类的传输失败）和其他未预期异常混成同一个 `-32603`。`_registry_mcp_dispatch` 只捕获 `BridgeError`，所以"端口没人听"这种 `OSError` 直接漏到最外层 `except Exception`，连异常类型都被丢掉；`_control_mcp_dispatch` 更彻底，压根没有捕获。
+
+改法（`bridge_runtime.py`）：
+
+1. 新增 `NodeUnavailableError(BridgeError)`。`local_registry_query` / `local_control_query` 只把**传输段**（connect / send / 握手读 / JSON 解析）的失败包成它，并把原始异常挂在 `__cause__`；节点自己回 `ok:false` 的业务性拒绝仍然抛普通 `BridgeError`，于是"节点答了错"和"节点没答"不再混淆。
+2. 两个前端把 `NodeUnavailableError` 变成**工具级 `isError` 结果**（与注册表前端既有约定一致），带 `code` / `endpoint` / `summary` / `detail` 四个字段：`node_absent`（连接被拒 = 端口没人听）与 `node_unreachable`（超时、重置、握手早关、回非本桥 JSON = 有东西占着端口但不服务）。
+3. 真正的内部异常仍回 `-32603`（消息文字不变，事故记录里的原句仍成立），但加了 `data.exception` / `data.detail`；控制面补上 stderr 一行（注册表本来就有）。
+
+离线测试：`tests/test_modern_control_frontend.py` 新增 5 项——控制面的两种故障码、节点自答错误保持自己的 code、注册表侧的 `node_absent`、以及 loop 级 `-32603` 带异常类型与 stderr 行。
+
 ## 验收（真实环境 A/B）
 
 1. **造故障态**：用 supervisor 正常起栈（`own`，注册表 4 个工具、`bridge_registry_list` 返回真实对端数据）→ `kill -9` supervisor（模拟会话被强杀，无人执行 `finally`）→ 杀掉 WSL 节点 → 剩下孤儿的 Windows 节点占着 8768/8770、8769 空闲。
@@ -104,4 +116,4 @@ server exited on its own with code 1
 
 1. **孤儿 Windows 节点本身没人回收**。`reclaim` 让它重新可用，但那个 Windows 节点始终没有 supervisor 管辖；下次 owner 异常退出仍会再产生一个（只是现在不会卡死了）。彻底办法是让 Windows 节点在失去 link 对端后自行退出，或让 supervisor 主动接管——前者要动共享运行时，后者要依赖 Windows 侧工具，均未实施。
 2. ~~**attach 侧的 `registry-mcp` 在 owner 死后不退出**~~ → **已修**（见"附带修复"）：attach 模式现在由 supervisor 监视借来的节点并主动退出。注意 `control-mcp` 是另一条独立 MCP 条目（由 home patch 提供），它仍不会自己退出；只是它是按调用连接、节点恢复后即可用（事故后实测恢复）。
-3. **`bridge_control status`/`bridge_diagnostics` 在这类故障下只给 `-32603`**，没有可区分的诊断信息。
+3. ~~**`bridge_control status`/`bridge_diagnostics` 在这类故障下只给 `-32603`**，没有可区分的诊断信息。~~ → **已修**（见"附带修复 2"）：节点不可达现在是工具级 `isError`，带 `node_absent`/`node_unreachable` 与 endpoint；真内部异常仍回 `-32603` 但多了异常类型。

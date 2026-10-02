@@ -225,6 +225,21 @@ class ModernRegistryFrontendTest(unittest.TestCase):
         self.assertIn("registry unreachable boom", result["content"][0]["text"])
         self.mock_query.assert_called_once()
 
+    def test_registry_node_absence_is_a_diagnostic_tool_error(self) -> None:
+        # The incident's other symptom: with the owner gone the registry tools
+        # answered "internal registry error" and named neither the endpoint nor
+        # the fault. A refused connection is the absent node, and it says so.
+        fault = br.NodeUnavailableError("127.0.0.1:1 did not answer a registry query")
+        fault.__cause__ = ConnectionRefusedError(111, "Connection refused")
+        self.mock_query.side_effect = fault
+        response = self.call_tool("bridge_registry_list", {}, meta=_meta())
+        self.assertNotIn("error", response)
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        text = result["content"][0]["text"]
+        self.assertIn("no bridge node is listening on 127.0.0.1:1", text)
+        self.assertIn("node_absent", text)
+
     def test_unknown_registry_tool_is_invalid_params_without_side_effect(self) -> None:
         response = self.call_tool("not_a_registry_tool", {}, meta=_meta())
         self.assertEqual(response["error"]["code"], -32602)
@@ -456,6 +471,52 @@ class ModernControlFrontendTest(unittest.TestCase):
             {"op": "diagnostics", "limit": 5},
         )
 
+    @staticmethod
+    def _node_fault(cause: BaseException, text: str) -> br.NodeUnavailableError:
+        """A NodeUnavailableError carrying ``cause``, as the queries raise it."""
+        fault = br.NodeUnavailableError(text)
+        fault.__cause__ = cause
+        return fault
+
+    def test_node_faults_are_diagnostic_tool_errors_not_internal_errors(self) -> None:
+        # docs/INCIDENT_HALF_DEAD_STACK_20261002.md: both faults reached the
+        # client as a bare -32603, which is exactly what an operator cannot act
+        # on. An absent node and a half-dead listener must be distinguishable.
+        self.mock_query.side_effect = self._node_fault(
+            ConnectionRefusedError(111, "Connection refused"),
+            "127.0.0.1:1 did not answer a control request",
+        )
+        response = self.call_tool("bridge_diagnostics", {"limit": 5}, meta=_meta())
+        self.assertNotIn("error", response)
+        result = response["result"]
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["resultType"], bp.RESULT_TYPE_COMPLETE)
+        fault = result["structuredContent"]
+        self.assertEqual(fault["code"], "node_absent")
+        self.assertEqual(fault["endpoint"], "127.0.0.1:1")
+        self.assertIn("no bridge node is listening on 127.0.0.1:1", fault["summary"])
+        self.assertIn("node_absent", result["content"][0]["text"])
+
+        self.mock_query.side_effect = self._node_fault(
+            TimeoutError("timed out"), "127.0.0.1:1 did not answer a control request"
+        )
+        half_dead = self.call_tool("bridge_control", {"action": "status"})["result"]
+        self.assertTrue(half_dead["isError"])
+        self.assertEqual(half_dead["structuredContent"]["code"], "node_unreachable")
+        self.assertIn("TimeoutError", half_dead["structuredContent"]["summary"])
+
+    def test_a_node_that_answers_an_error_keeps_its_own_code(self) -> None:
+        # The node may refuse the action itself; that is not a stack fault and
+        # must keep the node's own code and summary.
+        self.mock_query.return_value = {
+            "ok": False,
+            "code": "control_failed",
+            "summary": "confirmation required",
+        }
+        result = self.call_tool("bridge_control", {"action": "stop"})["result"]
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["structuredContent"]["code"], "control_failed")
+
     def test_unknown_control_tool_is_invalid_params_without_side_effect(self) -> None:
         response = self.call_tool("bridge_restart_everything", {})
         self.assertEqual(response["error"]["code"], -32602)
@@ -546,6 +607,51 @@ class ModernLoopFramingAndEraTest(unittest.TestCase):
         self.assertEqual(responses[1]["error"]["code"], -32601)
         self.assertIn("legacy initialize", responses[1]["error"]["message"])
         self.mock_query.assert_not_called()
+
+    def test_control_loop_answers_node_loss_instead_of_internal_error(self) -> None:
+        # The client-visible half of the fix: the incident's "MCP error -32603
+        # internal control error" must become a result that names the endpoint.
+        fault = br.NodeUnavailableError("127.0.0.1:1 did not answer a control request")
+        fault.__cause__ = ConnectionRefusedError(111, "Connection refused")
+        self.mock_query.side_effect = fault
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": "bridge_control", "arguments": {"action": "status"}},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        return_code, responses = _run_stdio(
+            lambda: br.control_mcp("127.0.0.1", 1), payload
+        )
+        self.assertEqual(return_code, 0)
+        self.assertEqual(len(responses), 1)
+        self.assertNotIn("error", responses[0])
+        result = responses[0]["result"]
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["structuredContent"]["code"], "node_absent")
+        self.assertEqual(result["structuredContent"]["endpoint"], "127.0.0.1:1")
+
+    def test_control_loop_internal_error_names_the_exception(self) -> None:
+        # A genuinely unexpected fault keeps -32603 but stops being anonymous.
+        self.mock_query.side_effect = RuntimeError("boom")
+        payload = json.dumps(
+            {
+                "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                "params": {"name": "bridge_diagnostics", "arguments": {}},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        with mock.patch("sys.stderr", io.StringIO()) as stderr:
+            return_code, responses = _run_stdio(
+                lambda: br.control_mcp("127.0.0.1", 1), payload
+            )
+        self.assertEqual(return_code, 0)
+        self.assertEqual(responses[0]["error"]["code"], -32603)
+        self.assertEqual(responses[0]["error"]["message"], "internal control error")
+        self.assertEqual(responses[0]["error"]["data"]["exception"], "RuntimeError")
+        self.assertIn("boom", responses[0]["error"]["data"]["detail"])
+        self.assertIn("RuntimeError", stderr.getvalue())
 
     def test_control_loop_default_legacy_era_ignores_modern_meta(self) -> None:
         # Without --protocol-era modern the endpoint keeps its exact legacy

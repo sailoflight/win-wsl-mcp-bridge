@@ -1050,6 +1050,18 @@ class BridgeError(RuntimeError):
     pass
 
 
+class NodeUnavailableError(BridgeError):
+    """The local bridge node did not complete an exchange.
+
+    Raised, with the transport failure as ``__cause__``, instead of a plain
+    ``BridgeError`` so a Bridge-owned frontend can tell a *stack* fault — no
+    listener on the port, a half-dead listener, a handshake that closes early —
+    from a node that answered with an error about the request itself. Both
+    faults used to reach the client as a bare ``-32603``; see
+    ``docs/INCIDENT_HALF_DEAD_STACK_20261002.md``.
+    """
+
+
 class JsonRpcError(BridgeError):
     def __init__(self, code: int, message: str):
         super().__init__(message)
@@ -11583,19 +11595,25 @@ def local_registry_query(
 ) -> Any:
     if not _is_loopback(local_host):
         raise BridgeError("registry host must resolve only to loopback")
-    with socket.create_connection((local_host, local_port), timeout=10) as sock:
-        sock.sendall(
-            _json_bytes(
-                {
-                    "op": "registry",
-                    "scope": scope,
-                    "action": action,
-                    "arguments": arguments,
-                }
+    try:
+        with socket.create_connection((local_host, local_port), timeout=10) as sock:
+            sock.sendall(
+                _json_bytes(
+                    {
+                        "op": "registry",
+                        "scope": scope,
+                        "action": action,
+                        "arguments": arguments,
+                    }
+                )
+                + b"\n"
             )
-            + b"\n"
-        )
-        reply = json.loads(_recv_line(sock))
+            reply = json.loads(_recv_line(sock))
+    except (OSError, ValueError, BridgeError) as exc:
+        raise NodeUnavailableError(
+            f"{local_host}:{local_port} did not answer a registry query: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     if not reply.get("ok"):
         raise BridgeError(str(reply.get("message", "registry query failed")))
     return reply.get("result")
@@ -11697,6 +11715,17 @@ def _registry_mcp_dispatch(
                 actions[name],
                 arguments,
             )
+        except NodeUnavailableError as exc:
+            fault = _node_fault_value(local_host, local_port, exc)
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"{fault['summary']} [{fault['code']}]",
+                    }
+                ],
+                "isError": True,
+            }
         except BridgeError as exc:
             return {
                 "content": [{"type": "text", "text": str(exc)}],
@@ -11755,6 +11784,42 @@ def _control_tools() -> list[dict[str, Any]]:
     ]
 
 
+def _node_fault_value(
+    local_host: str, local_port: int, exc: BaseException
+) -> dict[str, Any]:
+    """Diagnostic value for a registry/control query that never reached the node.
+
+    Both Bridge-owned frontends reach the local node over loopback, so a failed
+    exchange is a node or stack fault, not a bad request. Collapsing it into an
+    internal error hid the one distinction an operator needs during a half-dead
+    stack: with no listener on the port the node is *absent*, while a listener
+    that accepts and then says nothing (or nonsense) means the stack is
+    half-dead. ``docs/INCIDENT_HALF_DEAD_STACK_20261002.md`` records that both
+    reached the client as a bare ``-32603``.
+    """
+    endpoint = f"{local_host}:{local_port}"
+    cause = exc.__cause__ if exc.__cause__ is not None else exc
+    if isinstance(cause, ConnectionRefusedError):
+        code = "node_absent"
+        summary = f"no bridge node is listening on {endpoint}"
+    else:
+        # A timeout, a reset, a handshake that closed early, or a reply that is
+        # not this bridge's JSON: something owns the port but does not serve it.
+        code = "node_unreachable"
+        summary = f"{type(cause).__name__} while talking to {endpoint}: {cause}"
+    return {
+        "ok": False,
+        "code": code,
+        "endpoint": endpoint,
+        "summary": summary,
+        "detail": (
+            "the local bridge node did not answer; the Bridge-owned MCP reaches "
+            "it over loopback, so this is a stack fault rather than a rejected "
+            "request"
+        ),
+    }
+
+
 def _control_mcp_dispatch(
     message: dict[str, Any], local_host: str, local_port: int
 ) -> dict[str, Any]:
@@ -11795,7 +11860,10 @@ def _control_mcp_dispatch(
         request = {"op": "diagnostics", "limit": arguments.get("limit", 20)}
     else:
         raise JsonRpcError(-32602, f"unknown control tool: {name}")
-    value = local_control_query(local_host, local_port, request)
+    try:
+        value = local_control_query(local_host, local_port, request)
+    except NodeUnavailableError as exc:
+        value = _node_fault_value(local_host, local_port, exc)
     return {
         "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, separators=(",", ":"))}],
         "structuredContent": value,
@@ -11981,9 +12049,15 @@ def local_control_query(
 ) -> dict[str, Any]:
     if not _is_loopback(local_host):
         raise BridgeError("control host must resolve only to loopback")
-    with socket.create_connection((local_host, local_port), timeout=10) as sock:
-        sock.sendall(_json_bytes(request) + b"\n")
-        reply = json.loads(_recv_line(sock))
+    try:
+        with socket.create_connection((local_host, local_port), timeout=10) as sock:
+            sock.sendall(_json_bytes(request) + b"\n")
+            reply = json.loads(_recv_line(sock))
+    except (OSError, ValueError, BridgeError) as exc:
+        raise NodeUnavailableError(
+            f"{local_host}:{local_port} did not answer a control request: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     if not reply.get("ok"):
         return {"ok": False, "code": "control_failed", "summary": str(reply.get("message", "control failed"))[:400]}
     value = reply.get("result")
@@ -12470,8 +12544,23 @@ def control_mcp(
                 response = {"jsonrpc": "2.0", "id": request_id, "result": result}
         except JsonRpcError as exc:
             response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": exc.code, "message": str(exc)}}
-        except Exception:
-            response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32603, "message": "internal control error"}}
+        except Exception as exc:
+            print(
+                f"control MCP internal error: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "internal control error",
+                    # The type and text of an unexpected fault are what make it
+                    # diagnosable; the client otherwise sees only the code.
+                    "data": {"exception": type(exc).__name__, "detail": str(exc)[:400]},
+                },
+            }
         _write_registry_mcp_response(response)
 
 
@@ -12601,7 +12690,11 @@ def registry_mcp(
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": -32603, "message": "internal registry error"},
+                "error": {
+                    "code": -32603,
+                    "message": "internal registry error",
+                    "data": {"exception": type(exc).__name__, "detail": str(exc)[:400]},
+                },
             }
         _write_registry_mcp_response(response)
 
