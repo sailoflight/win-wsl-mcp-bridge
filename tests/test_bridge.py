@@ -5284,6 +5284,8 @@ class ProjectionHarness(unittest.TestCase):
                 "CODEX_HOME",
                 "DSH_HOME",
                 "PATH",
+                "XDG_DATA_HOME",
+                "LOCALAPPDATA",
                 "FAKE_STATE",
                 "FAKE_KIND",
             )
@@ -5308,6 +5310,12 @@ class ProjectionHarness(unittest.TestCase):
         os.environ["HOMEPATH"] = str(self.home)[len(self.home.drive):]
         os.environ["CODEX_HOME"] = str(self.home / ".codex")
         os.environ["DSH_HOME"] = str(self.dsh_home)
+        # The default bridge launcher prefers this host's installed console
+        # script, which is resolved from the data home.  Pin both data roots
+        # inside the hermetic root so a developer's real installation can never
+        # become this suite's launcher (``docs/DEPLOYMENT.md``).
+        os.environ["XDG_DATA_HOME"] = str(self.root / "data")
+        os.environ["LOCALAPPDATA"] = str(self.root / "local")
         os.environ.pop("FAKE_STATE", None)
         os.environ.pop("FAKE_KIND", None)
         self.set_path([])
@@ -5409,6 +5417,101 @@ class ProjectionHarness(unittest.TestCase):
         if env_extra:
             env.update(env_extra)
         return {"command": command, "args": list(args), "env": env}
+
+
+class ProjectionLauncherFormTest(ProjectionHarness):
+    """A projected client launches the installed artifact, never the tree.
+
+    The projected launcher decides which bridge code a *business client* runs,
+    so it is a deployment decision rather than a convenience: the working tree
+    is mutable, and a client pinned to it silently follows whatever was last
+    edited while the node keeps running the installed release.  Both halves then
+    disagree about the code they are running, which is what the revision check
+    in ``bridge_diagnostics`` exists to report
+    (``docs/DEPLOYMENT.md``).
+    """
+
+    CONSOLE = "win-wsl-mcp-wsl"
+
+    def install_console_script(self, side: str | None = None) -> Path:
+        """Create the installed console script this host would own."""
+        if (side or self.SIDE) == "win":
+            directory = (
+                Path(os.environ["LOCALAPPDATA"]) / "WinWslMcpBridge" / "runtime" / "Scripts"
+            )
+            script = directory / "win-wsl-mcp-win.exe"
+        else:
+            directory = (
+                Path(os.environ["XDG_DATA_HOME"]) / "win-wsl-mcp-bridge" / "runtime" / "bin"
+            )
+            script = directory / self.CONSOLE
+        directory.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def component(self, side: str | None = None) -> Path:
+        return ROOT / f"{side or self.SIDE}-bridge-mcp" / "bridge.py"
+
+    def test_default_launcher_prefers_the_installed_console_script(self) -> None:
+        scripts = {side: self.install_console_script(side) for side in ("win", "wsl")}
+        for side, script in scripts.items():
+            with self.subTest(side=side):
+                command, args = installer_projection._default_launcher(side)
+                self.assertEqual((command, args), (str(script), []))
+                installer_projection._validate_launcher(side, command, args)
+
+    def test_default_launcher_without_an_installation_stays_on_the_tree(self) -> None:
+        # A development or test host has no installation; the tree form keeps it
+        # able to enroll, and it is only ever an explicit fallback.
+        for side in ("win", "wsl"):
+            with self.subTest(side=side):
+                self.assertIsNone(installer_projection._installed_console_script(side))
+                command, args = installer_projection._default_launcher(side)
+                self.assertEqual(command, sys.executable)
+                self.assertEqual(args, [str(self.component(side))])
+                installer_projection._validate_launcher(side, command, args)
+
+    def test_console_launcher_refuses_python_style_bridge_args(self) -> None:
+        script = self.install_console_script()
+        with self.assertRaisesRegex(BridgeError, "must not carry"):
+            installer_projection._validate_launcher(
+                self.SIDE, str(script), [str(self.component())]
+            )
+
+    def test_a_foreign_absolute_launcher_is_still_refused(self) -> None:
+        # The relaxation accepts this side's console script only: an arbitrary
+        # existing program remains outside the projection's authority.
+        self.install_console_script()
+        foreign = self.root / "foreign-program"
+        foreign.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        foreign.chmod(0o755)
+        with self.assertRaisesRegex(BridgeError, "installed console script"):
+            installer_projection._validate_launcher(self.SIDE, str(foreign), [])
+        with self.assertRaisesRegex(BridgeError, "not an existing file"):
+            installer_projection._validate_launcher(
+                self.SIDE, str(self.root / "missing-console"), []
+            )
+
+    def test_enrollment_records_and_writes_the_installed_console_script(self) -> None:
+        script = self.install_console_script()
+        config = self.home / ".codex" / "config.toml"
+        self.sync_mirror(self.make_peer([self.server("alpha")]))
+        self.enroll(self.candidate("codex"))
+        result = projection_reconcile(projection=self.projection(), side=self.SIDE)
+        self.assertTrue(result["ok"], result["errors"])
+        with connect_sqlite(self.projection()) as connection:
+            recorded = connection.execute(
+                "SELECT launcher_command, launcher_args_json FROM agent_environments"
+            ).fetchone()
+        self.assertEqual(recorded[0], str(script))
+        self.assertEqual(json.loads(recorded[1]), [])
+        entries = installer_projection._codex_owned_document_entries(
+            config.read_text(encoding="utf-8")
+        )
+        self.assertEqual(entries["alpha"]["command"], str(script))
+        self.assertEqual(entries["alpha"]["args"], ["connect", "alpha"])
+        self.assertNotIn(str(self.component()), config.read_text(encoding="utf-8"))
 
 
 class ProjectionScannerOutboxEnrollTest(ProjectionHarness):

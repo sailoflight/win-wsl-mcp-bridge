@@ -1298,8 +1298,39 @@ def _utc_text(value: Any) -> str:
 
 
 
+def _installed_console_script(side: str) -> Path | None:
+    """This host's installed console script for ``side``, or ``None``.
+
+    The bridge installs each side as a private runtime plus one console script,
+    and the two must stay together: a client must launch the artifact the
+    Operator installed, never a mutable working tree.  The location is derived
+    exactly like ``bridge_runtime.default_registry_path`` does for this side, so
+    one host resolves one installation location for both its registry and its
+    launcher.
+    """
+    if side == "win":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        candidate = base / "WinWslMcpBridge" / "runtime" / "Scripts" / "win-wsl-mcp-win.exe"
+    else:
+        data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+        candidate = data_home / "win-wsl-mcp-bridge" / "runtime" / "bin" / "win-wsl-mcp-wsl"
+    return candidate if candidate.is_file() else None
+
+
 def _default_launcher(side: str) -> tuple[str, list[str]]:
-    """Deterministic default bridge launcher for projected entries."""
+    """Deterministic default bridge launcher for projected entries.
+
+    Preference order is the deployment form first: the installed console script
+    of this host when one exists, then the working-tree component of a host that
+    has no installation (development and test hosts), then the bare console name
+    for an installation this module cannot see from here.  The tree form is a
+    fallback for developing the bridge, not a deployment: a projected client
+    that launched it would silently follow an edited working tree
+    (``docs/DEPLOYMENT.md``).
+    """
+    installed = _installed_console_script(side)
+    if installed is not None:
+        return str(installed), []
     component = Path(__file__).resolve().parents[1] / f"{side}-bridge-mcp" / "bridge.py"
     if component.is_file():
         return sys.executable, [str(component)]
@@ -1308,13 +1339,29 @@ def _default_launcher(side: str) -> tuple[str, list[str]]:
 
 
 def _validate_launcher(side: str, value: str, args: list[str]) -> None:
-    """Validate that the launcher references only this side's bridge component."""
+    """Validate that the launcher references only this side's bridge component.
+
+    Three launch forms are accepted, and none of them can name a foreign
+    program: this side's installed console script (absolute, no bridge args),
+    the bare console name itself, or an explicit absolute interpreter whose args
+    name this side's working-tree component.  The last one is the development
+    form that ``_default_launcher`` only falls back to on a host with no
+    installation.
+    """
     if not all(isinstance(item, str) for item in args):
         raise BridgeError("bridge launcher args must be strings")
     path = Path(value)
     if path.is_absolute():
         if not path.is_file():
             raise BridgeError(f"bridge launcher is not an existing file: {value}")
+        installed = _installed_console_script(side)
+        if installed is not None and path == installed:
+            if any(Path(arg).is_absolute() for arg in args):
+                raise BridgeError(
+                    "the installed console-script launcher must not carry "
+                    f"absolute bridge args: {args}"
+                )
+            return
         component = Path(__file__).resolve().parents[1] / f"{side}-bridge-mcp" / "bridge.py"
         references_component = any(
             Path(arg).is_absolute() and os.path.abspath(arg) == str(component)
@@ -1323,7 +1370,8 @@ def _validate_launcher(side: str, value: str, args: list[str]) -> None:
         if not references_component:
             raise BridgeError(
                 f"an absolute bridge launcher must name the {side} component "
-                f"bridge.py in its args: {component}"
+                f"bridge.py in its args, or be this side's installed console "
+                f"script: {component}"
             )
     else:
         expected = "win-wsl-mcp-win" if side == "win" else "win-wsl-mcp-wsl"

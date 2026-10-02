@@ -270,6 +270,76 @@ not start the relay or prove client runtime loading. Same-name transport changes
 verify persisted fingerprints, remove/add through the adapter, and roll back
 failed writes. User edits are reported as drift rather than overwritten.
 
+## Deployment form of the projected launcher
+
+A projected entry decides which bridge code a *business client* runs, so its
+default is the deployment form: the console script this host installed.
+
+```bash
+# inspect what each enrolled environment actually launches
+python3 wsl-bridge-mcp/bridge.py projection status --side wsl \
+    --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3
+```
+
+`enroll` resolves the launcher in this order and records one of three forms:
+
+1. the installed console script of this side, as an absolute path
+   (`$XDG_DATA_HOME/win-wsl-mcp-bridge/runtime/bin/win-wsl-mcp-wsl`, or
+   `%LOCALAPPDATA%\WinWslMcpBridge\runtime\Scripts\win-wsl-mcp-win.exe`) —
+   derived the way this host's registry path is derived, so one host resolves
+   one installation for both its registry and its launcher;
+2. the working-tree component (`sys.executable <tree>/<side>-bridge-mcp/bridge.py`)
+   only when this host owns no installation: a development fallback, never a
+   deployment;
+3. the bare console entry name when an installation exists that this module
+   cannot see from here.
+
+Forms 1 and 3 launch the installed artifact; the console form carries no Python
+arguments at all, so it also removes the bytecode and interpreter-path concerns
+of a tree launcher. Form 2 is accepted but is a deviation: the working tree is
+mutable, and a client pinned to it keeps following edits while the node keeps
+running the release that was installed. `SERVER_VERSION` cannot detect that,
+because both report the same version string.
+
+Two surfaces make a deviation visible instead:
+
+* `bridge_diagnostics` returns the node's `runtimeRevision`, a 12-hex digest of
+  every top-level runtime module the node loaded, and `revisionCheck` compares
+  it with the digest of the code the *client-side* frontend is running:
+  `verdict` is `match` (both halves run byte-identical runtime code), `differs`
+  (one side was edited or installed differently), or `unknown` (the node
+  reported no digest and predates this probe). Only `match` is healthy, and it
+  is a code identity rather than a location guarantee: a working-tree launcher
+  whose bytes still equal the installed release reports `match` too, which is
+  why the projected launcher is pinned instead of merely monitored. This
+  compares one host's node with the client-side frontend talking to it;
+  cross-host alignment is checked by running `doctor` on both hosts and
+  comparing the reported `runtimeRevision`;
+* `doctor` prints this host's `runtimeRevision`, so the two hosts can be
+  compared directly.
+
+Re-pinning an enrolled environment (there is no in-place launcher editor, and a
+recorded launcher is never silently rewritten) is a deliberate re-enrollment,
+where `--launcher` / `--launcher-args` express an explicit deviation:
+
+```bash
+python3 wsl-bridge-mcp/bridge.py projection unenroll <environment-id> \
+    --keep-entries --confirm
+python3 wsl-bridge-mcp/bridge.py projection enroll <candidate-id> --side wsl \
+    --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3 --confirm
+python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl \
+    --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3
+```
+
+`unenroll --keep-entries` stops synchronization and leaves the client document
+untouched; the following `enroll` replaces the stopped row with the current
+default launcher, and `reconcile` re-verifies the owned entries and rewrites
+them through the environment's adapter. Re-run `projection status` afterwards to
+confirm `launcherCommand` points at the installed console script, and
+`bridge_diagnostics` to confirm `revisionCheck.verdict` is `match`. Refresh the
+installation before re-pinning: the pinned artifact is what every client of that
+environment will run.
+
 ## Explicit protocol-era conversion
 
 The HTTP-to-stdio adapter defaults to the legacy session protocol. For a modern

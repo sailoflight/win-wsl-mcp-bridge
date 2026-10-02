@@ -162,6 +162,60 @@ SHARED_BACKEND_CLIENT_CAPABILITIES: dict[str, Any] = {}
 #: shape of MCP protocol revision identifiers (``YYYY-MM-DD`` dates).
 MCP_PROTOCOL_REVISION_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+#: Cached digest of the runtime modules this process loaded (see
+#: ``runtime_revision``).  ``None`` until the first call.
+_RUNTIME_REVISION: str | None = None
+
+
+def runtime_revision() -> str:
+    """Identity digest of the runtime code this process actually loaded.
+
+    ``SERVER_VERSION`` cannot detect a skewed deployment: an unreleased working
+    tree and the installed release both report the same version string, so a
+    client pinned to the wrong artifact used to be invisible.  This digest
+    covers every top-level ``*.py`` module shipped next to the *loaded*
+    ``bridge_runtime``, in name order, so two processes agree only when they run
+    byte-identical runtime code.  The node reports it in diagnostics and the
+    control frontend compares it with its own value
+    (``docs/DEPLOYMENT.md``).
+    """
+    global _RUNTIME_REVISION
+    if _RUNTIME_REVISION is None:
+        digest = hashlib.sha256()
+        try:
+            directory = Path(__file__).resolve().parent
+            modules = sorted(directory.glob("*.py"))
+            for module in modules:
+                digest.update(module.name.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(module.read_bytes())
+                digest.update(b"\0")
+        except OSError:
+            # An unreadable installation is reported as unknown rather than
+            # mistaken for a match: skew detection must never guess.
+            _RUNTIME_REVISION = "unknown"
+        else:
+            _RUNTIME_REVISION = digest.hexdigest()[:12]
+    return _RUNTIME_REVISION
+
+
+def _revision_check(node_revision: Any) -> dict[str, Any]:
+    """Compare a node-reported runtime digest with this process's own.
+
+    ``verdict`` is ``match`` when both sides run byte-identical runtime code,
+    ``differs`` when they do not, and ``unknown`` when the node reported no
+    digest at all (a node that predates the probe).  Only ``match`` means the
+    client and the node share one deployment form.
+    """
+    client = runtime_revision()
+    if isinstance(node_revision, str) and node_revision and node_revision != "unknown":
+        verdict = "match" if node_revision == client else "differs"
+        node = node_revision
+    else:
+        verdict = "unknown"
+        node = "unknown"
+    return {"node": node, "client": client, "verdict": verdict}
+
 
 def negotiate_mcp_protocol_version(
     requested: Any,
@@ -11360,6 +11414,7 @@ class BridgeNode:
         return {
             "ok": True,
             "side": self.side,
+            "runtimeRevision": runtime_revision(),
             "peer": "connected" if self.link_ready.is_set() else "unavailable",
             "activeStreams": len(self.streams),
             "sharedBackends": len(self.shared_backends),
@@ -11774,7 +11829,11 @@ def _control_tools() -> list[dict[str, Any]]:
         },
         {
             "name": "bridge_diagnostics",
-            "description": "Return a bounded metadata-only Bridge health and recent-error summary.",
+            "description": (
+                "Return a bounded metadata-only Bridge health and recent-error "
+                "summary, including the node's runtime revision and the "
+                "revisionCheck comparison with this client's own runtime."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
@@ -11864,6 +11923,15 @@ def _control_mcp_dispatch(
         value = local_control_query(local_host, local_port, request)
     except NodeUnavailableError as exc:
         value = _node_fault_value(local_host, local_port, exc)
+    if (
+        name == "bridge_diagnostics"
+        and isinstance(value, dict)
+        and value.get("ok") is True
+    ):
+        # The node reports its own runtime digest; this frontend adds the
+        # comparison with the code *it* is running, which is the only place the
+        # two halves of a client-to-node pairing can be compared at all.
+        value["revisionCheck"] = _revision_check(value.get("runtimeRevision"))
     return {
         "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, separators=(",", ":"))}],
         "structuredContent": value,
@@ -12759,6 +12827,7 @@ def deployment_diagnostics(
         "version": SERVER_VERSION,
         "bridgeProtocol": BRIDGE_PROTOCOL,
         "side": side,
+        "runtimeRevision": runtime_revision(),
         "checks": checks,
     }
 

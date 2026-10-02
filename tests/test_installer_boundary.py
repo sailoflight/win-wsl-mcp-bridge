@@ -3,7 +3,11 @@ from pathlib import Path
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
+
+from bridge_runtime import BridgeError
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -92,13 +96,52 @@ class InstallerBoundaryTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("--receipt", result.stdout)
 
-    def test_source_launcher_still_resolves_component_directory(self):
+    def test_source_launcher_prefers_the_installed_console_script(self):
+        # A host that owns an installation must project that artifact: the tree
+        # form would let a business client follow an edited working tree while
+        # the node keeps running the installed release (docs/DEPLOYMENT.md).
         from installer.projection import _default_launcher, _validate_launcher
-        for side in ("win", "wsl"):
-            command, args = _default_launcher(side)
-            self.assertEqual(command, sys.executable)
-            self.assertEqual(args, [str(ROOT / (side + "-bridge-mcp") / "bridge.py")])
-            _validate_launcher(side, command, args)
+        with tempfile.TemporaryDirectory(prefix="bridge-launcher-form-") as temporary:
+            data_home = Path(temporary) / "data"
+            local_app_data = Path(temporary) / "local"
+            installed = {
+                "wsl": data_home / "win-wsl-mcp-bridge" / "runtime" / "bin" / "win-wsl-mcp-wsl",
+                "win": local_app_data / "WinWslMcpBridge" / "runtime" / "Scripts" / "win-wsl-mcp-win.exe",
+            }
+            for script in installed.values():
+                script.parent.mkdir(parents=True, exist_ok=True)
+                script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            environment = {
+                "XDG_DATA_HOME": str(data_home),
+                "LOCALAPPDATA": str(local_app_data),
+            }
+            with mock.patch.dict(os.environ, environment):
+                for side, script in installed.items():
+                    with self.subTest(side=side):
+                        command, args = _default_launcher(side)
+                        self.assertEqual((command, args), (str(script), []))
+                        _validate_launcher(side, command, args)
+                        # the console form never carries python-style bridge args
+                        with self.assertRaisesRegex(BridgeError, "must not carry"):
+                            _validate_launcher(
+                                side, command,
+                                [str(ROOT / (side + "-bridge-mcp") / "bridge.py")],
+                            )
+
+    def test_source_launcher_without_an_installation_resolves_component_directory(self):
+        from installer.projection import _default_launcher, _validate_launcher
+        with tempfile.TemporaryDirectory(prefix="bridge-launcher-tree-") as temporary:
+            environment = {
+                "XDG_DATA_HOME": str(Path(temporary) / "data"),
+                "LOCALAPPDATA": str(Path(temporary) / "local"),
+            }
+            with mock.patch.dict(os.environ, environment):
+                for side in ("win", "wsl"):
+                    with self.subTest(side=side):
+                        command, args = _default_launcher(side)
+                        self.assertEqual(command, sys.executable)
+                        self.assertEqual(args, [str(ROOT / (side + "-bridge-mcp") / "bridge.py")])
+                        _validate_launcher(side, command, args)
 
 
 if __name__ == "__main__":

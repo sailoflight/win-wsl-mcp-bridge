@@ -32,7 +32,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -766,6 +770,121 @@ class LegacyDefaultRegressionTest(unittest.TestCase):
                 "impactOverride": False, "reason": "",
             },
         )
+
+
+class DeploymentRevisionSkewTest(unittest.TestCase):
+    """The revision check that makes a skewed deployment visible.
+
+    ``serverInfo.version`` is identical for an unreleased working tree and the
+    installed release, so a client pinned to the wrong artifact used to look
+    exactly like a healthy one.  The node reports its own runtime digest in
+    diagnostics and this frontend, which runs the client-side runtime, adds the
+    comparison (``docs/DEPLOYMENT.md``).
+    """
+
+    def setUp(self) -> None:
+        self.query = mock.patch("bridge_runtime.local_control_query")
+        self.mock_query = self.query.start()
+        self.addCleanup(self.query.stop)
+
+    def diagnostics(self, payload: dict) -> dict:
+        self.mock_query.return_value = payload
+        message = {
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "bridge_diagnostics", "arguments": {}},
+        }
+        response = br._control_mcp_dispatch(message, "127.0.0.1", 1)
+        self.assertNotIn("isError", response)
+        return response["structuredContent"]
+
+    def test_a_matching_node_reports_match(self) -> None:
+        value = self.diagnostics(
+            {"ok": True, "side": "wsl", "runtimeRevision": br.runtime_revision()}
+        )
+        self.assertEqual(value["runtimeRevision"], br.runtime_revision())
+        self.assertEqual(
+            value["revisionCheck"],
+            {"node": br.runtime_revision(), "client": br.runtime_revision(), "verdict": "match"},
+        )
+
+    def test_a_node_running_other_code_reports_differs(self) -> None:
+        value = self.diagnostics(
+            {"ok": True, "side": "wsl", "runtimeRevision": "0123456789ab"}
+        )
+        self.assertEqual(value["revisionCheck"]["node"], "0123456789ab")
+        self.assertEqual(value["revisionCheck"]["client"], br.runtime_revision())
+        self.assertEqual(value["revisionCheck"]["verdict"], "differs")
+
+    def test_a_node_without_a_digest_reports_unknown(self) -> None:
+        # A node that predates the probe cannot be compared, and that is exactly
+        # the case the check must not silently call healthy.
+        for reported in (None, "unknown", 7, ""):
+            with self.subTest(reported=reported):
+                payload = {"ok": True, "side": "wsl"}
+                if reported is not None:
+                    payload["runtimeRevision"] = reported
+                self.assertEqual(
+                    self.diagnostics(payload)["revisionCheck"]["verdict"], "unknown"
+                )
+
+    def test_only_diagnostics_carries_the_revision_check(self) -> None:
+        self.mock_query.return_value = {"ok": True, "preview": True}
+        message = {
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {"name": "bridge_control", "arguments": {"action": "status"}},
+        }
+        value = br._control_mcp_dispatch(message, "127.0.0.1", 1)["structuredContent"]
+        self.assertNotIn("revisionCheck", value)
+
+    def test_a_node_fault_is_not_dressed_up_as_a_revision_report(self) -> None:
+        fault = br.NodeUnavailableError("127.0.0.1:1 did not answer")
+        fault.__cause__ = ConnectionRefusedError(111, "Connection refused")
+        self.mock_query.side_effect = fault
+        message = {
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "bridge_diagnostics", "arguments": {}},
+        }
+        value = br._control_mcp_dispatch(message, "127.0.0.1", 1)["structuredContent"]
+        self.assertEqual(value["code"], "node_absent")
+        self.assertNotIn("revisionCheck", value)
+
+
+class RuntimeRevisionTest(unittest.TestCase):
+    """The digest is derived from the runtime code a process actually loaded."""
+
+    @staticmethod
+    def _revision_of(directory: Path) -> str:
+        result = subprocess.run(
+            [sys.executable, "-E", "-c",
+             "import bridge_runtime; print(bridge_runtime.runtime_revision())"],
+            cwd=directory,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": ""},
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode:
+            raise AssertionError(result.stderr[-1000:])
+        return result.stdout.strip()
+
+    def test_runtime_revision_is_a_stable_content_digest(self) -> None:
+        revision = br.runtime_revision()
+        self.assertRegex(revision, r"^[0-9a-f]{12}$")
+        self.assertEqual(br.runtime_revision(), revision)
+
+    def test_the_digest_covers_the_loaded_runtime_modules(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bridge-revision-") as temporary:
+            copies = {}
+            for name in ("pristine", "edited"):
+                target = Path(temporary) / name
+                target.mkdir()
+                for module in sorted(ROOT.glob("*.py")):
+                    shutil.copyfile(module, target / module.name)
+                copies[name] = target
+            marker = copies["edited"] / "bridge_protocol.py"
+            marker.write_text(
+                marker.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8"
+            )
+            self.assertEqual(self._revision_of(copies["pristine"]), br.runtime_revision())
+            self.assertNotEqual(self._revision_of(copies["edited"]), br.runtime_revision())
 
 
 class ModernCliFlagTest(unittest.TestCase):

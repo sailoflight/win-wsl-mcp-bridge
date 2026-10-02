@@ -66,12 +66,19 @@ def smoke_install(wheel: Path) -> dict[str, object]:
             installer_checks[side] = True
         probe = subprocess.run(
             [str(python), "-I", "-c",
-             "import pathlib; from installer import harness_verification as hv; "
-             "from installer.projection import _default_launcher; "
-             "assert _default_launcher('wsl') == ('win-wsl-mcp-wsl', []); "
-             "assert _default_launcher('win') == ('win-wsl-mcp-win', []); "
-             "assert 'site-packages' in pathlib.Path(hv.__file__).parts; "
-             "import subprocess, sys; "
+             "import pathlib\n"
+             "from installer import harness_verification as hv\n"
+             "from installer.projection import _default_launcher\n"
+             # The projected launcher is a deployment form: either the console
+             # script this host installed (absolute) or the bare console entry
+             # of an installation this module cannot see. It is never a working
+             # tree component and never carries python-style bridge args.
+             "for side, name in (('wsl', 'win-wsl-mcp-wsl'), ('win', 'win-wsl-mcp-win')):\n"
+             "    command, args = _default_launcher(side)\n"
+             "    assert args == [], (side, args)\n"
+             "    assert pathlib.Path(command).stem == name, (side, command)\n"
+             "assert 'site-packages' in pathlib.Path(hv.__file__).parts\n"
+             "import subprocess, sys\n"
              "raise SystemExit(subprocess.call([sys.executable, '-I', hv.__file__, '--help']))"],
             cwd=root, env=environment, capture_output=True, text=True, timeout=15,
         )
