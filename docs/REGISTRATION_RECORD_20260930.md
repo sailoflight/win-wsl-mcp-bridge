@@ -229,8 +229,8 @@ python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl --dry-run \
 2. **CadQ 的 `artifactDelivery` 仍关闭**：CadQ 的输出根固定且故意不可配置，v1 不做产物回传，调用方按它自己声明的 `output_dir` 取件（WSL 侧走 `/mnt/c/...` 直读）。这不是桥的产物保证。
 3. **失败转移缺陷**（§2 坑 3）未修。
 4. 换码后 **Windows 侧运行时目录名换过**：以后要再原地升级，请按 §2 坑 1 在最终目录里重装一次。
-5. **web overlay 的 cadq/meshq 仍是"手加、桥不知情"的**：接管已执行（§5.3），但那两条在 **web** 里被判为 conflict（`next_session` + `conflicts=['cadq','meshq']`），因此桥既认领也不改写它们。功能不受影响（两条照常可用），但 `unenroll --remove-entries` 不会清理它们，`projection status` 也不把它们记进账。dsh-tui 与 headless 没有这个问题。
-6. **`official-cli` 适配器下 stdio 条目永远无法反证**（`projection.py:2194-2217`）：`claude mcp get` 的 `Args:` 是空格拼接、env 是自由文本，解析器故意不猜，于是条目进 `unverifiable` → 每次 reconcile 报冲突、`ok` 恒为 False。**claude 环境已改走 `bridge-file` 绕开它**（§5.3），但缺陷本身仍在：任何再次以 `official-cli` 注册的 claude/codex stdio 环境都会复现。另：`_cli_list_entry_names` 曾把 `claude mcp list` 的 "Checking MCP server health…" 首行当成条目名，**已修**（见本节上文）。
+5. **web overlay 的 cadq/meshq 仍是"手加、桥不知情"的**：接管已执行（§5.3），但那两条在 **web** 里被判为 conflict（`next_session` + `conflicts=['cadq','meshq']`），因此桥既认领也不改写它们。功能不受影响（两条照常可用），但 `unenroll --remove-entries` 不会清理它们，`projection status` 也不把它们记进账。dsh-tui 与 headless 没有这个问题。**→ 已关闭（2026-10-02，0.4.2 `017f988`）**：web 重新注册后 20 行 `agent_mcp_projections` 全部 `configured` 且指纹非空，cadq/meshq 已入账，并随整份 overlay 在部署形态下重写（见 §8）。
+6. **`official-cli` 适配器下 stdio 条目永远无法反证**（`projection.py:2194-2217`）：`claude mcp get` 的 `Args:` 是空格拼接、env 是自由文本，解析器故意不猜，于是条目进 `unverifiable` → 每次 reconcile 报冲突、`ok` 恒为 False。**claude 环境已改走 `bridge-file` 绕开它**（§5.3），但缺陷本身仍在：任何再次以 `official-cli` 注册的 claude/codex stdio 环境都会复现。**→ 已关闭（2026-10-02，0.4.2 `017f988`）**：真实 `claude mcp get` 的 stdio 人读块现在会被解析，所有权落在桥自己的 env 标记 + 落盘指纹上（没改过 = `configured`，用户改过 = `drift` 且不覆盖）；测试替身也改成真实 CLI 的打印形态，见 §8.4。claude 环境已按部署形态重新注册并**回到 `official-cli`**。另：`_cli_list_entry_names` 曾把 `claude mcp list` 的 "Checking MCP server health…" 首行当成条目名，**已修**（见本节上文）。
 
 **回滚**
 
@@ -245,3 +245,87 @@ python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl --dry-run \
 ## §7 提交
 
 见本仓库同一提交。MeshQ 侧的动作（发文件、建 `.venv`、装 Blender、`--doctor`、MCP 验收）仍是人工/需批准，不在此记录范围内。
+
+## §8 0.4.2：投影启动器改成部署形态，并关闭缺口 5/6（2026-10-02）
+
+### §8.1 为什么改
+
+此前 5 个环境记的启动器是**开发树形态**（`<runtime>/bin/python` + `<repo>/wsl-bridge-mcp/bridge.py`），
+节点跑的却是安装版，而 `SERVER_VERSION` 分不出来（两边答同一个版本串）。0.4.1 起：
+
+- `projection enroll` 的默认启动器按**部署顺序**解析：本机安装的 console script 绝对路径 → 只有本机没有安装时才退回仓库组件 → 最后才退裸 console 名；
+- `_validate_launcher` 接受 console 形态（绝对路径、不带 bridge 参数），仍拒绝不是本侧 bridge 的东西；
+- `bridge_diagnostics` 报节点的 `runtimeRevision`（节点实际加载的顶层运行时模块的 12 位摘要），控制前端加 `revisionCheck`（`match` / `differs` / `unknown`）；`doctor` 两侧各报一份。这是**代码同一性**，不是位置保证，所以启动器要钉死而不是只监控。
+
+### §8.2 重指（re-pin）的正确配方——这里踩过坑
+
+```
+projection unenroll <env> --remove-entries --confirm
+projection scan --side wsl                       # 文档变了，候选要重扫
+projection enroll <candidate> --side wsl --projection <proj> --confirm
+projection reconcile --side wsl --projection <proj>
+```
+
+**必须 `--remove-entries`，不能 `--keep-entries`。** `--keep-entries` 会留下旧条目，而 `unenroll`
+把记录这些条目的 `agent_mcp_projections` 行一起删了；下一次 reconcile 看得到"名字被占、账上没有"，
+判成 **unmanaged name collision / drift**，于是既不改写也不收敛（`ok: false`）。首次执行时
+claude、codex 就是这样卡住的（且 claude 当时还被重解析成 `official-cli`，见 §8.3）——
+后来用 `backups/20261002T120851Z-pre-0.4.1/projection.sqlite3` 还原后按正确配方重做。
+
+**例外**：整份文档由桥生成的环境（DSH overlay、codex 自有文档）可以用 `--keep-entries`——
+reconcile 会整份重写，不会留下孤儿条目。web 就是这种情况，而且它带着缺口 5 的历史 drift，
+`--remove-entries` 被安全护栏挡下（`unenrollment removal hit drift for … (cadq, meshq)`）。
+选择公式：适配器 `bridge-file` 且整份文档归桥 → `--keep-entries` 可用；共享文档（claude JSON）或 `official-cli` → 必须 `--remove-entries`。
+
+### §8.3 适配器会在重新注册时被静默重解析（本次事故的触发点）
+
+`enroll` 每次都重算 `apply_adapter`，而 `_claude_cli_available()` 就是 `shutil.which("claude")`。
+§5.3 当初把 claude 指到 `bridge-file` 是为了绕开缺口 6，但那个选择没有被记录下来；本次重指在带
+`~/.local/bin` 的交互 shell 里执行，claude 就被重解析成 `official-cli`，缺口 6 立刻复现。
+**缺口 6 已随 0.4.2 修掉**，所以 `official-cli` 现在可用；但"适配器取决于注册时的 PATH"仍是设计现状，
+是否要让 Operator 显式钉死适配器，值得单独决定。
+
+### §8.4 0.4.2 修了什么（缺口 6 关闭）
+
+真实 `claude mcp get` 没有结构化输出：stdio 条目是一段人读文本（`Type:`、`Command:`、
+空格拼接的 `Args:`、每行一个 `KEY=VALUE` 的 `Environment:`）。旧解析器只认夹具的 JSON 和 http 文本块，
+于是**自己刚写的 stdio 条目读不回来**：名字进 `unverifiable` → 每次 reconcile 报冲突 →
+环境永不收敛，且 `unenroll --remove-entries` 与"对端下线"都碰不到它。现在 stdio 块会被解析，
+所有权落在桥自己的 env 标记 + 落盘指纹上：没改过 = `configured`，用户改过 = `drift`（不覆盖）。
+`Args:` 是空格拼接，两个渲染相同的 argv 在这里不可区分，落盘指纹比较负责不让这种歧义覆盖任何东西。
+
+测试替身同时改成"真实 CLI 打印什么就打印什么"（`claude mcp list` 的 health-check 前导行 + `name: <command…>`；
+`mcp get` 的人读块）。旧替身对 claude 答 JSON——一个它根本产生不了的格式，这正是缺口漏测的原因。
+
+### §8.5 状态（2026-10-02 部署窗口内完成）
+
+| 环境 | 适配器 | launcherCommand | launcherArgs | 曝光 |
+|---|---|---|---|---|
+| claude `env-0d779bc4…` | official-cli | `<runtime>/bin/win-wsl-mcp-wsl` | `[]` | native |
+| codex `env-8614afcb…` | official-cli | 同上 | `[]` | native |
+| dsh-tui `env-5d21ee51…` | bridge-file | 同上 | `[]` | auto → native |
+| dsh-headless `env-83601c2d…` | bridge-file | 同上 | `[]` | auto → native |
+| dsh-web `env-3bc9d44a…` | bridge-file | 同上 | `[]` | auto → native |
+
+- 客户端文档里 20 条条目一律 `<runtime>/bin/win-wsl-mcp-wsl connect|connect-http|compatibility-mcp|deferred-mcp <id>`；
+- `reconcile --dry-run`：5 个环境全 `configured` / `next_session`、动作 0 条、`ok: true`；
+- 20 行 `agent_mcp_projections` 全部 `configured` 且指纹非空 → **缺口 5 关闭**；
+- 两侧 `doctor`：`ok: true`、`version 0.4.2`、`runtimeRevision 0170f156361c`（两侧逐字节同一份运行时）。
+
+**身份**：0.4.2 wheel sha256 `9e1bb3f26c4ad42a3ffdddd421c0270d81cf6532848d447c3d80ea931b6fa936`，
+两侧各一份 `releases/0.4.2-017f988/`（含 `SHA256SUMS`）；0.4.1 留在 `releases/0.4.1-ec65715/`；
+0.4.0 还原点见 §6 回滚（`backups/20261002T120851Z-pre-0.4.1/`）。
+
+### §8.6 尚未完成的人工步骤
+
+1. **重启 DSH profile（必需）**：三个节点的内存里还是旧码——现在 `bridge_diagnostics` 还没有
+   `revisionCheck` 字段就是证据。重启后应出现 `runtimeRevision 0170f156361c` 与
+   `revisionCheck.verdict: "match"`。重启必须排在重指之后（现在已满足）。
+2. **（可选）恢复 DSH 的 deferred 曝光**：重新注册会换掉环境行，而客户端验证证据绑定环境行，
+   所以三个 DSH profile 的 `tool_exposure` 从 `auto` 落回 `native`（tui 原先借 family 证据是 `deferred`，
+   web 自己的证据早已 stale）。不恢复也能用，只是模型侧看到完整目录。要恢复就在**一个** profile（如 web）
+   跑一次探针，另两个会自动 adopt family 证据：
+   `projection probe-client <env> --probe-file <path> --aspect refresh --confirm` →
+   在隔离会话里按打印的 fixture 命令跑 → `projection record-client-verification <env> --receipt <path> --tool-exposure deferred --aspect refresh`。
+   挑战 15 分钟过期（`PROBE_TTL_SECONDS`），会话开始前再生成。
+
