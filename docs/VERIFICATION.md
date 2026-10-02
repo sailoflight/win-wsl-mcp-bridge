@@ -50,13 +50,25 @@ with a recorded intermittent failure, and run the full suite before a release:
 the whole suite still runs in CI, non-blockingly, so a regression stays visible.
 
 Windows CI is not a gate yet: every recorded cause is fixed, and the leg stays
-non-blocking only until one run confirms it. The run that fixed the last four
-failures went from `failures=4` to `failures=1` on the same leg, and the one
-left was `tests.test_modern_http_adapter.ModernAdapterTests.test_shutdown_interrupts_tls_handshake_before_response_exists`,
+non-blocking only until one run confirms it. The failure count on that leg went
+from 4 (`873e67a`, one environment difference) to 1 (`89876a6`) to 3
+(`b6ae38e`); each round removed a cause and exposed the next test whose verdict
+depended on wall-clock room. The single failure was
+`tests.test_modern_http_adapter.ModernAdapterTests.test_shutdown_interrupts_tls_handshake_before_response_exists`,
 which tripped `started.wait(2)` on a runner where the whole suite took 363 s
 against 163 s here — the same code passed the previous Windows run, so its
 scene-setting waits (loopback accept, TLS ClientHello, connect timeout) are now
-generous while the behavioural assertions stay at 0.7 s and 10 s. The oldest
+generous while the behavioural assertions stay at 0.7 s and 10 s. The three were
+`ModernFacadeTests` members answering `504` (`'application/json'`) where a
+healthy backend and an SSE stream were expected: `start_server` passed
+`request_timeout_s=3`, and the facade compares that bound against a cold `python`
+spawn of the fixture backend, which on that runner does not reliably fit in 3 s.
+That class now derives every deadline from `HEALTHY_EXCHANGE_TIMEOUT_S` (12 s,
+which a healthy exchange never reaches), `COLD_SPAWN_GRACE_TIMEOUT_S` (4 s, for
+the members that assert the deadline itself) and `CLIENT_WAIT_S` (the largest
+server bound plus 3 s, so a slowed exchange cannot fail as a client read timeout
+instead); the two members that were listed load-sensitive for this reason are
+listed no longer and run in the deterministic leg. The oldest
 test-side causes were
 `PermissionError [WinError 32]` while a temporary directory holding
 `registry.sqlite3`, `events.sqlite`, or `win.sqlite` was removed, `OSError

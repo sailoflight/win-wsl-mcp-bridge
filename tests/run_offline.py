@@ -19,15 +19,15 @@ import sys
 import unittest
 
 #: Tests whose verdict depends on how much else is running. Evidence for each
-#: entry is a recorded intermittent failure, not a guess.
+#: entry is a recorded intermittent failure, not a guess. Two
+#: `ModernFacadeTests` members left this list once their deadline stopped
+#: doubling as a cold-spawn budget (see the constants in
+#: tests/test_modern_http_facade.py): the recorded failures were about spawn
+#: latency, never about the protocol behaviour those members assert.
 LOAD_SENSITIVE: frozenset[str] = frozenset(
     {
-        # Bounded handler deadlines: a saturated runner trips the deadline
-        # before the exchange it is testing completes.
-        "tests.test_modern_http_facade.ModernFacadeTests"
-        ".test_bounded_request_response_and_http_worker_lifecycle",
-        "tests.test_modern_http_facade.ModernFacadeTests"
-        ".test_dispatched_extension_and_sse_deadline_report_uncertain_outcome",
+        # Concurrent recovery: a saturated runner loses more sessions before
+        # recovery settles, so "exactly once" is measured against a moving set.
         "tests.test_streamable_http_stdio.ConcurrentSessionLossTest"
         ".test_concurrent_404_recovery_is_exactly_once_and_never_deadlocks",
         # Spawn / initialize counting and connector liveness under thread load.

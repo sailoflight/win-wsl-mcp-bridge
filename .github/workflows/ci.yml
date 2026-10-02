@@ -5,20 +5,22 @@ name: verify
 # without making every push red:
 #
 #   * `load-sensitive` — tests whose verdict depends on how much else is
-#     running (bounded handler deadlines, a concurrent 404 recovery, spawn /
-#     initialize counting, connector liveness under thread load). They pass on
-#     an idle host and flake on a saturated 2-core runner. The blocking `test`
-#     job skips exactly the named set (`tests/run_offline.py --deterministic-only`);
-#     this job runs the whole suite so a real regression is still visible.
+#     running (a concurrent 404 recovery, spawn / initialize counting, connector
+#     liveness under thread load). They pass on an idle host and flake on a
+#     saturated 2-core runner. The blocking `test` job skips exactly the named set
+#     (`tests/run_offline.py --deterministic-only`); this job runs the whole suite
+#     so a real regression is still visible.
 #   * `windows` — the Windows leg never passed. Every recorded cause is now
 #     fixed: an unclosed `sqlite3` handle blocking temporary-directory removal
 #     with `WinError 32`, two loopback socket errors on closed or unconnected
 #     sockets, a fixture cleanup deadline, a bridge candidate check that rejected
 #     the runner's own `%USERPROFILE%\.claude.json`, fixture temporary roots
 #     that were not their own `resolve()` because the runner sets `TEMP` to an
-#     8.3 short name, and one scene-setting timeout in a TLS-handshake test that
-#     the same code passed on the previous run. It stays non-blocking until one
-#     run confirms that, then it becomes a hard gate.
+#     8.3 short name, one scene-setting timeout in a TLS-handshake test that the
+#     same code passed on the previous run, and facade deadlines that doubled as
+#     a cold-spawn budget (now named constants in `tests/test_modern_http_facade.py`).
+#     It stays non-blocking until one run confirms that, then it becomes a hard
+#     gate.
 
 on:
   push:

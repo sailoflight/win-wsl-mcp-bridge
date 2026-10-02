@@ -141,6 +141,25 @@ def header_value(value):
 
 
 class ModernFacadeTests(unittest.TestCase):
+    #: Deadline for a member that needs a *healthy* registered backend to
+    #: answer. The facade compares this deadline against a cold spawn of the
+    #: fixture backend, and the Windows CI runner is about 2.2x slower than a
+    #: developer host, so a deadline sized for the exchange also sized the
+    #: verdict: run `b6ae38e` recorded `504 != 200`,
+    #: `504 not in (200, 502)` and `'application/json' != 'text/event-stream'`
+    #: because a fixture spawn did not fit inside it. A healthy exchange never
+    #: reaches twelve seconds; this only stops machine load from deciding.
+    HEALTHY_EXCHANGE_TIMEOUT_S = 12
+    #: Deadline for a member that *asserts the deadline itself* (an uncertain
+    #: outcome, or an SSE error at expiry). It must still outlast a cold backend
+    #: spawn, so it is 4 s rather than the sub-second value a developer host
+    #: gets away with.
+    COLD_SPAWN_GRACE_TIMEOUT_S = 4
+    #: A client must outlive the server's own bound, otherwise a load-slowed
+    #: exchange fails as a client read timeout instead of reaching the outcome
+    #: under test (the default server bound is the largest of the above).
+    CLIENT_WAIT_S = HEALTHY_EXCHANGE_TIMEOUT_S + 3
+
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
@@ -208,7 +227,8 @@ class ModernFacadeTests(unittest.TestCase):
 
     def start_server(self, **changes):
         options = dict(side="wsl", target="modern-fixture", node_port=self.wsl_port,
-                       protocol_era="modern", request_timeout_s=3, sse_heartbeat_s=.05)
+                       protocol_era="modern", request_timeout_s=self.HEALTHY_EXCHANGE_TIMEOUT_S,
+                       sse_heartbeat_s=.05)
         options.update(changes)
         server = facade.ModernFacadeServer(facade.FacadeOptions(**options))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -250,7 +270,7 @@ class ModernFacadeTests(unittest.TestCase):
 
     def post(self, message, *, headers=None, server=None):
         server = server or self.server
-        connection = http.client.HTTPConnection(*server.server_address[:2], timeout=7)
+        connection = http.client.HTTPConnection(*server.server_address[:2], timeout=self.CLIENT_WAIT_S)
         try:
             connection.request("POST", "/mcp", body=json.dumps(message).encode(), headers=self.headers(message) if headers is None else headers)
             response = connection.getresponse()
@@ -366,7 +386,7 @@ class ModernFacadeTests(unittest.TestCase):
 
     def test_sse_progress_disconnect_cancels_and_reaps_only_owned_proxy(self):
         message = request("tools/call", 71, name="slow", meta={"progressToken":"request-token"})
-        connection = http.client.HTTPConnection(*self.server.server_address[:2], timeout=4)
+        connection = http.client.HTTPConnection(*self.server.server_address[:2], timeout=self.CLIENT_WAIT_S)
         connection.request("POST", "/mcp", body=json.dumps(message).encode(), headers=self.headers(message))
         response = connection.getresponse()
         self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
@@ -385,12 +405,18 @@ class ModernFacadeTests(unittest.TestCase):
         self.assertEqual(self.post(request(rid=72))[0], 200)
 
     def test_timeout_and_crash_have_uncertainty_no_replay_and_proxy_cleanup(self):
-        server = self.start_server(request_timeout_s=.7)
+        # The crash business exits right after executing, so the deadline only
+        # has to outlast its cold spawn; `.7` did not on the CI runner and the
+        # exchange became a 504 instead of the crash uncertainty under test.
+        server = self.start_server(request_timeout_s=self.COLD_SPAWN_GRACE_TIMEOUT_S)
         # No progress token: synthetic slow emits unrelated progress, so use
         # a known business that exits after execution for transport uncertainty.
         status, _, body = self.post(request("tools/call", 80, name="crash"), server=server)
         self.assertIn(status, (200, 502), body)
         self.assertTrue(body["error"]["data"]["outcomeUnknown"])
+        # Deliberately tight: `blocked` stalls before the backend request is
+        # dispatched, and this member asserts that no dispatch happened, which
+        # only a deadline that expires first guarantees.
         blocked = self.start_server(target="blocked", request_timeout_s=.5)
         status, _, body = self.post(request("tools/call", 81, name="echo"), server=blocked)
         self.assertEqual(status, 504)
@@ -422,7 +448,11 @@ class ModernFacadeTests(unittest.TestCase):
         status, _, body = self.post(request("tools/call", 31, name="big"), server=server)
         self.assertEqual(status, 502)
         self.assertTrue(body["error"]["data"]["outcomeUnknown"])
-        limited = self.start_server(max_inflight=1, request_timeout_s=.4)
+        # The 503 below is capacity-driven (`max_inflight` admits one connection
+        # with `acquire(blocking=False)`), so a generous deadline keeps it while
+        # the trailing 200 again needs a cold spawn to fit; `.4` only bounded
+        # the idle-connection timer.
+        limited = self.start_server(max_inflight=1, request_timeout_s=self.HEALTHY_EXCHANGE_TIMEOUT_S)
         slow_header = socket.create_connection(limited.server_address[:2])
         self.wait_until(lambda: len(limited.connections) == 1)
         self.assertEqual(self.post(request(), server=limited)[0], 503)
@@ -475,12 +505,14 @@ class ModernFacadeTests(unittest.TestCase):
         self.assertFalse(any(e["event"] == "recv" and e["message"].get("method") == "tools/call" for e in self.events()))
 
     def test_dispatched_extension_and_sse_deadline_report_uncertain_outcome(self):
-        server = self.start_server(request_timeout_s=.7)
+        # Doubly deadline-asserting: `fixture/extension-hang` never answers, and
+        # the `slow` business must still spawn and emit progress before expiry.
+        server = self.start_server(request_timeout_s=self.COLD_SPAWN_GRACE_TIMEOUT_S)
         status, _, body = self.post(request("fixture/extension-hang", 111), server=server)
         self.assertEqual(status, 504)
         self.assertTrue(body["error"]["data"]["outcomeUnknown"])
         message = request("tools/call", 112, name="slow", meta={"progressToken":"t"})
-        connection = http.client.HTTPConnection(*server.server_address[:2], timeout=3)
+        connection = http.client.HTTPConnection(*server.server_address[:2], timeout=self.CLIENT_WAIT_S)
         connection.request("POST", "/mcp", body=json.dumps(message).encode(), headers=self.headers(message))
         response = connection.getresponse()
         self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
@@ -495,7 +527,7 @@ class ModernFacadeTests(unittest.TestCase):
         process = subprocess.Popen([
             sys.executable, str(ROOT / "stdio_http_facade.py"), "--protocol-era", "modern",
             "--side", "wsl", "--target", "modern-fixture", "--node-port", str(self.wsl_port),
-            "--listen-port", str(port), "--request-timeout-s", "3"], cwd=ROOT,
+            "--listen-port", str(port), "--request-timeout-s", str(self.HEALTHY_EXCHANGE_TIMEOUT_S)], cwd=ROOT,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE":"1"}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         connection = None
         response = None
@@ -510,7 +542,7 @@ class ModernFacadeTests(unittest.TestCase):
             message = request("tools/call", 121, name="slow", meta={"progressToken":"cli-token"})
             headers = self.headers(message)
             headers["Authorization"] = SECRET
-            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=self.CLIENT_WAIT_S)
             connection.request("POST", "/mcp", body=json.dumps(message).encode(), headers=headers)
             response = connection.getresponse()
             self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
