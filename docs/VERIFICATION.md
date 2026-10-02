@@ -380,10 +380,10 @@ dependencies. The root layout guard permits generated build output directories.
 ```bash
 PYTHONDONTWRITEBYTECODE=1 .venv-build/bin/python -m build --no-isolation --outdir release-artifacts
 PYTHONDONTWRITEBYTECODE=1 python3 -m tests.verify_distribution --root . \
-  --wheel release-artifacts/win_wsl_mcp_bridge-0.4.0-py3-none-any.whl \
-  --sdist release-artifacts/win_wsl_mcp_bridge-0.4.0.tar.gz
+  --wheel release-artifacts/win_wsl_mcp_bridge-0.4.1-py3-none-any.whl \
+  --sdist release-artifacts/win_wsl_mcp_bridge-0.4.1.tar.gz
 PYTHONDONTWRITEBYTECODE=1 python3 -m tests.smoke_install \
-  release-artifacts/win_wsl_mcp_bridge-0.4.0-py3-none-any.whl
+  release-artifacts/win_wsl_mcp_bridge-0.4.1-py3-none-any.whl
 ```
 
 `build` first creates the sdist, then builds the wheel from it. The verifier derives

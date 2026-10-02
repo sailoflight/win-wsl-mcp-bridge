@@ -2,6 +2,51 @@
 
 All notable changes to this project are recorded here.
 
+## 0.4.1 - Unreleased
+
+The 0.4.0 section below is the feature set deployed on 2026-09-29 (the installed
+wheel still answers `0.4.0`); everything in this section is what the next
+installation adds.
+
+### Deployment form: a pinned launcher, and a runtime revision probe
+
+- `projection enroll` resolves its default launcher in deployment order: this
+  host's installed console script as an absolute path, then the working-tree
+  component only on a host that owns no installation, then the bare console
+  name for an installation the installer cannot see. Previously the tree
+  component won whenever it existed, so every enrolled client on a development
+  host launched a *mutable* working tree while the nodes ran the installed
+  release — and `SERVER_VERSION` cannot tell those apart. `_validate_launcher`
+  accepts the console form (absolute, no bridge arguments) and still refuses
+  anything that is not this side's bridge. A recorded launcher is never rewritten
+  silently; re-pinning is an explicit `unenroll --keep-entries` plus `enroll`,
+  documented in `docs/DEPLOYMENT.md`.
+- `bridge_diagnostics` reports the node's `runtimeRevision`, a 12-hex digest of
+  every top-level runtime module the node loaded, and the control frontend adds
+  `revisionCheck` (`match` / `differs` / `unknown`) against the code it is
+  running itself; `doctor` reports the same digest per host. This is a code
+  identity rather than a location guarantee, which is why the launcher is pinned
+  rather than merely monitored.
+- An unreachable local node is a diagnostic tool error instead of a bare
+  `-32603`: `node_absent` when nothing listens on the endpoint, `node_unreachable`
+  when something accepts and then goes silent, each naming the endpoint
+  (`docs/INCIDENT_HALF_DEAD_STACK_20261002.md`).
+- A facade capacity refusal is delivered rather than resetting the client: the
+  refusal drains the refused request within a bounded window before closing, so
+  a Windows peer no longer aborts its own send with `WinError 10053` and loses
+  the structured error.
+- The official-CLI list adapters ask codex for `mcp list --json` and parse the
+  text form per client, so a CLI table header (`Name`, `Checking`) is never read
+  back as a server name.
+
+### Verification: the Windows leg is a blocking gate
+
+- The Windows matrix leg is blocking again, and passes: the recorded causes were
+  the connections that outlived their `with` block, a facade deadline doubling as
+  a cold-spawn budget, and the capacity-refusal reset above. `load-sensitive`
+  stays non-blocking by design; the whole suite is 661 tests locally and 661 on
+  Windows with 14 platform skips.
+
 ## 0.4.0 - Unreleased
 
 ### Verification: a deterministic CI gate, and connections that close
@@ -14,12 +59,12 @@ All notable changes to this project are recorded here.
   and flake on a saturated two-core runner, which had made every push red. The
   whole suite still runs in a non-blocking job, so a real regression stays
   visible.
-- The Windows matrix leg is non-blocking until its recorded causes are resolved:
-  `WinError 32` while a temporary directory holding a registry or journal
-  database is removed, `WinError 10038` and `WinError 10022` on closed or
-  unconnected loopback sockets, a bounded fixture-cleanup deadline, and a
-  candidate check that rejects a pre-existing unrelated `%USERPROFILE%\.claude.json`
-  on the runner.
+- The Windows matrix leg recorded these causes while it was non-blocking, and the
+  0.4.1 section above records the fixes: `WinError 32` while a temporary
+  directory holding a registry or journal database is removed, `WinError 10038`
+  and `WinError 10022` on closed or unconnected loopback sockets, a bounded
+  fixture-cleanup deadline, and a candidate check that rejects a pre-existing
+  unrelated `%USERPROFILE%\.claude.json` on the runner.
 - Connections close when their `with` block ends. `with sqlite3.connect(...) as
   connection` is a *transaction* context manager, not a closing one: it commits
   or rolls back and leaves the handle open until a collection pass, which on

@@ -48,6 +48,7 @@ from bridge_runtime import (
     ArtifactReceiveState,
     ArtifactTransferWaiter,
     Registry,
+    SERVER_VERSION,
     SharedBackend,
     StreamState,
     _is_loopback,
@@ -2140,7 +2141,7 @@ class RegistryTest(unittest.TestCase):
                 timeout=20,
                 check=True,
             )
-            self.assertIn("0.4.0", process.stdout)
+            self.assertIn(SERVER_VERSION, process.stdout)
         direct = subprocess.run(
             [sys.executable, str(ROOT / "bridge_runtime.py")],
             text=True,
@@ -10841,7 +10842,7 @@ class FakeNodeServer:
     def __init__(
         self,
         *,
-        core_version: str = "0.4.0",
+        core_version: str = CORE_VERSION,
         instructions: str = "Fake downstream instructions.",
         exit_after_call: bool = False,
         exit_before_response: bool = False,
@@ -11162,19 +11163,19 @@ class ConnectorEngineUnitTest(unittest.TestCase):
     """The JSON-RPC-aware recovery lives in the dynamic engine (pure logic)."""
 
     def test_staleness_is_simple_direct_version_equality(self) -> None:
-        self.assertFalse(make_recovery("0.4.0").stale())  # exact match
+        self.assertFalse(make_recovery(CORE_VERSION).stale())  # exact match
         self.assertTrue(make_recovery("0.3.9").stale())   # any difference is stale
-        self.assertTrue(make_recovery("0.4.1").stale())   # newer also differs
+        self.assertTrue(make_recovery("9.9.9").stale())   # newer also differs
         self.assertFalse(make_recovery(None).stale())
         self.assertFalse(make_recovery("").stale())
         recovery = make_recovery("0.3.9")
-        self.assertIn("expects node core 0.4.0", recovery.warning_line())
+        self.assertIn(f"expects node core {CORE_VERSION}", recovery.warning_line())
         self.assertIn("node reports 0.3.9", recovery.warning_line())
         self.assertIn("core mismatch", recovery.failed_message("bridge: x"))
-        self.assertEqual(make_recovery("0.4.0").failed_message("bridge: x"), "bridge: x")
+        self.assertEqual(make_recovery(CORE_VERSION).failed_message("bridge: x"), "bridge: x")
 
     def test_agent_lines_are_classified_and_handshake_cached(self) -> None:
-        recovery = make_recovery("0.4.0")
+        recovery = make_recovery(CORE_VERSION)
         initialize = _init_request(1)
         initialized = (
             b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
@@ -11196,7 +11197,7 @@ class ConnectorEngineUnitTest(unittest.TestCase):
         self.assertEqual(recovery.cached_initialized(), initialized)
 
     def test_replay_absorb_swallows_only_the_replayed_initialize_result(self) -> None:
-        recovery = make_recovery("0.4.0")
+        recovery = make_recovery(CORE_VERSION)
         recovery.handle_agent(_init_request(1))
         recovered_init = recovery.cached_initialize()
         assert recovered_init is not None
@@ -11210,7 +11211,7 @@ class ConnectorEngineUnitTest(unittest.TestCase):
         )
 
     def test_init_annotation_and_optional_tool_note_only_when_stale(self) -> None:
-        clean = make_recovery("0.4.0")
+        clean = make_recovery(CORE_VERSION)
         clean.handle_agent(_init_request(1))
         forwarded = clean.handle_node(_init_result(1, "DOWNSTREAM"), absorbing=False)
         self.assertNotIn(b"expects node core", forwarded.payload)
@@ -11218,7 +11219,7 @@ class ConnectorEngineUnitTest(unittest.TestCase):
         stale.handle_agent(_init_request(1))
         forwarded = stale.handle_node(_init_result(1, "DOWNSTREAM"), absorbing=False)
         self.assertIn(b"DOWNSTREAM", forwarded.payload)
-        self.assertIn(b"expects node core 0.4.0", forwarded.payload)
+        self.assertIn(f"expects node core {CORE_VERSION}".encode(), forwarded.payload)
         # Default policy: no tool-result note even when stale.
         stale.remember_sent(2, "tools/call", current=True)
         result = stale.handle_node(_call_result(2), absorbing=False)
@@ -11259,7 +11260,7 @@ class ConnectorEngineUnitTest(unittest.TestCase):
         # Exactly once: repeating the same ids yields nothing.
         self.assertEqual(recovery.fail_once(lost, recovery.LOST_REASON), [])
         # Responses for remembered ids consume bookkeeping and never error.
-        clean = make_recovery("0.4.0")
+        clean = make_recovery(CORE_VERSION)
         clean.remember_sent(1, "tools/call", current=True)
         payload = clean.handle_node(_call_result(1), absorbing=False)
         self.assertIsNotNone(payload.payload)
@@ -11282,7 +11283,7 @@ class ConnectorEngineUnitTest(unittest.TestCase):
         self.assertEqual(engine.ENGINE_VERSION, ENGINE_VERSION)
         self.assertEqual(engine.Recovery.CORE_VERSION, CORE_VERSION)
         self.assertFalse(engine.Recovery.NOTE_RESULTS_WHEN_STALE)
-        self.assertFalse(engine.make_recovery("0.4.0").stale())
+        self.assertFalse(engine.make_recovery(CORE_VERSION).stale())
         self.assertTrue(engine.make_recovery("0.3.9").stale())
 
     def test_engine_override_is_dynamically_loaded_by_version(self) -> None:
@@ -11324,7 +11325,7 @@ class ConnectorEngineUnitTest(unittest.TestCase):
                         "ENGINE_NAME = 'test-engine'",
                         "ENGINE_VERSION = '1.0.0'",
                         "class Recovery(_base.Recovery):",
-                        "    CORE_VERSION = '0.4.0'",
+                        "    CORE_VERSION = '9.9.9'",
                     ]
                 )
                 + "\n",
@@ -11443,7 +11444,7 @@ class PersistentConnectorStdioTest(unittest.TestCase):
                 process.kill()
 
     def test_handshake_carries_connector_version_and_core_version(self) -> None:
-        node = FakeNodeServer(core_version="0.4.0")
+        node = FakeNodeServer(core_version=CORE_VERSION)
         process: subprocess.Popen | None = None
         try:
             process, reader = self._start(node)
@@ -11627,7 +11628,7 @@ class PersistentConnectorStdioTest(unittest.TestCase):
                 "result"
             ]["instructions"]
             self.assertTrue(instructions.startswith("DOWNSTREAM INSTRUCTION."))
-            self.assertIn("expects node core 0.4.0", instructions)
+            self.assertIn(f"expects node core {CORE_VERSION}", instructions)
             self.assertIn("node reports 0.3.9", instructions)
             error = [item for item in responses if item.get("id") == 3][0]["error"]
             self.assertIn("core mismatch", error["message"])
@@ -11643,7 +11644,7 @@ class PersistentConnectorStdioTest(unittest.TestCase):
                 process.kill()
 
     def test_no_stale_annotation_when_core_is_current(self) -> None:
-        node = FakeNodeServer(core_version="0.4.0", instructions="CLEAN INST.")
+        node = FakeNodeServer(core_version=CORE_VERSION, instructions="CLEAN INST.")
         process: subprocess.Popen | None = None
         try:
             process, reader = self._start(node)

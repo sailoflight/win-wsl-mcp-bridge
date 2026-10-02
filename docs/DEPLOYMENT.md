@@ -7,8 +7,11 @@ are trusted. Every bridge listener and client must resolve only to loopback. Do
 not expose the bridge through a LAN bind, port proxy, container publish rule, or
 public tunnel.
 
-Both hosts must run the same bridge protocol release. Version 0.4.0 uses
-`win-wsl-mcp-bridge/0.2` and intentionally rejects older peers.
+Both hosts must run the same bridge protocol release. Version 0.4.1 uses
+`win-wsl-mcp-bridge/0.2` and intentionally rejects older peers. The package
+version is not a compatibility check between halves; `bridge_diagnostics`
+reports the runtime revision each side actually loaded, because a working tree
+and an installed release both answer with this version string.
 
 ## Build once
 
