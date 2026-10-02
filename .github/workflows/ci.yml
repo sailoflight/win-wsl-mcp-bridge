@@ -1,8 +1,8 @@
 name: verify
 
 # The blocking gate is `test` plus `package`. Two further jobs run the checks
-# that are currently not trustworthy as a gate, non-blockingly, so the signal
-# is kept without making every push red:
+# that are not yet trustworthy as a gate, non-blockingly, so the signal is kept
+# without making every push red:
 #
 #   * `load-sensitive` — tests whose verdict depends on how much else is
 #     running (bounded handler deadlines, a concurrent 404 recovery, spawn /
@@ -10,14 +10,14 @@ name: verify
 #     an idle host and flake on a saturated 2-core runner. The blocking `test`
 #     job skips exactly the named set (`tests/run_offline.py --deterministic-only`);
 #     this job runs the whole suite so a real regression is still visible.
-#   * `windows` — the Windows legs of the matrix have never passed since the
-#     import. Recorded causes: `PermissionError [WinError 32]` while a temp
-#     directory holding `registry.sqlite3` / `events.sqlite` / `win.sqlite` is
-#     removed, `OSError [WinError 10038]` / `[WinError 10022]` on closed or
-#     unconnected sockets, a fixture cleanup deadline, and a bridge candidate
-#     check that rejects a pre-existing `%USERPROFILE%\.claude.json` on the
-#     runner. Installing an unrelated client's config is not this repository's
-#     to fix; the job stays non-blocking until the rest is resolved.
+#   * `windows` — the Windows leg never passed. Every recorded cause is now
+#     fixed: an unclosed `sqlite3` handle blocking temporary-directory removal
+#     with `WinError 32`, two loopback socket errors on closed or unconnected
+#     sockets, a fixture cleanup deadline, a bridge candidate check that rejected
+#     the runner's own `%USERPROFILE%\.claude.json`, and fixture temporary roots
+#     that were not their own `resolve()` because the runner sets `TEMP` to an
+#     8.3 short name. It stays non-blocking until one run confirms that, then it
+#     becomes a hard gate.
 
 on:
   push:
@@ -55,6 +55,8 @@ jobs:
         run: python -m tests.run_offline -v
 
   windows:
+    # Remove `continue-on-error` once a run is green: that is the only step left
+    # between this leg and a hard gate.
     continue-on-error: true
     runs-on: windows-latest
     env:

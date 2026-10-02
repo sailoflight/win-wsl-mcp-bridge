@@ -1880,7 +1880,10 @@ class RegistryTest(unittest.TestCase):
 
     def test_artifact_snapshot_rejects_symlink_hardlink_and_oversize(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # ``_snapshot_artifact`` requires the staging directory to be its own
+            # resolved path, so the fixture must not be a symlinked or 8.3-short
+            # temporary root.
+            root = Path(temp).resolve()
             database = root / "registry.sqlite3"
             write_registry(database, "artifact-test", "Artifact Test")
             node = BridgeNode(
@@ -4254,7 +4257,11 @@ class BidirectionalIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.temp = tempfile.TemporaryDirectory()
-        temp = Path(cls.temp.name)
+        # Canonical root: the runtime resolves every path it accepts or records,
+        # so a non-canonical temp root (a symlinked temp directory, or the
+        # ``RUNNER~1`` 8.3 short name a Windows runner puts in ``TEMP``) would
+        # never compare equal to the path the bridge hands back.
+        temp = Path(cls.temp.name).resolve()
         cls.win_registry = temp / "win.sqlite3"
         cls.wsl_registry = temp / "wsl.sqlite3"
         cls.win_workspace = temp / "win-workspace"
@@ -5216,7 +5223,10 @@ class ProjectionHarness(unittest.TestCase):
                 "FAKE_KIND",
             )
         }
-        self.root = Path(tempfile.mkdtemp(prefix="p0b-test-"))
+        # Canonical root, for the same reason as BidirectionalIntegrationTest:
+        # the runtime resolves the paths it accepts and records, and a symlinked
+        # temp directory or a Windows 8.3 short name would not match it.
+        self.root = Path(tempfile.mkdtemp(prefix="p0b-test-")).resolve()
         self.addCleanup(self._restore_environment)
         self.home = self.root / "home"
         (self.home / ".codex").mkdir(parents=True)

@@ -49,20 +49,43 @@ leg, or a workstation running several Agents at once. Add a name there only
 with a recorded intermittent failure, and run the full suite before a release:
 the whole suite still runs in CI, non-blockingly, so a regression stays visible.
 
-Windows CI is not a gate. The recorded causes are `PermissionError [WinError 32]`
-while a temporary directory holding `registry.sqlite3`, `events.sqlite`, or
-`win.sqlite` is removed, `OSError [WinError 10038]` and `[WinError 10022]` on
-closed or unconnected loopback sockets, a bounded fixture-cleanup deadline, and a
-candidate check that rejects a pre-existing unrelated `%USERPROFILE%\.claude.json`
-on the runner. Most of those failures share one production cause, now fixed:
-`with sqlite3.connect(...) as connection` is a transaction context manager, not a
-closing one, so the handle stayed open and blocked Windows temporary-directory
-cleanup with `WinError 32`. `bridge_runtime.connect_sqlite` supplies a
-`_ClosingConnection` that keeps commit/rollback and adds the close, and the
-runtime journal/registry sites and both projection connection factories use it.
-Test-side `sqlite3.connect` calls still use the bare idiom, and the remaining
-Windows causes above are not yet fixed, so the leg stays non-blocking until a run
-confirms otherwise.
+Windows CI is not a gate yet: every recorded cause is fixed, and the leg stays
+non-blocking only until one run confirms it. The test-side causes were
+`PermissionError [WinError 32]` while a temporary directory holding
+`registry.sqlite3`, `events.sqlite`, or `win.sqlite` was removed, `OSError
+[WinError 10038]` and `[WinError 10022]` on closed or unconnected loopback
+sockets, a bounded fixture-cleanup deadline, and a candidate check that rejects a
+pre-existing unrelated `%USERPROFILE%\.claude.json` on the runner. Most of those
+shared one production cause: `with sqlite3.connect(...) as connection` is a
+transaction context manager, not a closing one, so the handle stayed open and
+blocked Windows temporary-directory cleanup with `WinError 32`.
+`bridge_runtime.connect_sqlite` supplies a `_ClosingConnection` that keeps
+commit/rollback and adds the close, and the runtime journal/registry sites and
+both projection connection factories use it. Test-side `sqlite3.connect` sites
+pair the connection with `contextlib.closing` or an explicit `close()` in
+`finally`, so they do not hold the file open the way the runtime idiom did.
+
+The last four failures were one environment difference. A Windows runner sets
+`TEMP` to an 8.3 short name (`C:\Users\RUNNER~1\…`), so `tempfile` hands back a
+path that is not its own `resolve()`, while the runtime canonicalizes every path
+it accepts, records, or compares — `_validate_artifact_inbox`, the installer's
+recorded `configPath`, and the staging-directory check in `_snapshot_artifact`.
+The tests then compared a canonical runtime path against a short-form fixture
+path. Fixtures now resolve their temporary root at creation, which is a no-op on
+a POSIX host whose temp directory is already canonical.
+
+That failure mode is reproducible without Windows: point `TMPDIR` at a symlinked
+directory and every non-canonical-path assumption fails the same way.
+
+```bash
+mkdir -p /tmp/repro-real && ln -s /tmp/repro-real /tmp/repro-link
+TMPDIR=/tmp/repro-link PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m tests.run_offline --deterministic-only
+```
+
+A change that touches path canonicalization should be run that way as well as
+normally; the deterministic gate under a symlinked `TMPDIR` passed on
+2026-10-02.
 
 ## Choosing a test scope
 
