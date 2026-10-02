@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import contextlib
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -384,6 +385,81 @@ class SupervisorPeerProbeTest(unittest.TestCase):
             with self.subTest(behaviour=behaviour):
                 with mock.patch.object(supervisor, "local_registry_query", behaviour):
                     self.assertFalse(supervisor._peer_node_answers(self.config))
+
+
+class _PollingProcess(_FakeProcess):
+    """A child that keeps running for a fixed number of polls, then exits."""
+
+    def __init__(self, argv, polls: int = 3, returncode: int = 0) -> None:
+        super().__init__(argv, returncode)
+        self.polls = polls
+
+    def wait(self, timeout=None):
+        if self.polls > 0:
+            self.polls -= 1
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
+        return self._returncode
+
+
+class SupervisorAttachWatchdogTest(unittest.TestCase):
+    """An attached entry must not keep serving a node that is gone."""
+
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        root = Path(self._temporary.name)
+        self.wsl_node = root / "win-wsl-mcp-wsl"
+        self.wsl_node.write_bytes(b"installed")
+        self.config = supervisor.SupervisorConfig(
+            windows_node=root / "win-wsl-mcp-win.exe",
+            wsl_node=self.wsl_node,
+            windows_registry="C:\\Bridge\\registry.sqlite3",
+            wsl_registry=root / "registry.sqlite3",
+            log_root=root / "logs",
+        )
+        (self.config.windows_node).write_bytes(b"installed")
+        self.config.wsl_registry.write_bytes(b"installed")
+        self.started: list[_PollingProcess] = []
+
+    def _fake_popen(self, argv, *args, **kwargs):
+        process = _PollingProcess(argv)
+        self.started.append(process)
+        return process
+
+    def _run_attach(self, *, node_answers: bool):
+        with mock.patch.object(
+            supervisor.subprocess, "Popen", self._fake_popen
+        ), mock.patch.object(
+            supervisor, "LOCAL_NODE_CHECK_SECONDS", 0.0
+        ), mock.patch.object(
+            supervisor, "ATTACH_WAIT_POLL_SECONDS", 0.0
+        ), mock.patch.object(
+            supervisor, "_stack_ready", lambda _port: node_answers
+        ), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = supervisor.run(
+                self.config,
+                port_accepts=lambda _port: True,
+                stack_ready=lambda: True,
+                peer_answers=lambda: False,
+            )
+        return code, stderr.getvalue()
+
+    def test_attach_exits_non_zero_when_the_borrowed_node_goes_away(self) -> None:
+        code, stderr = self._run_attach(node_answers=False)
+        self.assertEqual(code, 1)
+        # Only registry-mcp was started, and it was torn down on the way out.
+        self.assertEqual(
+            [process.argv for process in self.started],
+            [[str(self.wsl_node), "registry-mcp", "--local-port", "8769"]],
+        )
+        self.assertTrue(all(process.terminated for process in self.started))
+        self.assertIn("stopped answering", stderr)
+
+    def test_attach_keeps_serving_while_the_borrowed_node_answers(self) -> None:
+        code, stderr = self._run_attach(node_answers=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(len(self.started), 1)
 
 
 if __name__ == "__main__":

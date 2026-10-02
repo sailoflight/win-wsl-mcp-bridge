@@ -21,9 +21,12 @@ stack. Ownership is therefore decided per start:
     A ready stack already answers: start no node, stop no node, and just serve
     ``registry-mcp`` against the running local node. Every further DSH profile
     keeps its registry tools, and the profile that merely attaches never tears
-    the shared stack down. If the owner disappears later, this attached
+    the shared stack down. If the owner disappears later, the attached
     ``registry-mcp`` loses the node, exits, and the Harness reconnect restarts
-    this entry, which then finds the ports free and becomes the owner.
+    this entry, which then finds the ports free and becomes the owner. That exit
+    cannot come from the borrowed node's process handle, which this process does
+    not hold, so an attaching entry also watches the node it borrowed and exits
+    non-zero once that node stops answering.
 ``reclaim``
     Ports are occupied, the local node does not answer, but the **peer** node
     answers its own registry: the previous owner died without reaping its
@@ -63,6 +66,8 @@ STARTUP_TIMEOUT_SECONDS = 30
 ATTACH_WAIT_POLL_SECONDS = 0.5
 EXPECTED_REMOTE_IDS = frozenset({"onshape", "taobao"})
 PORT_PROBE_TIMEOUT_SECONDS = 0.2
+LOCAL_NODE_CHECK_SECONDS = 5.0
+LOCAL_NODE_LOSS_LIMIT = 2
 WINDOWS_INTEROP_ROOT = Path("/mnt/c/Users")
 WINDOWS_INSTALL_TAIL = Path("AppData/Local/WinWslMcpBridge")
 WINDOWS_NODE_TAIL = Path("runtime/Scripts/win-wsl-mcp-win.exe")
@@ -288,11 +293,19 @@ def _serve_registry(
     *,
     windows_process: subprocess.Popen[bytes] | None,
     wsl_process: subprocess.Popen[bytes] | None,
+    watch_local_node: bool = False,
 ) -> int:
     """Serve ``registry-mcp`` against the local node and mirror its exit code.
 
     Only nodes started by this process are torn down afterwards, so an
     attaching profile never stops the stack it attached to.
+
+    ``watch_local_node`` covers the one thing an attached profile cannot see in
+    its process handles: the node it borrowed dying. Without it, a dead owner
+    leaves this entry serving a node that is gone, the Harness never reconnects,
+    and the profile keeps a registry whose every call fails. Exiting non-zero
+    instead is what lets the documented reconnect start a fresh entry that owns
+    (or reclaims) the stack.
     """
     registry_process = subprocess.Popen(
         [
@@ -303,6 +316,8 @@ def _serve_registry(
         ],
         env=environment,
     )
+    misses = 0
+    next_local_check = time.monotonic() + LOCAL_NODE_CHECK_SECONDS
     try:
         while not _stopping:
             try:
@@ -314,6 +329,17 @@ def _serve_registry(
                     )
                 if wsl_process is not None and wsl_process.poll() is not None:
                     raise RuntimeError(f"WSL bridge node exited ({wsl_process.returncode})")
+                if watch_local_node and time.monotonic() >= next_local_check:
+                    next_local_check = time.monotonic() + LOCAL_NODE_CHECK_SECONDS
+                    if _stack_ready(config.wsl_local_port):
+                        misses = 0
+                    else:
+                        misses += 1
+                        if misses >= LOCAL_NODE_LOSS_LIMIT:
+                            raise RuntimeError(
+                                "attached bridge node stopped answering; "
+                                "exiting so the Harness reconnect can take over"
+                            )
         return 0
     finally:
         _terminate(registry_process)
@@ -367,7 +393,8 @@ def run(
     if role == "attach":
         try:
             return _serve_registry(
-                config, environment, windows_process=None, wsl_process=None,
+                config, environment,
+                windows_process=None, wsl_process=None, watch_local_node=True,
             )
         except Exception as exc:
             if not _stopping:
