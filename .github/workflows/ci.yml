@@ -19,7 +19,10 @@ name: verify
 # fixture temporary roots that were not their own `resolve()` because the runner
 # sets `TEMP` to an 8.3 short name, one scene-setting timeout in a TLS-handshake
 # test, and facade deadlines that doubled as a cold-spawn budget (now named
-# constants in `tests/test_modern_http_facade.py`).
+# constants in `tests/test_modern_http_facade.py`). Enabling the gate then caught
+# one more: a capacity refusal closed the socket before reading the refused
+# request, so on Windows the client's own write was aborted with `WinError 10053`
+# and the structured 503 never arrived.
 
 on:
   push:

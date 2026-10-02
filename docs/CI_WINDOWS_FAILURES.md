@@ -2,7 +2,8 @@
 
 Status record, not current capability documentation. It is the evidence base for
 the remaining Windows work: read it before changing a Windows-sensitive test or
-re-enabling the Windows CI leg as a gate.
+re-enabling the Windows CI leg as a gate. That work is finished — §9 records the
+resolution, the enabled gate, and the last defect the gate itself caught.
 
 Provenance: produced by a read-only diagnosis run on 2026-09-29 against commit
 `a76b228`, with a local Windows reproduction at `C:\MCP\ci-repro`. The
@@ -641,3 +642,65 @@ a documented retry.
    use cp1252. Bugs whose *symptom* is a decode error appear locally but are silent on CI (item 3), and
    the reverse can also happen; treat the exact residual list as approximate and re-measure in CI after
    the fixes land.
+
+---
+
+## 9. Resolution (2026-10-02)
+
+This record was written while the Windows leg could not be trusted. The leg now
+passes and is a blocking gate, and the classes it left open are closed. Read this
+section, not the "read it before re-enabling" framing above, for the current
+state.
+
+**The gate.** Run `36990671066` (commit `5f3ba90`) passed with the same 638 tests
+the blocking `test` job runs, in 264 s against 170 s here, with 13
+platform-conditional skips, and `continue-on-error` came off the leg in commit
+`80efc64`. The count went 4 (`873e67a`, one environment difference) → 1
+(`89876a6`) → 3 (`b6ae38e`) → 0. Each round removed a cause and exposed the next
+test whose verdict depended on wall-clock room rather than on the behaviour it
+asserts:
+
+  * `tests.test_modern_http_adapter.ModernAdapterTests.test_shutdown_interrupts_tls_handshake_before_response_exists`
+    tripped `started.wait(2)`: a loopback accept or TLS ClientHello can arrive
+    late on a runner 2.2x slower than this host. Its scene-setting waits are now
+    generous (20 s/30 s) while the behavioural assertions stay at 0.7 s and 10 s.
+  * Three `ModernFacadeTests` members answered `504`, or JSON where an SSE stream
+    was expected. `start_server` passed `request_timeout_s=3`, and the facade
+    compares that bound against a cold `python` spawn of the fixture backend,
+    which does not reliably fit in 3 s there. The class now derives its deadlines
+    from `HEALTHY_EXCHANGE_TIMEOUT_S` (12 s), `COLD_SPAWN_GRACE_TIMEOUT_S` (4 s,
+    for members that assert the deadline itself) and `CLIENT_WAIT_S` (the largest
+    server bound plus 3 s). Two of those members had been quarantined as
+    load-sensitive for this reason and are listed no longer, so the deterministic
+    leg went from 636 to 639 tests.
+
+**RC10b resolved, including the `10053` case.** The first run with the gate
+enabled (`36991188063`) failed exactly one test,
+`ModernFacadeTests.test_bounded_request_response_and_http_worker_lifecycle`, with
+`ConnectionAbortedError: [WinError 10053]` raised by the *client's write*, not by
+its 503 assertion. That is a real Windows behaviour, not test noise: the
+capacity-refusal path in `ModernFacadeServer.process_request` writes its 503
+before reading the request and then closes the socket, and on Windows a peer that
+writes to that closed socket has its send aborted, so the structured refusal
+never arrives — a client at capacity saw a transport reset instead of the
+documented error. The refusal now reads the refused request first, bounded by
+`REFUSAL_DRAIN_SECONDS` (0.25 s) and `REFUSAL_DRAIN_BYTES` (64 KiB), which turns
+the close into a FIN. The drain usually costs nothing, because the client's
+request is already buffered when the refusal is written, and
+`test_a_refused_request_is_drained_within_its_bounds` pins both bounds and the
+EOF/error exits. The member now also asserts the refusal *body*, because the body
+— not the status line — is what a Windows client was losing. The other three
+RC10b cases are the deadline ones above; the `sigterm-CLI` member is the one
+whose SSE assertion produced both the `application/json` and the sigterm
+symptoms.
+
+**RC11** is handled as this record recommended: the fake-CLI `official_cli_*`
+tests skip with an explicit reason where no Windows CLI shim exists. The 13
+runner skips are 9 of those, plus 2 POSIX mode-bit tests and 2 POSIX-only
+process-group escalation tests.
+
+**The ubuntu legs.** The 504 flake this record proposed to quarantine by retry is
+fixed at its source by the deadline constants above, so no retry mechanism was
+added. `load-sensitive` stays non-blocking: a saturated two-core runner still
+cannot run this suite's wall-clock and interleaving assertions, and that job
+exists to keep the full-suite signal visible rather than to block a push.

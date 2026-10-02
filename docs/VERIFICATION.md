@@ -49,12 +49,13 @@ leg, or a workstation running several Agents at once. Add a name there only
 with a recorded intermittent failure, and run the full suite before a release:
 the whole suite still runs in CI, non-blockingly, so a regression stays visible.
 
-Windows CI is a gate as of run 36990671066 (commit `5f3ba90`): the leg ran the
-same 638 tests the blocking `test` job runs, in 264 s against 170 s here, with 13
-platform-conditional skips. Getting there took four rounds, each of which removed
-a cause and exposed the next test whose verdict depended on wall-clock room: the
-failure count went from 4 (`873e67a`, one environment difference) to 1
-(`89876a6`) to 3 (`b6ae38e`) to 0. The single failure was
+Windows CI is a gate: the leg passed in run 36990671066 (commit `5f3ba90`) with
+the same 638 tests the blocking `test` job runs, in 264 s against 170 s here, with
+13 platform-conditional skips, and `continue-on-error` came off in commit
+`80efc64`. Getting there took four rounds, each of which removed a cause and
+exposed the next test whose verdict depended on wall-clock room: the failure count
+went from 4 (`873e67a`, one environment difference) to 1 (`89876a6`) to 3
+(`b6ae38e`) to 0. The single failure was
 `tests.test_modern_http_adapter.ModernAdapterTests.test_shutdown_interrupts_tls_handshake_before_response_exists`,
 which tripped `started.wait(2)` on a runner where the whole suite took 363 s
 against 163 s here — the same code passed the previous Windows run, so its
@@ -69,7 +70,19 @@ which a healthy exchange never reaches), `COLD_SPAWN_GRACE_TIMEOUT_S` (4 s, for
 the members that assert the deadline itself) and `CLIENT_WAIT_S` (the largest
 server bound plus 3 s, so a slowed exchange cannot fail as a client read timeout
 instead); the two members that were listed load-sensitive for this reason are
-listed no longer and run in the deterministic leg. The oldest
+listed no longer and run in the deterministic leg.
+
+Enabling the gate then found a genuine Windows defect on its first run
+(`36991188063`).
+`ModernFacadeTests.test_bounded_request_response_and_http_worker_lifecycle`
+failed with `ConnectionAbortedError: [WinError 10053]` raised by the client's
+*write*: the facade's capacity refusal writes its 503 before reading the request
+and closes the socket, and Windows aborts the peer's send once that peer writes to
+the closed socket, so a client refused for capacity saw a reset instead of the
+documented error. The refusal now drains the refused request within
+`REFUSAL_DRAIN_SECONDS` (0.25 s) and `REFUSAL_DRAIN_BYTES` (64 KiB) before
+closing, which turns the close into a FIN and costs nothing in the common case
+because the request is already buffered. The oldest
 test-side causes were
 `PermissionError [WinError 32]` while a temporary directory holding
 `registry.sqlite3`, `events.sqlite`, or `win.sqlite` was removed, `OSError

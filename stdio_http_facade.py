@@ -1424,6 +1424,32 @@ class ModernFacadeServer(ThreadingHTTPServer):
         host = f"[{host}]" if ":" in host else host
         return f"http://{host}:{port}{self.endpoint}"
 
+    #: An early refusal writes its 503 before reading the request, so the socket
+    #: must not be closed while the client is still sending that request: on
+    #: Windows the peer's write to a closed socket fails with `WinError 10053`
+    #: and the structured 503 never arrives (recorded on the Windows leg of run
+    #: 36991188063). Reading the refused request within these bounds turns the
+    #: close into a FIN, and costs nothing in the common case because the client
+    #: has already sent its request by the time the refusal is written.
+    REFUSAL_DRAIN_SECONDS = 0.25
+    REFUSAL_DRAIN_BYTES = 65536
+
+    def _drain_refused(self, request: socket.socket) -> None:
+        deadline = time.monotonic() + self.REFUSAL_DRAIN_SECONDS
+        drained = 0
+        while drained < self.REFUSAL_DRAIN_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            request.settimeout(remaining)
+            try:
+                chunk = request.recv(self.REFUSAL_DRAIN_BYTES - drained)
+            except OSError:
+                return
+            if not chunk:
+                return
+            drained += len(chunk)
+
     def process_request(self, request: socket.socket, client_address: Any) -> None:
         if self._closing.is_set() or not self._slots.acquire(blocking=False):
             body = _json_bytes(_ModernFacadeError(503, ERR_TRANSPORT, "Modern facade capacity exhausted").payload(None))
@@ -1431,6 +1457,7 @@ class ModernFacadeServer(ThreadingHTTPServer):
                 request.settimeout(0.1)
                 request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
                                 + str(len(body)).encode() + b"\r\n\r\n" + body)
+                self._drain_refused(request)
             except OSError:
                 pass
             self.shutdown_request(request)

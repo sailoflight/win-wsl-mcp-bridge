@@ -455,11 +455,61 @@ class ModernFacadeTests(unittest.TestCase):
         limited = self.start_server(max_inflight=1, request_timeout_s=self.HEALTHY_EXCHANGE_TIMEOUT_S)
         slow_header = socket.create_connection(limited.server_address[:2])
         self.wait_until(lambda: len(limited.connections) == 1)
-        self.assertEqual(self.post(request(), server=limited)[0], 503)
+        # The refused client must still *read* its 503: this facade answers
+        # before reading the request, and on Windows closing that socket while
+        # the client is still sending fails the client's write with
+        # `WinError 10053` (recorded on run 36991188063), so the body — not just
+        # the status — is what proves the refusal reached the client.
+        status, _, body = self.post(request(), server=limited)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"], "Modern facade capacity exhausted")
         self.wait_until(lambda: not limited.connections)
         slow_header.close()
         self.assertEqual(limited.proxies, set())
         self.assertEqual(self.post(request(), server=limited)[0], 200)
+
+    def test_a_refused_request_is_drained_within_its_bounds(self):
+        """A refusal reads the refused request, but only within its bounds.
+
+        The facade answers 503 before reading the request, so it must consume
+        that request before closing the socket; it must not wait for EOF (a
+        client may never close) and must not grow with the request, because this
+        runs in the accept loop.
+        """
+        server = self.start_server()
+
+        class Refused:
+            def __init__(self, chunks):
+                self.chunks, self.sizes, self.timeouts = list(chunks), [], []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+            def recv(self, size):
+                self.sizes.append(size)
+                return self.chunks.pop(0) if self.chunks else b""
+
+        complete = Refused([b"POST /mcp HTTP/1.1\r\n", b"{}"])
+        server._drain_refused(complete)
+        self.assertEqual(len(complete.sizes), 3)  # two chunks, then EOF
+        self.assertTrue(all(0 < size <= server.REFUSAL_DRAIN_BYTES
+                            for size in complete.sizes))
+        self.assertTrue(all(0 < value <= server.REFUSAL_DRAIN_SECONDS
+                            for value in complete.timeouts))
+
+        oversized = Refused([b"x" * server.REFUSAL_DRAIN_BYTES])
+        server._drain_refused(oversized)
+        self.assertEqual(len(oversized.sizes), 1)
+        self.assertEqual(oversized.sizes[0], server.REFUSAL_DRAIN_BYTES)
+
+        class Broken(Refused):
+            def recv(self, size):
+                self.sizes.append(size)
+                raise ConnectionResetError("refused client went away")
+
+        failed = Broken([])
+        server._drain_refused(failed)
+        self.assertEqual(len(failed.sizes), 1)
 
     def test_positive_accept_quality_and_zero_quality_are_distinguished(self):
         message = request()
