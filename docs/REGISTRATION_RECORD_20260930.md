@@ -161,11 +161,13 @@ dsh: overlay entry 3 in …/cordis-bridge-overlay.json must be a mapping (a load
 
 **已定（Operator 决定）**：保持现状（cadq/meshq 只挂在三个 dsh profile，手加但已证明对 reconcile 稳定）；等 MeshQ 的 Windows 部署完成、`--doctor` 与 MCP 验收通过之后，再一次性让桥的投影权威接管这两条（届时 codex/claude 一并受益，不会出现空指针）。在那之前不运行 `projection sync`，以免把未部署的 meshq 推进镜像。
 
+**前置条件已满足（2026-10-02）**：MeshQ 已在 Windows 部署（`C:\MCP\MeshQ` + `.venv`）并经桥实测可用（见缺口 1）。因此"一起接管"这一步现在可执行；它会把 cadq/meshq 一并写进 codex 与 claude 两个客户端，**待 Operator 点头后再动手**（命令：`projection sync --refresh-from registry-path --peer-registry <Windows registry.sqlite3>` 然后 `projection reconcile`，先加 `--dry-run` 复核）。
+
 ## §6 已知缺口与回滚
 
 **缺口**
 
-1. **MeshQ 现在是空指**。`C:\MCP\MeshQ` 不存在：`tools/deploy_windows_stdio.py --plan` 说 106 个文件待发、`--doctor` 0/2（无副本、无 `.venv`），Windows 侧也没有 Blender。登记行是**声明**；在它自己的部署完成前，调到它只会明确失败。把它提前加进三个 profile 意味着每次会话启动都会尝试拉一个起不来的服务（`failOnStartupError:false`，不会毁会话，但是噪声）。
+1. ~~**MeshQ 现在是空指**~~ → **已关闭（2026-10-02 复核）**：`C:\MCP\MeshQ` 已在位并带 `.venv`，经桥实测可用——`connect meshq` → `initialize` 报 `meshq 0.1.0`，`tools/list` 11 个工具（8 个 `meshq_*`：`doctor`/`caps`/`inspect`/`describe`/`views`/`animate`/`run`/`audit`，加桥的 `mcp_tool_catalog`/`mcp_tool_view`/`mcp_tool_invoke`）。因此三个 profile 里的 `mcp-meshq` **不再需要摘除**。原始记录留痕：`C:\MCP\MeshQ` 不存在：`tools/deploy_windows_stdio.py --plan` 说 106 个文件待发、`--doctor` 0/2（无副本、无 `.venv`），Windows 侧也没有 Blender。登记行是**声明**；在它自己的部署完成前，调到它只会明确失败。
 2. **CadQ 的 `artifactDelivery` 仍关闭**：CadQ 的输出根固定且故意不可配置，v1 不做产物回传，调用方按它自己声明的 `output_dir` 取件（WSL 侧走 `/mnt/c/...` 直读）。这不是桥的产物保证。
 3. **失败转移缺陷**（§2 坑 3）未修。
 4. 换码后 **Windows 侧运行时目录名换过**：以后要再原地升级，请按 §2 坑 1 在最终目录里重装一次。

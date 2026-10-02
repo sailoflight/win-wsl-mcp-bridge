@@ -53,6 +53,12 @@ def _plan(occupied, stack_ready, peer_ready=False):
 - **不猜外来监听器**：`_peer_node_answers()` 用一次有界的 registry 查询做身份识别；超时/拒绝/垃圾回包/错误应答（`BridgeError`/`OSError`/`ValueError`）一律视为"不应答"→ 仍旧 `fail`。
 - **零成本探测**：只有"端口被占且本地不应答"时才发这一次探测；端口空闲（`own`）或本地可 attach 时不探测。
 
+## 附带修复：attach 侧的本节点失联看门狗
+
+事故之所以拖成"永久"，是因为 `attach` 模式那半边坏了：模块文档承诺"owner 消失 → 挂在它上面的 `registry-mcp` 失去节点并退出 → Harness 重连 → 新 entry 成为 owner"，但**实际上它不退出**，只对每次调用回 `-32603`，于是 DSH 永远不重连、栈不会自愈。
+
+attach 侧看不到自己借来的节点的进程句柄，所以补一个看门狗：每 `LOCAL_NODE_CHECK_SECONDS`（5s）向本节点发一次真实 registry 查询，连续 `LOCAL_NODE_LOSS_LIMIT`（2）次不应答就以非零码退出。健康时不退出（查询与轮询频率无关，不会给节点刷日志）。只有 attach 模式启用——`own`/`reclaim` 模式本来就有子进程句柄可判断。
+
 ## 验收（真实环境 A/B）
 
 1. **造故障态**：用 supervisor 正常起栈（`own`，注册表 4 个工具、`bridge_registry_list` 返回真实对端数据）→ `kill -9` supervisor（模拟会话被强杀，无人执行 `finally`）→ 杀掉 WSL 节点 → 剩下孤儿的 Windows 节点占着 8768/8770、8769 空闲。
@@ -65,17 +71,37 @@ def _plan(occupied, stack_ready, peer_ready=False):
 [wsl-bridge] peer link established
 ```
 
-离线测试：`tests/test_dsh_registry_supervisor.py` 17 项通过（新增 `reclaim` 计划、只起本地节点、外来占用仍旧 fail、空闲/attach 不探测、探测不吃异常六类）；全量离线套件 644 项通过。运行时（`bridge_runtime.py`）**未改动**——这是刻意的，避免为一次探测再动 wheel 换码。
+离线测试：`tests/test_dsh_registry_supervisor.py` 19 项通过（新增 `reclaim` 计划、只起本地节点、外来占用仍旧 fail、空闲/attach 不探测、探测不吃异常六类，以及 attach 看门狗的两条：节点失联则退出、节点仍应答则继续服务）；全量离线套件 644 项通过。运行时（`bridge_runtime.py`）**未改动**——这是刻意的，避免为一次探测再动 wheel 换码。
+
+**看门狗的真实环境验收**：在已成对的栈上，用一个 attach 模式的 supervisor 挂上去（`tools/list` 4 个注册表工具、`bridge_registry_list` 正常）→ 杀掉被借用的 WSL 节点 → 约 15s 后该 supervisor 自行退出：
+
+```
+bridge supervisor: RuntimeError: attached bridge node stopped answering; exiting so the Harness reconnect can take over
+server exited on its own with code 1
+```
+
+即"owner 死 → attached entry 退出 → Harness 重连 → 新 entry own/reclaim"这条链现在真的闭合了。
 
 ## 部署与回滚
 
 - 部署对象：`~/.local/share/win-wsl-mcp-bridge/dsh_node_registry_entry.py`（DSH 各 profile 的 `registry` MCP 入口所执行的文件）。
-- 备份：`~/.local/share/win-wsl-mcp-bridge/backups/20261002T070923Z-supervisor-reclaim/dsh_node_registry_entry.py.before`。
-- 回滚 = 把备份覆盖回去（本改动只涉及这一个文件；`bridge_runtime.py` 与 wheel 均未动）。
-- 生效时机：**下一次 profile 启动**（overlay/MCP 条目只在会话启动时加载）。已运行的会话不会自愈——实测 24 秒采样内 DSH 没有重试 `registry` 条目。
+- 备份（两次改动各一份）：
+  - `~/.local/share/win-wsl-mcp-bridge/backups/20261002T070923Z-supervisor-reclaim/dsh_node_registry_entry.py.before`
+  - `~/.local/share/win-wsl-mcp-bridge/backups/20261002T071937Z-supervisor-attach-watchdog/dsh_node_registry_entry.py.before`
+- 回滚 = 把对应备份覆盖回去（本改动只涉及这一个文件；`bridge_runtime.py` 与 wheel 均未动）。
+- 生效时机：**下一次 profile 启动**（overlay/MCP 条目只在会话启动时加载）。已运行的会话不会自愈——实测 24 秒采样内 DSH 没有重试 `registry` 条目；但看门狗补上之后，只要 owner 出事，attach 侧的 entry 会自己退出并触发重连。
+
+## 当前运行状态（2026-10-02 事故后）
+
+为避免"人不在这段时间桥是断的"，已将栈以 **detached 的一对节点**恢复（不是 supervisor 拉起，即 attach-ready 状态）：
+
+- Windows 节点：`win-wsl-mcp-win.exe serve --registry …\WinWslMcpBridge\registry.sqlite3 --local-port 8768 --link-port 8770`
+- WSL 节点：`win-wsl-mcp-wsl serve --registry ~/.local/state/win-wsl-mcp-bridge/registry.sqlite3 --local-port 8769 --link-port 8770`
+- 两侧日志均有 `peer link established`；经节点查询对端注册表得到 `['cadq','meshq','onshape','taobao']`。
+- 任一 profile 下次启动时，supervisor 会看到端口被占且本地 registry 应答 → 走 `attach`，不再 `fail`。
 
 ## 仍未修的深层缺口
 
 1. **孤儿 Windows 节点本身没人回收**。`reclaim` 让它重新可用，但那个 Windows 节点始终没有 supervisor 管辖；下次 owner 异常退出仍会再产生一个（只是现在不会卡死了）。彻底办法是让 Windows 节点在失去 link 对端后自行退出，或让 supervisor 主动接管——前者要动共享运行时，后者要依赖 Windows 侧工具，均未实施。
-2. **attach 侧的 `registry-mcp` 在 owner 死后不退出**（只回 `-32603`），使 DSH 无法靠重连自愈。`dsh_node_registry_entry.py` 的文档承诺了"退出→Harness 重连→新 owner"，实际不成立。
+2. ~~**attach 侧的 `registry-mcp` 在 owner 死后不退出**~~ → **已修**（见"附带修复"）：attach 模式现在由 supervisor 监视借来的节点并主动退出。注意 `control-mcp` 是另一条独立 MCP 条目（由 home patch 提供），它仍不会自己退出；只是它是按调用连接、节点恢复后即可用（事故后实测恢复）。
 3. **`bridge_control status`/`bridge_diagnostics` 在这类故障下只给 `-32603`**，没有可区分的诊断信息。

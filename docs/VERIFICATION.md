@@ -64,6 +64,52 @@ Test-side `sqlite3.connect` calls still use the bare idiom, and the remaining
 Windows causes above are not yet fixed, so the leg stays non-blocking until a run
 confirms otherwise.
 
+## Choosing a test scope
+
+The deterministic gate is 632 tests and takes about 145 s on this host. Running
+every module for a one-file change wastes most of that, so start from the module
+that owns the change and widen only when the change crosses a boundary. Never
+narrow the pre-release gate: run the whole suite before a release.
+
+Measured wall clock for the deterministic gate, so the cost of widening is
+visible. Five modules are roughly two thirds of the total:
+
+| Module | Tests | Wall clock |
+| --- | --- | --- |
+| `tests.test_bridge` | 254 | 46.0 s |
+| `tests.test_stdio_http_facade` | 16 | 16.2 s |
+| `tests.test_modern_http_facade` | 11 | 13.7 s |
+| `tests.test_modern_http_adapter` | 24 | 12.5 s |
+| `tests.test_legacy_modern_stdio` | 32 | 10.5 s |
+| the other 19 modules | 295 | 45.9 s |
+
+Routing aid — the module to run first for a change in each area:
+
+| Change area | Start with |
+| --- | --- |
+| DSH registry supervisor (`installer/dsh_node_registry_entry.py`) | `tests.test_dsh_registry_supervisor` (0.2 s) |
+| Installer enrollment, adapters, projection writes | `tests.test_client_enrollment_verification`, `tests.test_projection_preview`, `tests.test_installer_boundary` |
+| Projection preview and protocol/registration metadata | `tests.test_protocol_projection`, `tests.test_harness_verification` |
+| stdio and HTTP facades/adapters | `tests.test_stdio_http_facade`, `tests.test_modern_http_facade`, `tests.test_modern_http_adapter`, `tests.test_http_protocol_registration` |
+| Legacy/modern stdio split and compatibility routes | `tests.test_legacy_modern_stdio`, `tests.test_legacy_profiles`, `tests.test_compatibility_resilience` |
+| Deferred and library tool surface | `tests.test_deferred_tools`, `tests.test_modern_control_frontend` |
+| Journal maintenance, evidence, streams | `tests.test_journal_maintenance`, `tests.test_journal_evidence`, `tests.test_stream_evidence`, `tests.test_streamable_http_stdio` |
+| Shared scheduling | `tests.test_shared_scheduling` |
+| Repository layout, packaging, archives | `tests.test_repository_layout`, `tests.test_archive_profile`, `tests.test_connector_core` |
+
+This map is derived from cross-module imports, not from a coverage run, so treat
+it as a starting point rather than a contract. `bridge_runtime.py` is imported by
+15 of the 24 modules — a change there is a shared-runtime change, so run the whole
+deterministic gate instead of picking modules. `bridge_protocol.py`,
+`connector_core.py`, and `connector_engine.py` are similar at a smaller scale.
+
+Ad-hoc `python3` in this repository must set `PYTHONDONTWRITEBYTECODE=1`. A stray
+root `__pycache__` fails
+`tests.test_bridge.RegistryTest.test_project_has_only_two_component_directories`,
+which asserts the repository root holds only the two runtime component
+directories; clean it with
+`find . -name '__pycache__' -type d -prune -exec rm -rf {} +`.
+
 The `test_bridge.py` suite verifies:
 
 - typed stdio/Streamable-HTTP registry validation and public redaction, native HTTP relay and registered external HTTP control contracts, the constant two-tool Control MCP catalog/token budget, bounded event retention, and sensitive trace confirmation;
