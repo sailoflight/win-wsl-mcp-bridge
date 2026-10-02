@@ -30,7 +30,7 @@ from types import SimpleNamespace
 
 ENGINE_NAME = "connector-engine"
 ENGINE_VERSION = "1.0.0"
-CORE_VERSION = "0.4.1"  # exact node core release this engine pairs with
+CORE_VERSION = "0.4.2"  # exact node core release this engine pairs with
 
 # Optional single-line tool-result annotation.  When True and the connected node
 # core does not equal CORE_VERSION, the connector appends one concise text line

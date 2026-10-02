@@ -5067,6 +5067,21 @@ def first_positional(start):
     return None
 if cmd == "list":
     doc = load()
+    if KIND == "claude":
+        # Real Claude Code has no ``--json``: it prints a health-check
+        # preamble and one ``name: <command…> - ✔ Connected`` line per server.
+        print("Checking MCP server health\u2026")
+        print()
+        for key, value in doc["mcpServers"].items():
+            if value.get("type") == "http":
+                rendered = str(value.get("url") or "")
+            else:
+                rendered = " ".join(
+                    [str(value.get("command") or "")]
+                    + [str(item) for item in value.get("args", [])]
+                )
+            print(f"{key}: {rendered} - \u2714 Connected")
+        sys.exit(0)
     out = {
         "mcpServers": [
             {"name": key, **value} for key, value in doc["mcpServers"].items()
@@ -5091,6 +5106,30 @@ if cmd == "get":
             transport = {"type": "stdio", "command": value.get("command"),
                          "args": value.get("args", []), "env": value.get("env", {})}
         print(json.dumps({"name": name, "transport": transport}))
+        sys.exit(0)
+    if KIND == "claude":
+        # Real Claude Code renders a human block and offers no structured
+        # form, so a stdio read here is the only faithful round trip.
+        block = [
+            f"{name}:",
+            "  Scope: User config (available in all your projects)",
+            "  Status: \u2714 Connected",
+        ]
+        if value.get("type") == "http":
+            block += ["  Type: http", f"  URL: {value.get('url')}"]
+        else:
+            block += ["  Type: stdio", f"  Command: {value.get('command')}"]
+            rendered_args = " ".join(
+                str(item) for item in value.get("args", [])
+            )
+            if rendered_args:
+                block.append(f"  Args: {rendered_args}")
+            if value.get("env"):
+                block.append("  Environment:")
+                for key in sorted(value["env"]):
+                    block.append(f"    {key}={value['env'][key]}")
+        block += ["", f"To remove this server, run: claude mcp remove {name} -s user"]
+        print("\n".join(block))
         sys.exit(0)
     print(json.dumps({"name": name, **value}))
     sys.exit(0)
@@ -6556,6 +6595,57 @@ class ProjectionNativeHttpTest(ProjectionHarness):
             _cli_parse_claude_text(text, "alpha"),
             {"url": "http://127.0.0.1:8877/mcp/alpha", "headers": {}},
         )
+
+    def test_official_cli_claude_stdio_text_get_round_trips(self) -> None:
+        """The real `claude mcp get` prints stdio as a human block, never JSON.
+
+        Captured from Claude Code against a projected stdio entry: the `Args:`
+        line is space-joined and the Bridge-owned marker is one `KEY=VALUE` per
+        `Environment:` line. Parsing it back is what lets an official-CLI
+        environment recognize the entries it wrote; without it every name reads
+        as occupied and reconcile reports the collision it just created.
+        """
+        from installer.projection import _cli_get_entry, _entry_fingerprint_for_kind
+
+        canonical = {
+            "command": "/opt/bridge/runtime/bin/win-wsl-mcp-wsl",
+            "args": ["connect", "onshape"],
+            "env": {
+                "WIN_WSL_MCP_BRIDGE_OWNED": "1",
+                "WIN_WSL_MCP_BRIDGE_SERVER": "onshape",
+            },
+        }
+        text = (
+            "onshape:\n"
+            "  Scope: User config (available in all your projects)\n"
+            "  Status: \u2714 Connected\n"
+            "  Type: stdio\n"
+            "  Command: /opt/bridge/runtime/bin/win-wsl-mcp-wsl\n"
+            "  Args: connect onshape\n"
+            "  Environment:\n"
+            "    WIN_WSL_MCP_BRIDGE_OWNED=1\n"
+            "    WIN_WSL_MCP_BRIDGE_SERVER=onshape\n"
+            "\n"
+            "To remove this server, run: claude mcp remove onshape -s user\n"
+        )
+        entry = _cli_get_entry(text, "onshape")
+        self.assertEqual(entry, canonical)
+        # The read-back fingerprint is the descriptor's, so the next reconcile
+        # reports `configured` instead of an unmanaged name collision.
+        self.assertEqual(
+            _entry_fingerprint_for_kind("claude", entry),
+            _entry_fingerprint_for_kind("claude", canonical),
+        )
+        # A user edit inside the block is still parsed, so the caller compares
+        # fingerprints and reports drift rather than silently losing the entry.
+        self.assertEqual(
+            _cli_get_entry(text.replace("connect onshape", "--user-edited"), "onshape"),
+            {**canonical, "args": ["--user-edited"]},
+        )
+        # Another server's block is never accepted for this name.
+        self.assertIsNone(_cli_get_entry(text, "taobao"))
+        # A stdio block without the command line stays unparseable.
+        self.assertIsNone(_cli_get_entry("onshape:\n  Type: stdio\n", "onshape"))
 
     def test_official_cli_stdio_argv_keeps_name_out_of_variadic_env_flags(self) -> None:
         """Regression: Claude `-e/--env` is variadic, so the name precedes it.

@@ -7,7 +7,7 @@ are trusted. Every bridge listener and client must resolve only to loopback. Do
 not expose the bridge through a LAN bind, port proxy, container publish rule, or
 public tunnel.
 
-Both hosts must run the same bridge protocol release. Version 0.4.1 uses
+Both hosts must run the same bridge protocol release. Version 0.4.2 uses
 `win-wsl-mcp-bridge/0.2` and intentionally rejects older peers. The package
 version is not a compatibility check between halves; `bridge_diagnostics`
 reports the runtime revision each side actually loaded, because a working tree
@@ -327,21 +327,26 @@ where `--launcher` / `--launcher-args` express an explicit deviation:
 
 ```bash
 python3 wsl-bridge-mcp/bridge.py projection unenroll <environment-id> \
-    --keep-entries --confirm
+    --remove-entries --confirm
+python3 wsl-bridge-mcp/bridge.py projection scan --side wsl
 python3 wsl-bridge-mcp/bridge.py projection enroll <candidate-id> --side wsl \
     --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3 --confirm
 python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl \
     --projection ~/.local/state/win-wsl-mcp-bridge/projection.sqlite3
 ```
 
-`unenroll --keep-entries` stops synchronization and leaves the client document
-untouched; the following `enroll` replaces the stopped row with the current
-default launcher, and `reconcile` re-verifies the owned entries and rewrites
-them through the environment's adapter. Re-run `projection status` afterwards to
-confirm `launcherCommand` points at the installed console script, and
-`bridge_diagnostics` to confirm `revisionCheck.verdict` is `match`. Refresh the
-installation before re-pinning: the pinned artifact is what every client of that
-environment will run.
+`unenroll --remove-entries` deletes the entries this environment owns and the
+environment row, and the following `enroll` records the current default
+launcher; `reconcile` then writes the entries again through the environment's
+adapter. The scan is repeated because removing and re-adding entries changes the
+document a candidate is derived from. Do **not** use `--keep-entries` here: it
+leaves the old entries in the document while deleting the projection rows that
+recorded them, so the next reconcile sees the names as occupied and reports an
+*unmanaged name collision* (or drift) instead of rewriting them. After the
+re-pin, re-run `projection status` to confirm `launcherCommand` points at the
+installed console script, and `bridge_diagnostics` to confirm
+`revisionCheck.verdict` is `match`. Refresh the installation before re-pinning:
+the pinned artifact is what every client of that environment will run.
 
 ## Explicit protocol-era conversion
 

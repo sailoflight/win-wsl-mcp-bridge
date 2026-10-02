@@ -2288,25 +2288,57 @@ def _cli_parse_claude_text(output: str, name: str) -> dict[str, Any] | None:
     """Best-effort canonical parse of the real Claude Code ``mcp get`` text.
 
     The native Streamable HTTP block is exact (single-line ``URL:`` and
-    ``Type: http``); stdio text (space-joined args, free-form env) cannot be
-    reconstructed losslessly, so it returns None and removal stays
-    conservative drift.
+    ``Type: http``). A stdio block is human-formatted, and its ``Args:`` line is
+    space-joined, so the reconstruction is only as faithful as that rendering.
+    It is still returned instead of discarded: the caller decides ownership from
+    the Bridge-owned env marker the block carries and from the persisted entry
+    fingerprint, so an entry this bridge wrote and a user then edited is
+    reported as drift instead of becoming invisible. Two arguments that render
+    to the same space-joined text are indistinguishable here, and the caller's
+    fingerprint comparison is what keeps that ambiguity from overwriting
+    anything.
     """
     lines = output.splitlines()
     if lines and lines[0].strip().rstrip(":").strip() != name:
         return None
     server_type: str | None = None
     url: str | None = None
+    command: str | None = None
+    args_text: str | None = None
+    env: dict[str, str] = {}
+    in_env = False
     for raw in lines[1:]:
         line = raw.strip()
         if not line:
+            in_env = False
             continue
         if line.startswith("Type:"):
             server_type = line[len("Type:"):].strip().lower()
+            in_env = False
         elif line.startswith("URL:"):
             url = line[len("URL:"):].strip()
+            in_env = False
+        elif line.startswith("Command:"):
+            command = line[len("Command:"):].strip()
+            in_env = False
+        elif line.startswith("Args:"):
+            args_text = line[len("Args:"):].strip()
+            in_env = False
+        elif line.startswith("Environment:"):
+            in_env = True
+        elif in_env and "=" in line:
+            key, _separator, value = line.partition("=")
+            env[key.strip()] = value.strip()
+        else:
+            in_env = False
     if server_type in ("http", "streamable-http", "streamable_http") and url:
         return {"url": url, "headers": {}}
+    if server_type == "stdio" and command is not None:
+        return {
+            "command": command,
+            "args": args_text.split() if args_text else [],
+            "env": env,
+        }
     return None
 
 
@@ -2314,9 +2346,9 @@ def _cli_get_entry(output: str, name: str) -> dict[str, Any] | None:
     """Parse one official `get` result into a canonical entry.
 
     Accepts the structured JSON shapes of the hermetic fixtures and of the
-    real Codex CLI (``mcp get --json``), plus the exact native-HTTP text block
-    of the real Claude Code CLI. A vendor format that cannot be parsed returns
-    None so cleanup stays conservative.
+    real Codex CLI (``mcp get --json``), plus the text block of the real Claude
+    Code CLI (native HTTP and stdio alike). A vendor format that cannot be
+    parsed returns None so cleanup stays conservative.
     """
     try:
         document = json.loads(output)

@@ -46,7 +46,7 @@ WSL virtual environments. The wheel exposes `win-wsl-mcp-win` and
 Run `doctor` on both hosts before `serve`.
 
 ```text
-python -m pip install win_wsl_mcp_bridge-0.4.1-py3-none-any.whl
+python -m pip install win_wsl_mcp_bridge-0.4.2-py3-none-any.whl
 win-wsl-mcp-win --version
 win-wsl-mcp-wsl --version
 ```

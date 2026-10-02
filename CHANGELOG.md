@@ -2,6 +2,36 @@
 
 All notable changes to this project are recorded here.
 
+## 0.4.2 - Unreleased
+
+### Official-CLI stdio read-back for Claude Code
+
+- The real Claude Code CLI has no structured `mcp get`: it renders one server
+  as a human block (`Type:`, `Command:`, `Args:` space-joined, one `KEY=VALUE`
+  per `Environment:` line). The official-CLI read path only understood the JSON
+  shape of the hermetic fixture and the native-HTTP text block, so **every
+  stdio entry it had just written came back unparseable**. The next reconcile
+  then treated those entries as occupied names and failed the environment with
+  `unmanaged name collision` — the entries worked, but the environment could
+  never converge, and neither `unenroll --remove-entries` nor a peer removal
+  could touch them. `_cli_parse_claude_text` now parses the stdio block, so
+  ownership comes from the Bridge-owned env marker and from the persisted entry
+  fingerprint: an unchanged entry is `configured`, a user-edited one is
+  reported as `drift` and never overwritten. The `Args:` rendering is
+  space-joined, so two argv that render identically are indistinguishable here;
+  the fingerprint comparison is what keeps that ambiguity from overwriting
+  anything.
+- The test double for the official CLIs now renders what the real CLIs render:
+  `claude mcp list` prints its health-check preamble plus `name: <command…>`
+  lines, and `claude mcp get` prints the human block. The previous double
+  answered JSON for a CLI that cannot produce it, which is why this read-back
+  gap could not be seen by any test.
+- `docs/DEPLOYMENT.md` corrects the re-pin recipe: a re-enrollment that changes
+  the launcher form must remove the old entries (`unenroll --remove-entries`)
+  before `enroll`, because `--keep-entries` leaves entries whose recorded
+  projection rows are gone, and reconcile then reports them as an unmanaged
+  collision or drift instead of rewriting them.
+
 ## 0.4.1 - Unreleased
 
 The 0.4.0 section below is the feature set deployed on 2026-09-29 (the installed
