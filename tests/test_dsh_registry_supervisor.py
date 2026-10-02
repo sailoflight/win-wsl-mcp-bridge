@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from bridge_runtime import BridgeError
 from installer import dsh_node_registry_entry as supervisor
 
 
@@ -32,12 +33,20 @@ class _FakeProcess:
 
 
 class SupervisorPlanTest(unittest.TestCase):
-    def test_plan_covers_owner_attach_and_fail(self) -> None:
+    def test_plan_covers_owner_attach_reclaim_and_fail(self) -> None:
         self.assertEqual(supervisor._plan([], False), "own")
         self.assertEqual(supervisor._plan([], True), "own")
         self.assertEqual(supervisor._plan([8769], True), "attach")
         self.assertEqual(supervisor._plan([8768, 8769, 8770], True), "attach")
+        self.assertEqual(supervisor._plan([8768, 8770], False), "fail")
         self.assertEqual(supervisor._plan([8769], False), "fail")
+        # A half-dead stack: the peer node answers while the local node is gone.
+        self.assertEqual(supervisor._plan([8768, 8770], False, True), "reclaim")
+        self.assertEqual(supervisor._plan([8768, 8769, 8770], False, True), "reclaim")
+        # An answering local node always wins over a reclaim decision.
+        self.assertEqual(supervisor._plan([8768, 8770], True, True), "attach")
+        # Free ports are never a reclaim: this start owns the whole stack.
+        self.assertEqual(supervisor._plan([], False, True), "own")
 
 
 class SupervisorPathTest(unittest.TestCase):
@@ -168,12 +177,15 @@ class SupervisorRunTest(unittest.TestCase):
         self.started.append(process)
         return process
 
-    def _run(self, *, port_accepts, stack_ready):
+    def _run(self, *, port_accepts, stack_ready, peer_answers=None):
         with mock.patch.object(
             supervisor.subprocess, "Popen", self._fake_popen
         ), contextlib.redirect_stderr(io.StringIO()) as stderr:
             code = supervisor.run(
-                self.config, port_accepts=port_accepts, stack_ready=stack_ready,
+                self.config,
+                port_accepts=port_accepts,
+                stack_ready=stack_ready,
+                peer_answers=peer_answers or (lambda: False),
             )
         return code, stderr.getvalue()
 
@@ -232,6 +244,84 @@ class SupervisorRunTest(unittest.TestCase):
         self.assertIn("does not answer", stderr)
         self.assertIn("8768", stderr)
 
+    def _wsl_log_text(self) -> str:
+        return (self.config.log_root / "wsl-node.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+
+    def test_half_dead_stack_reclaims_by_starting_only_the_local_node(self) -> None:
+        """An owner that died without reaping its Windows child must not wedge later starts."""
+        with mock.patch.object(
+            supervisor,
+            "local_registry_query",
+            lambda *args, **kwargs: [{"id": "onshape"}, {"id": "taobao"}],
+        ):
+            code, stderr = self._run(
+                port_accepts=lambda _port: True,
+                stack_ready=lambda: False,
+                peer_answers=lambda: True,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(
+            [process.argv for process in self.started],
+            [
+                [
+                    str(self.wsl_node), "serve",
+                    "--registry", str(self.wsl_registry),
+                    "--local-port", "8769",
+                    "--link-port", "8770",
+                ],
+                [str(self.wsl_node), "registry-mcp", "--local-port", "8769"],
+            ],
+        )
+        # The surviving peer node was not started by this process, so this
+        # process must never launch, replace, or stop it.
+        self.assertFalse(
+            any(str(self.windows_node) in process.argv for process in self.started)
+        )
+        self.assertTrue(all(process.terminated for process in self.started))
+        self.assertIn("reclaim", self._wsl_log_text())
+
+    def test_a_foreign_occupant_of_the_peer_port_still_fails_closed(self) -> None:
+        code, stderr = self._run(
+            port_accepts=lambda _port: True,
+            stack_ready=lambda: False,
+            peer_answers=lambda: False,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(self.started, [])
+        self.assertIn("does not answer", stderr)
+
+    def test_free_ports_never_probe_the_local_or_peer_node(self) -> None:
+        def _unexpected(*_args, **_kwargs):
+            raise AssertionError("a port-free start must not probe any node")
+
+        with mock.patch.object(
+            supervisor,
+            "local_registry_query",
+            lambda *args, **kwargs: [{"id": "onshape"}, {"id": "taobao"}],
+        ):
+            code, _stderr = self._run(
+                port_accepts=lambda _port: False,
+                stack_ready=_unexpected,
+                peer_answers=_unexpected,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.started), 3)
+
+    def test_an_answering_local_node_never_probes_the_peer(self) -> None:
+        def _unexpected(*_args, **_kwargs):
+            raise AssertionError("attach must not probe the peer node")
+
+        code, _stderr = self._run(
+            port_accepts=lambda _port: True,
+            stack_ready=lambda: True,
+            peer_answers=_unexpected,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.started), 1)
+
     def test_missing_required_paths_fail_before_any_socket_work(self) -> None:
         config = replace(self.config, windows_node=self.config.windows_node.with_suffix(".gone"))
         probes: list[int] = []
@@ -245,6 +335,55 @@ class SupervisorRunTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(probes, [])
         self.assertIn("required path is missing", stderr.getvalue())
+
+
+def _raising(error: BaseException):
+    def _call(*_args, **_kwargs):
+        raise error
+
+    return _call
+
+
+class SupervisorPeerProbeTest(unittest.TestCase):
+    """The reclaim probe must be bounded, identifying, and never fatal."""
+
+    def setUp(self) -> None:
+        self.config = supervisor.SupervisorConfig(
+            windows_node=Path("/opt/bridge/win-wsl-mcp-win.exe"),
+            wsl_node=Path("/opt/bridge/win-wsl-mcp-wsl"),
+            windows_registry="C:\\Bridge\\registry.sqlite3",
+            wsl_registry=Path("/opt/bridge/registry.sqlite3"),
+            log_root=Path("/opt/bridge/logs"),
+        )
+
+    def test_a_registry_answer_identifies_the_peer_node(self) -> None:
+        seen: dict[str, object] = {}
+
+        def _answer(*args, **kwargs):
+            seen["args"] = args
+            return [{"id": "onshape"}, {"id": "taobao"}]
+
+        with mock.patch.object(supervisor, "local_registry_query", _answer):
+            self.assertTrue(supervisor._peer_node_answers(self.config))
+        args = seen["args"]
+        # The peer's own local port, asked for its own registrations.
+        self.assertEqual(args[0], "127.0.0.1")
+        self.assertEqual(args[1], self.config.windows_local_port)
+        self.assertEqual(args[2], "local")
+        self.assertEqual(args[3], "list")
+
+    def test_any_non_answer_is_false_instead_of_fatal(self) -> None:
+        for behaviour in (
+            _raising(BridgeError("registry query failed")),
+            _raising(ConnectionRefusedError("connection refused")),
+            _raising(TimeoutError("accepted but never answered")),
+            _raising(ValueError("garbage reply from a foreign listener")),
+            lambda *args, **kwargs: {"ok": False},
+            lambda *args, **kwargs: "not a registry list",
+        ):
+            with self.subTest(behaviour=behaviour):
+                with mock.patch.object(supervisor, "local_registry_query", behaviour):
+                    self.assertFalse(supervisor._peer_node_answers(self.config))
 
 
 if __name__ == "__main__":

@@ -71,8 +71,12 @@ Two of those reports are now handled here:
 - `dsh_node_registry_entry.py` is tracked as this package's client-specific DSH
   stack supervisor. It decides per start whether to own the bridge stack, to
   attach to a ready stack another DSH profile already owns (serving only
-  `registry-mcp` and never starting or stopping a node), or to fail when the
-  occupied ports do not answer a local registry query. Previously every DSH
+  `registry-mcp` and never starting or stopping a node), to reclaim a half-dead
+  stack (the peer node answers its own registry while the local node is gone,
+  because a previous owner died without reaping its Windows child: only the
+  missing local node is started, and the surviving peer node is never touched),
+  or to fail when the occupied ports answer neither the local nor the peer node.
+  Previously every DSH
   profile tried to own the stack, so every profile after the first printed
   `required bridge port already accepts connections` and exited without the
   registry tools.

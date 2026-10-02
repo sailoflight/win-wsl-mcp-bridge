@@ -24,10 +24,18 @@ stack. Ownership is therefore decided per start:
     the shared stack down. If the owner disappears later, this attached
     ``registry-mcp`` loses the node, exits, and the Harness reconnect restarts
     this entry, which then finds the ports free and becomes the owner.
+``reclaim``
+    Ports are occupied, the local node does not answer, but the **peer** node
+    answers its own registry: the previous owner died without reaping its
+    Windows child, so the peer ports stay occupied while the local node is
+    gone. Start only the missing local node, wait for the peer registry, and
+    serve ``registry-mcp``. The surviving peer node is never stopped here --
+    this process did not start it, and an occupied peer port alone proves
+    nothing about who owns it.
 ``fail``
-    Ports are occupied but the local node does not answer a registry query (a
-    foreign or half-dead listener): report and exit non-zero instead of guessing
-    or starting a second stack.
+    Ports are occupied, the local node does not answer, and the peer port does
+    not answer a registry question either (a foreign or half-dead listener):
+    report and exit non-zero instead of guessing or starting a second stack.
 
 Configuration comes from this module's own defaults and environment overrides,
 never from a remote caller: no registry/peer content selects a command, path, or
@@ -90,12 +98,16 @@ def _port_accepts(port: int) -> bool:
         return False
 
 
-def _plan(occupied: Sequence[int], stack_ready: bool) -> str:
-    """Decide this start's role from the ports and local-node readiness."""
+def _plan(
+    occupied: Sequence[int], stack_ready: bool, peer_ready: bool = False
+) -> str:
+    """Decide this start's role from the ports and node readiness."""
     if not occupied:
         return "own"
     if stack_ready:
         return "attach"
+    if peer_ready:
+        return "reclaim"
     return "fail"
 
 
@@ -116,18 +128,38 @@ def _stack_ready(wsl_local_port: int) -> bool:
     return isinstance(value, list)
 
 
+def _peer_node_answers(config: SupervisorConfig) -> bool:
+    """True when the peer (Windows) node answers its own local registry.
+
+    An occupied peer port alone proves nothing -- a foreign listener accepts
+    connections too -- and the bridge never guesses about a listener it did not
+    start. A well-formed local registry answer is what identifies the occupant
+    as this bridge's own peer node, which is the one case where a half-dead
+    stack may be completed instead of refused. The query is bounded by
+    ``local_registry_query``'s own socket timeout, and any non-answer (timeout,
+    refusal, garbage, error reply) is simply False.
+    """
+    try:
+        value = local_registry_query(
+            "127.0.0.1", config.windows_local_port, "local", "list", {},
+        )
+    except (BridgeError, OSError, ValueError):
+        return False
+    return isinstance(value, list)
+
+
 def _wait_for_peer(
-    windows_process: subprocess.Popen[bytes],
-    wsl_process: subprocess.Popen[bytes],
+    windows_process: subprocess.Popen[bytes] | None,
+    wsl_process: subprocess.Popen[bytes] | None,
     wsl_local_port: int,
 ) -> None:
     deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
     while time.monotonic() < deadline and not _stopping:
-        if windows_process.poll() is not None:
+        if windows_process is not None and windows_process.poll() is not None:
             raise RuntimeError(
                 f"Windows bridge node exited during startup ({windows_process.returncode})"
             )
-        if wsl_process.poll() is not None:
+        if wsl_process is not None and wsl_process.poll() is not None:
             raise RuntimeError(
                 f"WSL bridge node exited during startup ({wsl_process.returncode})"
             )
@@ -292,6 +324,7 @@ def run(
     *,
     port_accepts: Callable[[int], bool] = _port_accepts,
     stack_ready: Callable[[], bool] | None = None,
+    peer_answers: Callable[[], bool] | None = None,
 ) -> int:
     """Run one supervisor start and return the process exit code."""
     for path in (config.windows_node, config.wsl_node, Path(config.wsl_registry)):
@@ -306,7 +339,15 @@ def run(
     occupied = [port for port in ports if port_accepts(port)]
     if stack_ready is None:
         stack_ready = lambda: _stack_ready(config.wsl_local_port)  # noqa: E731
-    role = _plan(occupied, bool(stack_ready()) if occupied else False)
+    stack_replies = bool(stack_ready()) if occupied else False
+    if peer_answers is None:
+        peer_answers = lambda: _peer_node_answers(config)  # noqa: E731
+    # The peer probe costs a bounded round trip, so it runs only when no free
+    # ports would make this start an owner and no local node can be attached to.
+    peer_replies = (
+        bool(peer_answers()) if occupied and not stack_replies else False
+    )
+    role = _plan(occupied, stack_replies, peer_replies)
     if role == "fail":
         print(
             "bridge supervisor: required port already accepts connections but the "
@@ -332,6 +373,51 @@ def run(
             if not _stopping:
                 print(f"bridge supervisor: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
+
+    if role == "reclaim":
+        wsl_log_path = config.log_root / "wsl-node.log"
+        _rotate_log(wsl_log_path)
+        reclaimed: subprocess.Popen[bytes] | None = None
+        with wsl_log_path.open("ab", buffering=0) as wsl_log:
+            try:
+                wsl_log.write(
+                    b"[supervisor] reclaim: the peer node answers its own registry "
+                    b"while the local node is gone; starting only the local node\n"
+                )
+                reclaimed = subprocess.Popen(
+                    [
+                        str(config.wsl_node),
+                        "serve",
+                        "--registry",
+                        str(config.wsl_registry),
+                        "--local-port",
+                        str(config.wsl_local_port),
+                        "--link-port",
+                        str(config.link_port),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=wsl_log,
+                    env=environment,
+                )
+                _wait_for_peer(None, reclaimed, config.wsl_local_port)
+                if _stopping:
+                    return 0
+                return _serve_registry(
+                    config, environment,
+                    windows_process=None, wsl_process=reclaimed,
+                )
+            except Exception as exc:
+                if not _stopping:
+                    print(
+                        f"bridge supervisor: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                return 1
+            finally:
+                # This process started only the local node; the surviving peer
+                # node is not ours to stop.
+                _terminate(reclaimed)
 
     windows_log_path = config.log_root / "windows-node.log"
     wsl_log_path = config.log_root / "wsl-node.log"

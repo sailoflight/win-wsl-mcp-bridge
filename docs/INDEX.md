@@ -14,6 +14,7 @@ are not current capabilities; fixture checks are not installed-client evidence.
 | Windows CI failure root causes and open fixes | [Windows CI diagnosis](CI_WINDOWS_FAILURES.md) |
 | CadQ and MeshQ registration, runtime swap, and the field semantics that forced it | [Registration record 2026-09-30](REGISTRATION_RECORD_20260930.md) |
 | Answers to CadQ on `.FCBak`, `multiProcessAllowed`, and the default-mode expand assertion | [CadQ interface reply 2026-09-30](CADQ_INTERFACE_REPLY_20260930.md) |
+| Half-dead stack outage, the reclaim role, and the orphan gaps that remain | [Incident: half-dead stack 2026-10-02](INCIDENT_HALF_DEAD_STACK_20261002.md) |
 | Pinned official SDK interoperability | [SDK evidence](SDK_INTEROP.md) |
 | Harness capability probes and MCP tool exposure | [Tool exposure](MCP_TOOL_EXPOSURE.md) |
 | Ten behavior axes, composition constraints, environment evidence and implementation gaps | [桥行为轴与组合矩阵](MCP_EXPOSURE_TAXONOMY.md) |
