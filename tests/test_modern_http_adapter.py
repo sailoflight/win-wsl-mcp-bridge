@@ -409,13 +409,18 @@ class ModernAdapterTests(unittest.TestCase):
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
-        listener.settimeout(2)
+        # The waits that only set the scene are deliberately generous: a
+        # saturated Windows runner (the same suite takes 363 s there against
+        # 163 s here) can delay a loopback accept or the TLS ClientHello well
+        # past 2 s, which failed this test once — the same code passed on the
+        # previous Windows run. The behavioural assertions below stay tight.
+        listener.settimeout(20)
         started, disconnected = threading.Event(), threading.Event()
         def stall_tls():
             try:
                 sock, _ = listener.accept()
                 with sock:
-                    sock.settimeout(2)
+                    sock.settimeout(20)
                     sock.recv(4096)  # TLS ClientHello; never send ServerHello.
                     started.set()
                     if sock.recv(4096) == b"":
@@ -426,17 +431,17 @@ class ModernAdapterTests(unittest.TestCase):
         thread.start()
         try:
             client = self.make_adapter(endpoint_url=f"https://127.0.0.1:{listener.getsockname()[1]}/mcp",
-                                       connect_timeout_s=5, request_timeout_s=5)
+                                       connect_timeout_s=20, request_timeout_s=20)
             client.handle(request())
-            self.assertTrue(started.wait(2))
+            self.assertTrue(started.wait(30))
             before = time.monotonic()
             client.shutdown()
             self.assertLess(time.monotonic() - before, 0.7)
-            self.assertTrue(disconnected.wait(1))
+            self.assertTrue(disconnected.wait(10))
             self.assertTrue(self.output.messages.empty())
         finally:
             listener.close()
-            thread.join(2)
+            thread.join(20)
 
     def test_dns_wait_is_cancellable_and_one_resolver_is_shared(self):
         started, release = threading.Event(), threading.Event()

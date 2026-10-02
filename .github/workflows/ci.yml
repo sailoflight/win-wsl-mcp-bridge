@@ -14,10 +14,11 @@ name: verify
 #     fixed: an unclosed `sqlite3` handle blocking temporary-directory removal
 #     with `WinError 32`, two loopback socket errors on closed or unconnected
 #     sockets, a fixture cleanup deadline, a bridge candidate check that rejected
-#     the runner's own `%USERPROFILE%\.claude.json`, and fixture temporary roots
+#     the runner's own `%USERPROFILE%\.claude.json`, fixture temporary roots
 #     that were not their own `resolve()` because the runner sets `TEMP` to an
-#     8.3 short name. It stays non-blocking until one run confirms that, then it
-#     becomes a hard gate.
+#     8.3 short name, and one scene-setting timeout in a TLS-handshake test that
+#     the same code passed on the previous run. It stays non-blocking until one
+#     run confirms that, then it becomes a hard gate.
 
 on:
   push:
