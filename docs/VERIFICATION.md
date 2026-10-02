@@ -133,6 +133,13 @@ which asserts the repository root holds only the two runtime component
 directories; clean it with
 `find . -name '__pycache__' -type d -prune -exec rm -rf {} +`.
 
+Both launchers set `sys.dont_write_bytecode` before importing the runtime, so a
+client that spawns one without `PYTHONDONTWRITEBYTECODE` — Claude Code's MCP
+health check does — cannot leave bytecode in the tree either.
+`tests.test_repository_layout.RepositoryLayoutTest.test_launchers_never_leave_bytecode_in_the_repository`
+runs both launchers with that variable removed and fails if a root `__pycache__`
+appears.
+
 The `test_bridge.py` suite verifies:
 
 - typed stdio/Streamable-HTTP registry validation and public redaction, native HTTP relay and registered external HTTP control contracts, the constant two-tool Control MCP catalog/token budget, bounded event retention, and sensitive trace confirmation;

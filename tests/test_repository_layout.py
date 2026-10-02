@@ -2,7 +2,11 @@
 
 from pathlib import Path
 import ast
+import os
 import re
+import shutil
+import subprocess
+import sys
 import unittest
 import tomllib
 
@@ -10,6 +14,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RepositoryLayoutTest(unittest.TestCase):
+    def test_launchers_never_leave_bytecode_in_the_repository(self):
+        """Spawning a launcher without PYTHONDONTWRITEBYTECODE must not produce
+        bytecode here.
+
+        The two runtime component directories are a working copy, not an
+        installed package directory, and a client that spawns the launcher on
+        its own (Claude Code's MCP health check) controls that environment.
+        """
+        if (ROOT / "__pycache__").exists():
+            self.skipTest("the repository already carries a root __pycache__")
+        # Registered before the checks: cleanups run even when an assertion
+        # fails, and this removes only what this test's own subprocesses made.
+        self.addCleanup(shutil.rmtree, ROOT / "__pycache__", True)
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "PYTHONDONTWRITEBYTECODE"
+        }
+        for launcher in ("wsl-bridge-mcp", "win-bridge-mcp"):
+            with self.subTest(launcher=launcher):
+                subprocess.run(
+                    [sys.executable, str(ROOT / launcher / "bridge.py"), "--help"],
+                    cwd=ROOT,
+                    env=environment,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                self.assertFalse(
+                    (ROOT / "__pycache__").exists(),
+                    f"{launcher} wrote bytecode into the repository",
+                )
+
     def test_root_python_files_are_exactly_declared_runtime(self):
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())
         modules = project["tool"]["setuptools"]["py-modules"]
