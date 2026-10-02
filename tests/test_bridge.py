@@ -5203,6 +5203,71 @@ sys.exit(2)
 
 
 
+class OfficialCliListParsingTest(unittest.TestCase):
+    """`mcp list` parsing for the two official CLIs.
+
+    The shapes below are captured from the real CLIs: `codex mcp list` prints an
+    aligned table under its own header row, and `claude mcp list` prints
+    ``Checking MCP server health…`` above ``name: <command...>`` lines.
+    """
+
+    CODEX_TABLE = (
+        "Name      Command                                                        "
+        "Args                                                                         "
+        "Env                                                              Cwd  Status   Auth       \n"
+        "cadq      /home/x/runtime/bin/python  /home/x/wsl-bridge-mcp/bridge.py connect cadq  "
+        "WIN_WSL_MCP_BRIDGE_OWNED=*****  -    enabled  Unsupported\n"
+        "gitnexus  gitnexus                  mcp                    -                 "
+        "-    enabled  Unsupported\n"
+    )
+    CLAUDE_TEXT = (
+        "Checking MCP server health\u2026\n"
+        "\n"
+        "onshape: /home/x/runtime/bin/python /home/x/bridge.py connect onshape - \u2714 Connected\n"
+        "taobao: /home/x/runtime/bin/python /home/x/bridge.py connect taobao - \u2714 Connected\n"
+    )
+
+    def test_codex_is_asked_for_structured_output(self) -> None:
+        # The table's own header would otherwise be read as a server, and the
+        # structured form is exactly what this parser already understands.
+        from installer.projection import _cli_list_argv
+
+        self.assertEqual(_cli_list_argv("codex"), ["codex", "mcp", "list", "--json"])
+        self.assertEqual(_cli_list_argv("claude"), ["claude", "mcp", "list"])
+
+    def test_list_text_headers_are_not_server_names(self) -> None:
+        # A header read as a name made every reconcile ask the CLI about a server
+        # that cannot exist: `mcp get Name` for Codex, and `mcp get Checking` for
+        # Claude Code, which re-runs a health check and can only fail.
+        from installer.projection import _cli_list_entry_names
+
+        self.assertEqual(
+            _cli_list_entry_names("codex", self.CODEX_TABLE), ["cadq", "gitnexus"]
+        )
+        self.assertEqual(
+            _cli_list_entry_names("claude", self.CLAUDE_TEXT), ["onshape", "taobao"]
+        )
+
+    def test_structured_output_still_wins_over_the_text_fallback(self) -> None:
+        from installer.projection import _cli_list_entry_names
+
+        self.assertEqual(
+            _cli_list_entry_names("codex", '[{"name": "cadq", "enabled": true}]'),
+            ["cadq"],
+        )
+        self.assertEqual(
+            _cli_list_entry_names("claude", '{"mcpServers": [{"name": "alpha"}]}'),
+            ["alpha"],
+        )
+        # Neither CLI indents an entry, and Claude Code indents the details of
+        # `mcp get`, so an indented or bulleted line is never a name.
+        self.assertEqual(
+            _cli_list_entry_names("claude", "  Checking\u2026\nalpha: /x - ok\n"),
+            ["alpha"],
+        )
+        self.assertEqual(_cli_list_entry_names("codex", "- Name\ncadq  cmd\n"), ["cadq"])
+
+
 class ProjectionHarness(unittest.TestCase):
     """Hermetic per-test environment: fake HOME, pinned PATH, temp registries."""
 
@@ -6760,6 +6825,60 @@ class ProjectionNativeHttpTest(ProjectionHarness):
                 "SELECT entry_fingerprint FROM agent_mcp_projections"
             ).fetchall()
         self.assertTrue(all(row[0] == "" for row in rows))
+
+    @posix_fake_cli_only
+    def test_official_cli_text_list_header_is_never_fetched_as_a_server(self) -> None:
+        # `claude mcp list` prints "Checking MCP server health…" above its
+        # entries. The wrapper below speaks only that text shape, and records
+        # every subcommand, so the assertion is about what the CLI was asked —
+        # not only about the verdict: no `mcp get Checking` may ever appear.
+        bindir = self.root / "bin"
+        state = self.install_fake_cli("claude")
+        log = self.root / "cli-calls.txt"
+        real = bindir / "claude-real"
+        real.write_text(FAKE_CLI_SRC.replace("@PYBIN@", sys.executable))
+        real.chmod(0o755)
+        wrapper = bindir / "claude"
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            f"REAL = {str(real)!r}\n"
+            f"LOG = {str(log)!r}\n"
+            "args = sys.argv[1:]\n"
+            "with open(LOG, 'a') as handle:\n"
+            "    handle.write(' '.join(args) + '\\n')\n"
+            "if args[:2] == ['mcp', 'list']:\n"
+            "    try:\n"
+            "        entries = json.load(open(os.environ['FAKE_STATE']))['mcpServers']\n"
+            "    except (OSError, ValueError, KeyError):\n"
+            "        entries = {}\n"
+            "    print('Checking MCP server health\u2026\\n')\n"
+            "    for name in entries:\n"
+            "        print(f'{name}: /usr/bin/python3 /tmp/bridge.py connect {name}"
+            " - \u2714 Connected')\n"
+            "    sys.exit(0)\n"
+            "os.execv(REAL, [REAL] + args)\n"
+        )
+        wrapper.chmod(0o755)
+        self.sync_mirror(self.make_peer([self.http_server("alpha")]))
+        self.enroll_http("claude")
+        # first pass: the client's own store is empty, so the mirror is added
+        added = self._reconcile()
+        self.assertTrue(added["ok"], added["errors"])
+        # second pass: the CLI now lists `alpha` in its text shape, so reconciliation
+        # must verify that name and ignore the health header
+        settled = self._reconcile()
+        self.assertTrue(settled["ok"], settled["errors"])
+        self.assertEqual(settled["environments"][0]["actions"], [])
+        self.assertEqual(
+            json.loads(state.read_text())["mcpServers"]["alpha"]["type"], "http"
+        )
+        asked = [
+            line.split()[-1]
+            for line in log.read_text().splitlines()
+            if line.startswith("mcp get")
+        ]
+        self.assertEqual(asked, ["alpha"])
 
     def test_collision_probe_read_error_fails_environment_closed(self) -> None:
         peer = self.make_peer([self.http_server("alpha")])

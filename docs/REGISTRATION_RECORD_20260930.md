@@ -190,7 +190,7 @@ python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl --dry-run \
 1. **codex 的 CLI 现在跑不起来（用户环境问题，与桥无关）**：`~/.local/bin/codex` → `~/.codex/packages/standalone/current/bin/codex` → `…/releases/0.155.0-alpha.16.3-x86_64-unknown-linux-musl/bin` → `~/.vscode-server/extensions/openai.chatgpt-26.917.62051-linux-x64/bin/linux-x86_64`，而该 VS Code 扩展已升到 `…-26.930.21537-…`，旧版本目录被删，整条符号链接链断掉（`shutil.which("codex")` 返回 None）。修它属于用户环境（重装 codex / 重指链接），或把 codex 环境 `unenroll`。
 2. **claude 的 stdio 条目无法被官方 CLI 反证（已知设计，此前未记录）**：`_cli_parse_claude_text` 只精确解析单行 `URL:` 的 native-HTTP 文本块；stdio 的 `Args:` 是空格拼接、env 是自由文本，无法无损还原，于是返回 None → 名字进 `unverifiable` → 每次 reconcile 按 "unmanaged name collision" 报冲突（`projection.py:3678-3685`）。实测 `claude mcp get onshape` 输出完全正常（能看到 `WIN_WSL_MCP_BRIDGE_OWNED=1`），是**解析侧**取不到，不是文档丢了。推论：claude 环境在 `official-cli` 适配器下**永远不会收敛干净**，`ok` 恒为 False。可选出路是把 claude 环境改回 `bridge-file` 适配器（桥直接拥有 `~/.claude.json` 的 `mcpServers`，可读回校验——测试里跑的就是这条）。
 
-顺带发现：`_cli_list_entry_names` 会把 `claude mcp list` 的首行 "Checking MCP server health…" 也当成条目名（实测返回 `['Checking','onshape','taobao']`）。name 不在镜像里所以不污染 desired 集合，但它会进 `unverifiable`，是处解析脆弱点。
+顺带发现：`_cli_list_entry_names` 会把 `claude mcp list` 的首行 "Checking MCP server health…" 也当成条目名（实测返回 `['Checking','onshape','taobao']`）。name 不在镜像里所以不污染 desired 集合，但它会进 `unverifiable`，是处解析脆弱点。**已修**：Codex 的 list 改为 `codex mcp list --json`（那张对齐表格自身的表头行 `Name Command Args …` 同样会被当成条目名），文本回退改为按 kind 解析——Claude 只认带冒号的 `name: …` 行（健康检查首行没有冒号），Codex 丢掉只由列名组成的表头行。真机复核：`projection reconcile --dry-run` 仍 `ok: true`，codex 环境 `configured` 无冲突。
 
 #### 预演过程中修掉的两个缺陷（`installer/projection.py`）
 
@@ -230,7 +230,7 @@ python3 wsl-bridge-mcp/bridge.py projection reconcile --side wsl --dry-run \
 3. **失败转移缺陷**（§2 坑 3）未修。
 4. 换码后 **Windows 侧运行时目录名换过**：以后要再原地升级，请按 §2 坑 1 在最终目录里重装一次。
 5. **web overlay 的 cadq/meshq 仍是"手加、桥不知情"的**：接管已执行（§5.3），但那两条在 **web** 里被判为 conflict（`next_session` + `conflicts=['cadq','meshq']`），因此桥既认领也不改写它们。功能不受影响（两条照常可用），但 `unenroll --remove-entries` 不会清理它们，`projection status` 也不把它们记进账。dsh-tui 与 headless 没有这个问题。
-6. **`official-cli` 适配器下 stdio 条目永远无法反证**（`projection.py:2194-2217`）：`claude mcp get` 的 `Args:` 是空格拼接、env 是自由文本，解析器故意不猜，于是条目进 `unverifiable` → 每次 reconcile 报冲突、`ok` 恒为 False。**claude 环境已改走 `bridge-file` 绕开它**（§5.3），但缺陷本身仍在：任何再次以 `official-cli` 注册的 claude/codex stdio 环境都会复现。另：`_cli_list_entry_names` 会把 `claude mcp list` 的 "Checking MCP server health…" 首行当成条目名。
+6. **`official-cli` 适配器下 stdio 条目永远无法反证**（`projection.py:2194-2217`）：`claude mcp get` 的 `Args:` 是空格拼接、env 是自由文本，解析器故意不猜，于是条目进 `unverifiable` → 每次 reconcile 报冲突、`ok` 恒为 False。**claude 环境已改走 `bridge-file` 绕开它**（§5.3），但缺陷本身仍在：任何再次以 `official-cli` 注册的 claude/codex stdio 环境都会复现。另：`_cli_list_entry_names` 曾把 `claude mcp list` 的 "Checking MCP server health…" 首行当成条目名，**已修**（见本节上文）。
 
 **回滚**
 

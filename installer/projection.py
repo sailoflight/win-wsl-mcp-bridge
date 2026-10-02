@@ -2092,6 +2092,58 @@ def _cli_remove_argv(kind: str, name: str, *, scope: str | None = None) -> list[
     return argv
 
 
+#: Column headers of Codex's aligned ``mcp list`` table. A row made only of these
+#: words is the table's own header, never a registered server.
+_CLI_LIST_COLUMNS = frozenset(
+    {"Name", "Command", "Args", "Env", "Cwd", "Status", "Auth"}
+)
+
+
+def _cli_list_argv(kind: str) -> list[str]:
+    """The list command for one official CLI.
+
+    Codex's human-readable output is an aligned table, while ``--json`` returns
+    exactly the object list this module already parses (``_cli_list_entry_names``
+    handles a JSON array of ``{"name": …}``), so ask for the structured form.
+    Claude Code has no such flag: it prints ``name: <command...>`` lines.
+    """
+    binary = {"codex": "codex", "claude": "claude"}[kind]
+    if kind == CLIENT_KIND_CODEX:
+        return [binary, "mcp", "list", "--json"]
+    return [binary, "mcp", "list"]
+
+
+def _cli_text_entry_names(kind: str, output: str) -> list[str]:
+    """Entry names from a CLI's human-readable ``mcp list`` output.
+
+    Each CLI prints its own shape *and its own header*, and neither header is a
+    server: Claude Code prints ``Checking MCP server health…`` above
+    ``name: <command...>`` lines, and Codex prints an aligned
+    ``Name Command Args …`` row above its rows. Reading a header as a name made
+    every reconcile ask the CLI about a server that cannot exist — one wasted
+    ``mcp get`` per run, which for Claude Code re-runs a health check — and
+    counted that phantom as unverifiable.
+    """
+    names: list[str] = []
+    for line in output.splitlines():
+        if not line.strip() or line.startswith((" ", "\t", "-", "*")):
+            continue
+        if kind == CLIENT_KIND_CLAUDE:
+            name, separator, _rest = line.partition(":")
+            if not separator:
+                continue
+            name = name.strip()
+            if not name or len(name.split()) != 1:
+                continue
+        else:
+            tokens = line.split()
+            if set(tokens) <= _CLI_LIST_COLUMNS:
+                continue
+            name = tokens[0]
+        names.append(name)
+    return names
+
+
 def _cli_list_entry_names(kind: str, output: str) -> list[str]:
     try:
         document = json.loads(output)
@@ -2114,14 +2166,7 @@ def _cli_list_entry_names(kind: str, output: str) -> list[str]:
             for item in document
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         ]
-    names: list[str] = []
-    for line in output.splitlines():
-        if not line.strip() or line.startswith((" ", "\t", "-", "*")):
-            continue
-        name = line.split(":", 1)[0].strip().split()[0].strip()
-        if name:
-            names.append(name)
-    return names
+    return _cli_text_entry_names(kind, output)
 
 
 def _cli_canonicalize_flat(candidate: dict[str, Any]) -> dict[str, Any] | None:
@@ -2324,7 +2369,7 @@ def _adapter_read_entries(
         return {}
     if mode == ADAPTER_OFFICIAL_CLI:
         binary = {"codex": "codex", "claude": "claude"}[kind]
-        code, out, err = _run_tool([binary, "mcp", "list"])
+        code, out, err = _run_tool(_cli_list_argv(kind))
         if code != 0:
             raise BridgeError(f"{binary} mcp list failed: {err.strip()}")
         names = _cli_list_entry_names(kind, out)
