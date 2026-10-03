@@ -307,6 +307,9 @@ reconcile 会整份重写，不会留下孤儿条目。web 就是这种情况，
 | dsh-headless `env-83601c2d…` | bridge-file | 同上 | `[]` | auto → native |
 | dsh-web `env-3bc9d44a…` | bridge-file | 同上 | `[]` | auto → native |
 
+> 上表三个 DSH profile 的曝光列已过期：2026-10-03 恢复为 `auto → deferred`，客户端文档改回
+> `deferred-mcp` 形态，见 §8.7。
+
 - 客户端文档里 20 条条目一律 `<runtime>/bin/win-wsl-mcp-wsl connect|connect-http|compatibility-mcp|deferred-mcp <id>`；
 - `reconcile --dry-run`：5 个环境全 `configured` / `next_session`、动作 0 条、`ok: true`；
 - 20 行 `agent_mcp_projections` 全部 `configured` 且指纹非空 → **缺口 5 关闭**；
@@ -327,11 +330,55 @@ reconcile 会整份重写，不会留下孤儿条目。web 就是这种情况，
 
 1. ~~**重启 DSH profile（必需）**~~ → **已完成（2026-10-03）**：`revisionCheck.verdict: "match"`，
    两侧节点均加载 0.4.2，见 §8.5 的重启后复核。
-2. **（可选）恢复 DSH 的 deferred 曝光**：重新注册会换掉环境行，而客户端验证证据绑定环境行，
-   所以三个 DSH profile 的 `tool_exposure` 从 `auto` 落回 `native`（tui 原先借 family 证据是 `deferred`，
-   web 自己的证据早已 stale）。不恢复也能用，只是模型侧看到完整目录。要恢复就在**一个** profile（如 web）
-   跑一次探针，另两个会自动 adopt family 证据：
-   `projection probe-client <env> --probe-file <path> --aspect refresh --confirm` →
-   在隔离会话里按打印的 fixture 命令跑 → `projection record-client-verification <env> --receipt <path> --tool-exposure deferred --aspect refresh`。
-   挑战 15 分钟过期（`PROBE_TTL_SECONDS`），会话开始前再生成。
+2. ~~**（可选）恢复 DSH 的 deferred 曝光**~~ → **已完成（2026-10-03）**，见 §8.7。三个 DSH profile 全部
+   `auto → deferred`，客户端文档已改回 `deferred-mcp` 形态；**需再重启一次 DSH profile** 才会在客户端生效。
 
+
+### §8.7 DSH deferred（折叠目录）曝光恢复（2026-10-03）
+
+目标：把 0.4.2 重新注册时落回 `native` 的三个 DSH profile 恢复成 `deferred`（模型侧只看到
+`mcp_tool_*` 折叠入口，而不是完整目录）。**结果**：三个环境全部 `toolExposure auto → deferred`、
+`evidenceFresh: true`、无 blocker；客户端文档已由 `reconcile` 改写为 `deferred-mcp` 形态。
+
+#### 记录下来的四条规则（原 §8.6 的"一个 profile + 自动 adopt"配方不成立）
+
+1. **一个环境只有一条验证记录，后一条覆盖前一条。** `record-client-verification` 不是按 aspect 累加的：
+   分三次各记一个 aspect，最后一次的记录里 `modelExposure` 会变回 `{"source": "unknown"}`。
+   所以 `modelExposure` 与 `nativeToolSearch` 这两条 **challenge-bound 证言必须放进同一张 receipt**
+   （与 2026-09-30 已接受的那份证据同形：一份 receipt、一份 excerpt、两条证言）。
+2. **family adopt 只填"自己没有任何记录"的兄弟行**（`_adopt_family_evidence`，`projection.py:903`
+   的 `if _row_harness_verification(sibling): continue`）。当初重注册把三行都清空了，所以第一条记录会
+   被两个兄弟 adopt；但一旦兄弟行有了（哪怕 adopt 来的）记录，**再记新证据也不会传播**。因此本次是
+   **三个 profile 各跑一次真实探针**，各自记录一次，而不是"跑一个、其余 adopt"。
+3. **`DSH_HOME` 不能隔离 `~/.dsh/profiles/<name>/cordis-bridge-overlay.json`。** 隔离家里放一份
+   `profiles/headless/` 也没用：子会话仍会加载真实 home 里同名 profile 的桥投影文档，于是"业务无关的探针
+   会话"里出现了 cadq/onshape/taobao/meshq 全部工具（第一次隔离检查就是这样失败的）。
+   可行做法：**用真实 home 里不存在的 profile 名**（本次 `probeiso*`），该名字下没有桥投影文档，目录天然干净。
+4. **隔离会话的模型路由要自己带。** 当前 DSH 会把旧的 `settings.yaml` 自动导走
+   （改名为 `settings.yaml.imported`），只靠它会在启动时报
+   `MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"`。
+   在 profile 的 `cordis.patch.yml` 里补一份最小 `llm-pi-ai`（仅 `newapi`、`apiKeyEnv: NEWAPI_API_KEY`）
+   加 `agent-default-model` 即可；**不要**整块照抄真实 patch 的 `llm-pi-ai`——里面 `sub2api` 模型的
+   `reasoningEfforts` 有个 `false:` 键，YAML 往返会变成布尔键，校验直接报
+   `ValidationError: $.providers.sub2api.models[0].reasoningEfforts`。同理不要带
+   `web-search-deepseek`（它拉 `llm-deepseek`，又回到缺凭据）。
+
+#### 证据（可复核）
+
+- 每个 profile 一张 receipt（`status: complete`、6 条 observation、含 canary 成功调用），
+  证言引用同一份 bounded excerpt：`excerpt-<probe>.json`，`observedClient {dsh-mcp-client, 0.0.1}`、
+  `protocolVersion 2025-11-25`。
+- **模型自述不可作为证据**：其中一次会话模型报告 native-search 的 canary"从未出现"，但该会话
+  `request/header.tools` 的 `seq 60` 里 canary 明明在列。权威来源是会话日志里每一条请求的工具定义
+  （`seq 11` 三个 begin → `seq 26` refresh canary → `seq 43` model-exposure canary → `seq 60`
+  native-search canary），excerpt 记录的就是这份逐请求清单。
+- 折叠目录恢复后 `reconcile` 把三份 overlay 改写成 `args: ["deferred-mcp", "<id>"]`（每份 4 条），
+  改写后证据仍 `fresh`（写入路径会把 `projectionConfigFingerprint` 重锚到新指纹）。
+
+#### 顺带发现（未修，需人工定夺）
+
+`claude mcp list` 在本机稳定耗时 **30.8–30.9 s**，正好越过 official-cli 适配器 **30 s** 的读回预算
+（`installer/projection.py:1665`，超时值是常量、没有环境开关）。本次 `reconcile` 复核 claude 时因此超时，
+该环境的 4 条 `agent_mcp_projections` 由 `configured` 变成 `status: error`
+（`claude command did not answer within 30s`）；**条目本身未被改动**（动作 0 条），桥对 claude 的投影内容不变，
+只是状态列不再健康。要消掉只有两条路：把读回预算调大（改码/发版），或让该 CLI 恢复亚 30 s。
