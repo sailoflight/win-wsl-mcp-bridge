@@ -311,6 +311,13 @@ reconcile 会整份重写，不会留下孤儿条目。web 就是这种情况，
 - `reconcile --dry-run`：5 个环境全 `configured` / `next_session`、动作 0 条、`ok: true`；
 - 20 行 `agent_mcp_projections` 全部 `configured` 且指纹非空 → **缺口 5 关闭**；
 - 两侧 `doctor`：`ok: true`、`version 0.4.2`、`runtimeRevision 0170f156361c`（两侧逐字节同一份运行时）。
+- **重启后复核（2026-10-03，用户重启 DSH profile）**：`bridge_diagnostics` 报 `runtimeRevision 0170f156361c`
+  与 `revisionCheck {"node":"0170f156361c","client":"0170f156361c","verdict":"match"}`，`peer: connected`、
+  19 条活动流、`traceDropped 0`、降级方向 0；两侧节点同为 10-03 00:43 启动（WSL `serve` pid 4755 /
+  Windows pid 29444，均在 10-02 装码之后）⇒ 内存里跑的确实是 0.4.2。**全机已无任何进程跑仓库开发树**：
+  查询时 34 个桥进程全是安装版 console script（`connect`×21、`control-mcp`×6、`registry-mcp`×6、`serve`×1），
+  `pgrep -af wsl-bridge-mcp/bridge.py` 只匹配到查询命令本身。最近 400 条节点事件无 `core`/`stale`/`revision`
+  告警（对端核心版本不一致会出这类告警）。
 
 **身份**：0.4.2 wheel sha256 `9e1bb3f26c4ad42a3ffdddd421c0270d81cf6532848d447c3d80ea931b6fa936`，
 两侧各一份 `releases/0.4.2-017f988/`（含 `SHA256SUMS`）；0.4.1 留在 `releases/0.4.1-ec65715/`；
@@ -318,9 +325,8 @@ reconcile 会整份重写，不会留下孤儿条目。web 就是这种情况，
 
 ### §8.6 尚未完成的人工步骤
 
-1. **重启 DSH profile（必需）**：三个节点的内存里还是旧码——现在 `bridge_diagnostics` 还没有
-   `revisionCheck` 字段就是证据。重启后应出现 `runtimeRevision 0170f156361c` 与
-   `revisionCheck.verdict: "match"`。重启必须排在重指之后（现在已满足）。
+1. ~~**重启 DSH profile（必需）**~~ → **已完成（2026-10-03）**：`revisionCheck.verdict: "match"`，
+   两侧节点均加载 0.4.2，见 §8.5 的重启后复核。
 2. **（可选）恢复 DSH 的 deferred 曝光**：重新注册会换掉环境行，而客户端验证证据绑定环境行，
    所以三个 DSH profile 的 `tool_exposure` 从 `auto` 落回 `native`（tui 原先借 family 证据是 `deferred`，
    web 自己的证据早已 stale）。不恢复也能用，只是模型侧看到完整目录。要恢复就在**一个** profile（如 web）
