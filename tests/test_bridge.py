@@ -11837,5 +11837,36 @@ class PersistentConnectorStdioTest(unittest.TestCase):
             self.assertIn("connector engine", process.stderr)
 
 
+class WindowsChildConsoleFlagsTest(unittest.TestCase):
+    """A bridge-spawned child must never allocate its own visible console.
+
+    A console-subsystem child of a process without a console gets a new visible
+    console window, so a node started without one (a ``pythonw`` launcher) used
+    to pop a black window in the user's session for every downstream server.
+    """
+
+    def test_flags_combine_process_group_and_no_window(self) -> None:
+        import bridge_runtime
+
+        with mock.patch.object(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+        ), mock.patch.object(subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True):
+            self.assertEqual(bridge_runtime._windows_child_creation_flags(), 0x08000200)
+
+    def test_flags_are_zero_without_windows_constants(self) -> None:
+        import bridge_runtime
+
+        removed: list[tuple[str, int]] = []
+        for name in ("CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+            if hasattr(subprocess, name):
+                removed.append((name, getattr(subprocess, name)))
+                delattr(subprocess, name)
+        try:
+            self.assertEqual(bridge_runtime._windows_child_creation_flags(), 0)
+        finally:
+            for name, value in removed:
+                setattr(subprocess, name, value)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

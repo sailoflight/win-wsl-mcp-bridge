@@ -2997,6 +2997,23 @@ class ArtifactReceiveStateV2:
     discarded: bool = False
 
 
+def _windows_child_creation_flags() -> int:
+    """Console flags for a bridge-spawned child process.
+
+    The bridge must never put a window on a desktop. A console-subsystem child
+    whose parent has no console of its own gets a new *visible* console, so a
+    node started without one (for example from a ``pythonw`` launcher) pops a
+    black window in the user's session for every downstream server it spawns.
+    ``CREATE_NO_WINDOW`` keeps a child console-less no matter how the node was
+    started; the process-group flag is kept for signal and cleanup semantics.
+    Both names exist only on Windows, so this returns 0 elsewhere and may be
+    passed to ``Popen`` unconditionally.
+    """
+    process_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return process_group | no_window
+
+
 class SharedBackend:
     """One generation-safe JSON-RPC backend shared by logical MCP clients."""
 
@@ -3181,7 +3198,7 @@ class SharedBackend:
             "limit": MAX_SHARED_JSONRPC_BYTES,
         }
         if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            kwargs["creationflags"] = _windows_child_creation_flags()
         else:
             kwargs["start_new_session"] = True
         process: asyncio.subprocess.Process | None = None
@@ -5321,7 +5338,7 @@ class ManagedHttpBackend:
             "stderr": asyncio.subprocess.PIPE,
         }
         if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            kwargs["creationflags"] = _windows_child_creation_flags()
         else:
             kwargs["start_new_session"] = True
         process: asyncio.subprocess.Process | None = None
@@ -7805,6 +7822,8 @@ class BridgeNode:
             }
             if os.name != "nt":
                 kwargs["start_new_session"] = True
+            else:
+                kwargs["creationflags"] = _windows_child_creation_flags()
             process = await asyncio.create_subprocess_exec(
                 sys.executable, str(adapter), "--url", endpoint,
                 "--protocol-era", transport.get("protocolEra", "legacy"), **kwargs
@@ -8050,6 +8069,7 @@ class BridgeNode:
                 *entry.get("args", []),
                 cwd=entry.get("cwd") or None,
                 env=environment,
+                creationflags=_windows_child_creation_flags(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

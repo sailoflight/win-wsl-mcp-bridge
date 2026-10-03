@@ -2,6 +2,26 @@
 
 All notable changes to this project are recorded here.
 
+## Unreleased
+
+### Console-free downstream spawns
+
+- Every downstream server is now spawned with `CREATE_NO_WINDOW` in addition to
+  `CREATE_NEW_PROCESS_GROUP` (`_windows_child_creation_flags`, used by the shared
+  backend, the supervised backend, the HTTP adapter, and the transparent stream).
+  A console application started by a node that has no console of its own is given
+  a new *visible* console by Windows, so a `pythonw` launcher made the bridge pop
+  one black window per business MCP in the signed-on user's session; a visible
+  console is also a window a person can close, and closing it kills the node with
+  `STATUS_CONTROL_C_EXIT` (`0xC000013A`) and takes the whole loopback stack down.
+  The flag is 0 off Windows, so it may be passed unconditionally.
+- `docs/DEPLOYMENT.md` documents the hidden-console launcher for the
+  interactive-session logon task and records why each earlier launcher form
+  failed.
+- Tests: `tests/test_bridge.py` pins the combined flags and the off-Windows zero;
+  `tests/test_repository_layout.py` asserts every spawn site goes through the
+  helper instead of a bare process-group flag.
+
 ## 0.4.2 - Unreleased
 
 ### Official-CLI stdio read-back for Claude Code

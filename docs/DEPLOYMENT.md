@@ -651,72 +651,83 @@ therefore mutually exclusive. Installing the node as a service, or creating a
 process in another session (`WTSQueryUserToken` + `CreateProcessAsUser`), is
 outside this release and outside its supported profile.
 
-The bridge itself never chooses a session and never hides a window: it starts
-downstream servers with only `CREATE_NEW_PROCESS_GROUP` and no
-`CREATE_NEW_CONSOLE`, `DETACHED_PROCESS`, or hidden-window flag. The browser a
-GUI-needing MCP opens lands in whatever session that server inherited, and a
-stack started through WSL interop inherits the WSL interop chain's session.
+The bridge itself never chooses a session. Releases before 0.4.3 spawned
+downstream servers with only `CREATE_NEW_PROCESS_GROUP`, which put no window on a
+desktop while the node itself had a console, and popped a black window for every
+downstream server once a launcher started the node without one. From 0.4.3 every
+child is spawned with `CREATE_NO_WINDOW` as well, so the launcher's console no
+longer matters; until that runtime is deployed here, the launcher below must give
+the node a console that is present but hidden. The browser a GUI-needing MCP opens
+still lands in whatever session that server inherited, and a stack started through
+WSL interop inherits the WSL interop chain's session.
 
 To run the Windows node inside the signed-on user's session, register one logon
-task with an interactive principal (no elevation required). The action must be a
-launcher that gives the node **no console window at all**; hosting the console
-application itself creates a window a person can close, and closing it terminates
-the node with `STATUS_CONTROL_C_EXIT` (`0xC000013A`), which takes the whole
-loopback stack down and leaves every client with a bridge error. Deploy
-`C:\MCP\win-wsl-bridge\start-windows-node.pyw`:
+task with an interactive principal (no elevation required). The action must start
+the node through a hidden (never visible, never closable) console. Deploy
+`C:\MCP\win-wsl-bridge\start-windows-node.vbs`:
 
-```python
-"""Hidden launcher for the WIN-WSL bridge Windows node (pythonw, no console)."""
-from __future__ import annotations
+```vbscript
+' Starts the WIN-WSL bridge Windows node inside a hidden console.
+'
+' Why a console at all: Windows gives every console-subsystem child of a process
+' that has no console a *new, visible* console window in the caller's session.
+' Starting the node through pythonw (no console) therefore made every business
+' MCP the node spawns pop a black window on the user's desktop. A hidden console
+' is inherited by all of them instead, so nothing appears.
+'
+' Why hidden and not a plain cmd: a visible console is a window a person may
+' close, and closing it kills the node with STATUS_CONTROL_C_EXIT (0xC000013A),
+' which takes the whole loopback stack down.
+'
+' The third Run argument waits for the node, so the scheduled task action lives
+' exactly as long as the node and its restart policy can retry a non-zero exit.
+' Stop it deliberately with: taskkill /PID <node pid> /T /F, or
+' Stop-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode.
+' Logs: %LOCALAPPDATA%\WinWslMcpBridge\logs\windows-node.log (.prev = last run).
+Option Explicit
 
-import os
-import sys
+Dim shell, fso, root, logs, exePath, logPath, prevPath, args, q, cmd
+Set shell = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
 
-_ROOT = os.path.join(os.environ["LOCALAPPDATA"], "WinWslMcpBridge")
-_LOG_DIR = os.path.join(_ROOT, "logs")
-_LOG = os.path.join(_LOG_DIR, "windows-node.log")
-_PREV = _LOG + ".prev"
+root = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\WinWslMcpBridge"
+logs = root & "\logs"
+exePath = root & "\runtime\Scripts\win-wsl-mcp-win.exe"
+logPath = logs & "\windows-node.log"
+prevPath = logs & "\windows-node.log.prev"
+args = "serve --registry " & root & "/registry.sqlite3 --local-port 8768 --link-port 8770"
+q = Chr(34)
 
+On Error Resume Next
+If Not fso.FolderExists(logs) Then fso.CreateFolder(logs)
+If fso.FileExists(logPath) Then
+  If fso.FileExists(prevPath) Then fso.DeleteFile prevPath, True
+  fso.MoveFile logPath, prevPath
+End If
+On Error GoTo 0
 
-def _log_stream() -> object:
-    try:
-        os.makedirs(_LOG_DIR, exist_ok=True)
-        if os.path.exists(_LOG):
-            if os.path.exists(_PREV):
-                os.remove(_PREV)
-            os.replace(_LOG, _PREV)
-        return open(_LOG, "a", encoding="utf-8", errors="replace", buffering=1)
-    except OSError:
-        return open(os.devnull, "a", encoding="utf-8")
-
-
-sys.stdout = _log_stream()
-sys.stderr = sys.stdout
-
-from bridge_runtime import win_main  # noqa: E402  (after the stream redirect)
-
-if __name__ == "__main__":
-    raise SystemExit(win_main())
+cmd = "cmd.exe /c " & q & q & exePath & q & " " & args & " >> " & q & logPath & q & " 2>&1" & q
+shell.Run cmd, 0, True
 ```
 
-then register the task:
+Save it with CRLF line endings, then register the task:
 
 ```text
-$pyw  = "$env:LOCALAPPDATA\WinWslMcpBridge\runtime\Scripts\pythonw.exe"
-$args = "C:\MCP\win-wsl-bridge\start-windows-node.pyw serve --registry $env:LOCALAPPDATA/WinWslMcpBridge/registry.sqlite3 --local-port 8768 --link-port 8770"
+$vbs  = "C:\MCP\win-wsl-bridge\start-windows-node.vbs"
 Register-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode `
-  -Action    (New-ScheduledTaskAction -Execute $pyw -Argument $args -WorkingDirectory 'C:\MCP') `
+  -Action    (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B "' + $vbs + '"') -WorkingDirectory 'C:\MCP') `
   -Trigger   (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME) `
   -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited) `
   -Settings  (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1))
 ```
 
 `ExecutionTimeLimit` must be unlimited (`PT0S`): the default three-day limit
-would kill a long-running node. Through the `pythonw` shim the action lives
-exactly as long as the node, so the task reads `Running` while the node serves
-and `RestartCount`/`RestartInterval` (five attempts, one minute apart) really do
-retry a non-zero exit; `pythonw` also keeps the entry point
-(`bridge_runtime:win_main`), the arguments, and the interactive session. The task
+would kill a long-running node. Because the launcher waits for the node, the
+action lives exactly as long as the node, so the task reads `Running` while the
+node serves and `RestartCount`/`RestartInterval` (five attempts, one minute apart)
+really do retry a non-zero exit. The console window style 0 keeps the launcher's
+console hidden: the tree has one hidden console, and the downstream servers
+inherit it instead of allocating one visible console each. The task
 coexists with the DSH supervisor: when the Windows node answers and the local WSL
 registry does not, the supervisor's `_plan` returns `reclaim`, so it starts the
 WSL node rather than a second Windows node. `Start-ScheduledTask -TaskName
@@ -745,10 +756,16 @@ Consequences, alternatives, and rollback:
   if it is 0, stop that stray node and re-run the task.
 - Observed on 2026-10-03 after switching this host over: the node and all four
   registered MCP servers ran in session 2, the peer link re-established itself,
-  and `bridge_diagnostics` reported `revisionCheck: match`. The first attempt
-  hosted the node's console window directly; a person closed that window, the
-  task's last result was `0xC000013A`, and both nodes stopped until the task was
-  started again. The `pythonw` launcher above is the corrected form.
+  and `bridge_diagnostics` reported `revisionCheck: match`. Three launcher forms
+  were measured on the way there. Hosting the node's console window directly put
+  a closable window on the desktop; a person closed it, the task's last result
+  was `0xC000013A`, and both nodes stopped until the task was started again. A
+  `pythonw` launcher removed that window but gave the node no console, so each of
+  the four downstream servers allocated its own visible console in session 2
+  (four `conhost.exe` children), and a reconnect burst made them appear one after
+  another. The hidden-console launcher above is the corrected form: one hidden
+  console for the whole tree, no per-server window, and the launcher's wait keeps
+  the task action alive as long as the node.
 
 ## Stop, rollback, and uninstall
 

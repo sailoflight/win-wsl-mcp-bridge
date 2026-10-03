@@ -92,5 +92,17 @@ class RepositoryLayoutTest(unittest.TestCase):
         self.assertIn("recursive-include docs", manifest)
 
 
+    def test_every_windows_child_spawn_is_console_free(self):
+        source = (ROOT / "bridge_runtime.py").read_text(encoding="utf-8")
+        # The single bare read of the process-group flag is the helper itself;
+        # every spawn site must go through it so no child can allocate a console
+        # window of its own, and the helper is defined plus four call sites.
+        self.assertEqual(
+            source.count('getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)'), 1
+        )
+        self.assertEqual(source.count('getattr(subprocess, "CREATE_NO_WINDOW", 0)'), 1)
+        self.assertEqual(source.count("_windows_child_creation_flags()"), 5)
+
+
 if __name__ == "__main__":
     unittest.main()
