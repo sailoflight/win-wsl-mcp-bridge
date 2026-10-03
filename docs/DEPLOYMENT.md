@@ -613,6 +613,64 @@ python3 tests/field_test.py \
   --wsl-runner /tmp/.../bin/win-wsl-mcp-wsl
 ```
 
+## Which session the Windows node runs in
+
+A business MCP that needs a person can only show that person a window if its own
+process lives in that person's interactive Windows session. A Windows process
+cannot move itself: children inherit the session of whoever started them, and a
+process in session 0 can never reach a desktop. "Run the node as a service (or
+from a service-like context)" and "show a browser window to a person" are
+therefore mutually exclusive. Installing the node as a service, or creating a
+process in another session (`WTSQueryUserToken` + `CreateProcessAsUser`), is
+outside this release and outside its supported profile.
+
+The bridge itself never chooses a session and never hides a window: it starts
+downstream servers with only `CREATE_NEW_PROCESS_GROUP` and no
+`CREATE_NEW_CONSOLE`, `DETACHED_PROCESS`, or hidden-window flag. The browser a
+GUI-needing MCP opens lands in whatever session that server inherited, and a
+stack started through WSL interop inherits the WSL interop chain's session.
+
+To run the Windows node inside the signed-on user's session, register one logon
+task with an interactive principal (no elevation required):
+
+```text
+$exe  = "$env:LOCALAPPDATA\WinWslMcpBridge\runtime\Scripts\win-wsl-mcp-win.exe"
+$args = "serve --registry $env:LOCALAPPDATA/WinWslMcpBridge/registry.sqlite3 --local-port 8768 --link-port 8770"
+Register-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode `
+  -Action    (New-ScheduledTaskAction -Execute $exe -Argument $args -WorkingDirectory 'C:\MCP') `
+  -Trigger   (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME) `
+  -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited) `
+  -Settings  (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -StartWhenAvailable)
+```
+
+`ExecutionTimeLimit` must be unlimited (`PT0S`): the default three-day limit
+would kill a long-running node. The task coexists with the DSH supervisor. When
+the Windows node answers and the local WSL registry does not, the supervisor's
+`_plan` returns `reclaim`, so it starts the WSL node rather than a second Windows
+node. `Start-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode` switches a
+running deployment over without a reboot.
+
+Consequences, alternatives, and rollback:
+
+- With no signed-on session the node does not start. Signing out stops it; a
+  disconnected RDP session does not. Register the task for the user whose session
+  must host the window, and restart the node in a different session if the human
+  moves, because a console session and an RDP session are different sessions.
+- A person may instead launch the browser themselves in their own session using
+  the same profile the MCP uses; the MCP can still drive it over CDP at
+  `127.0.0.1:<port>`, because loopback TCP is machine-wide, not session-scoped.
+- Roll back by stopping the task's process, unregistering the task, and letting
+  the supervisor's `own` path start the stack as before.
+- Known regression path: after a sign-out removes the task's node, a client that
+  starts the stack from a session-0 context makes the supervisor `own`, so it
+  launches the Windows node itself (session 0 again) and the task's node later
+  loses the port race and exits. There is no supervisor knob to prevent that in
+  this release. After a sign-out/sign-in cycle, confirm the node's `SessionId`;
+  if it is 0, stop that stray node and re-run the task.
+- Observed on 2026-10-03 after switching this host over: the node and all four
+  registered MCP servers ran in session 2, the peer link re-established itself,
+  and `bridge_diagnostics` reported `revisionCheck: match`.
+
 ## Stop, rollback, and uninstall
 
 Foreground nodes stop with Ctrl+C. On POSIX, SIGTERM performs bounded stream,
