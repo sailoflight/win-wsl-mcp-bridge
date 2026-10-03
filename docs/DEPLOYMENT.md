@@ -228,6 +228,33 @@ business arguments, so patterns and regexes are rejected at `registry-init`. A
 plain name list keeps its historical serialized shape, and the public listing
 never exposes the rules.
 
+## Backend environment
+
+The bridge spawns each registered server with the node's own environment plus the
+registration's `env` map, which wins, read from the registry at every spawn. A
+setting the downstream tool needs — including one it must pass to a process it
+starts itself, such as a GPU-backend flag for Blender — therefore belongs in the
+registration:
+
+```json
+"env": {
+  "MESHQ_BLENDER_GPU_BACKEND": "vulkan",
+  "PYTHONDONTWRITEBYTECODE": "1",
+  "PYTHONUTF8": "1"
+}
+```
+
+Apply it with `registry-init --manifest … --replace` and then recycle the affected
+backend: a running generation keeps the environment it was spawned with. For a
+shared backend (`one-to-one` or `many-to-one`) recycling means the owning client's
+stream closes and the next connection spawns a fresh generation. Lifecycle control
+cannot force it: `backend_not_initialized` refuses a generation this node did not
+initialize, and `impact_override_not_allowed` refuses any override unless the
+registration sets `management.agentControl.allowImpactOverride`. Setting such a
+variable in a client process, or in the WSL environment, has no effect — the client
+and the backend are different processes, only the backend's environment reaches
+its children, and an unlisted WSL variable does not cross into a Windows process.
+
 ## Agent-local file input registration
 
 A business MCP that should accept an Agent-local file (for example a model file
