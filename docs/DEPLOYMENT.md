@@ -631,24 +631,73 @@ GUI-needing MCP opens lands in whatever session that server inherited, and a
 stack started through WSL interop inherits the WSL interop chain's session.
 
 To run the Windows node inside the signed-on user's session, register one logon
-task with an interactive principal (no elevation required):
+task with an interactive principal (no elevation required). The action must be a
+launcher that gives the node **no console window at all**; hosting the console
+application itself creates a window a person can close, and closing it terminates
+the node with `STATUS_CONTROL_C_EXIT` (`0xC000013A`), which takes the whole
+loopback stack down and leaves every client with a bridge error. Deploy
+`C:\MCP\win-wsl-bridge\start-windows-node.pyw`:
+
+```python
+"""Hidden launcher for the WIN-WSL bridge Windows node (pythonw, no console)."""
+from __future__ import annotations
+
+import os
+import sys
+
+_ROOT = os.path.join(os.environ["LOCALAPPDATA"], "WinWslMcpBridge")
+_LOG_DIR = os.path.join(_ROOT, "logs")
+_LOG = os.path.join(_LOG_DIR, "windows-node.log")
+_PREV = _LOG + ".prev"
+
+
+def _log_stream() -> object:
+    try:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+        if os.path.exists(_LOG):
+            if os.path.exists(_PREV):
+                os.remove(_PREV)
+            os.replace(_LOG, _PREV)
+        return open(_LOG, "a", encoding="utf-8", errors="replace", buffering=1)
+    except OSError:
+        return open(os.devnull, "a", encoding="utf-8")
+
+
+sys.stdout = _log_stream()
+sys.stderr = sys.stdout
+
+from bridge_runtime import win_main  # noqa: E402  (after the stream redirect)
+
+if __name__ == "__main__":
+    raise SystemExit(win_main())
+```
+
+then register the task:
 
 ```text
-$exe  = "$env:LOCALAPPDATA\WinWslMcpBridge\runtime\Scripts\win-wsl-mcp-win.exe"
-$args = "serve --registry $env:LOCALAPPDATA/WinWslMcpBridge/registry.sqlite3 --local-port 8768 --link-port 8770"
+$pyw  = "$env:LOCALAPPDATA\WinWslMcpBridge\runtime\Scripts\pythonw.exe"
+$args = "C:\MCP\win-wsl-bridge\start-windows-node.pyw serve --registry $env:LOCALAPPDATA/WinWslMcpBridge/registry.sqlite3 --local-port 8768 --link-port 8770"
 Register-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode `
-  -Action    (New-ScheduledTaskAction -Execute $exe -Argument $args -WorkingDirectory 'C:\MCP') `
+  -Action    (New-ScheduledTaskAction -Execute $pyw -Argument $args -WorkingDirectory 'C:\MCP') `
   -Trigger   (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME) `
   -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited) `
-  -Settings  (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -StartWhenAvailable)
+  -Settings  (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1))
 ```
 
 `ExecutionTimeLimit` must be unlimited (`PT0S`): the default three-day limit
-would kill a long-running node. The task coexists with the DSH supervisor. When
-the Windows node answers and the local WSL registry does not, the supervisor's
-`_plan` returns `reclaim`, so it starts the WSL node rather than a second Windows
-node. `Start-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode` switches a
-running deployment over without a reboot.
+would kill a long-running node. Through the `pythonw` shim the action lives
+exactly as long as the node, so the task reads `Running` while the node serves
+and `RestartCount`/`RestartInterval` (five attempts, one minute apart) really do
+retry a non-zero exit; `pythonw` also keeps the entry point
+(`bridge_runtime:win_main`), the arguments, and the interactive session. The task
+coexists with the DSH supervisor: when the Windows node answers and the local WSL
+registry does not, the supervisor's `_plan` returns `reclaim`, so it starts the
+WSL node rather than a second Windows node. `Start-ScheduledTask -TaskName
+WinWslMcpBridgeWindowsNode` switches a running deployment over without a reboot,
+and the node's own log lands in
+`%LOCALAPPDATA%\WinWslMcpBridge\logs\windows-node.log` (previous run `.prev`).
+Stop it deliberately with `Stop-ScheduledTask -TaskName
+WinWslMcpBridgeWindowsNode`, or `taskkill /PID <node pid> /T /F`.
 
 Consequences, alternatives, and rollback:
 
@@ -669,7 +718,10 @@ Consequences, alternatives, and rollback:
   if it is 0, stop that stray node and re-run the task.
 - Observed on 2026-10-03 after switching this host over: the node and all four
   registered MCP servers ran in session 2, the peer link re-established itself,
-  and `bridge_diagnostics` reported `revisionCheck: match`.
+  and `bridge_diagnostics` reported `revisionCheck: match`. The first attempt
+  hosted the node's console window directly; a person closed that window, the
+  task's last result was `0xC000013A`, and both nodes stopped until the task was
+  started again. The `pythonw` launcher above is the corrected form.
 
 ## Stop, rollback, and uninstall
 
