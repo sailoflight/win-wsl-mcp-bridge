@@ -13,6 +13,51 @@ version is not a compatibility check between halves; `bridge_diagnostics`
 reports the runtime revision each side actually loaded, because a working tree
 and an installed release both answer with this version string.
 
+## Release identity and additional machines
+
+The supported deployment is one Windows + WSL pair on one machine, because every
+listener and client resolves only to loopback. "Another device" therefore means
+installing this same release on that machine's own two halves, not bridging two
+machines over a network.
+
+Current release:
+
+| Item | Value |
+|---|---|
+| Version | 0.4.2 (`bridge_runtime.SERVER_VERSION`) |
+| Wheel | `win_wsl_mcp_bridge-0.4.2-py3-none-any.whl` |
+| sha256 | `9e1bb3f26c4ad42a3ffdddd421c0270d81cf6532848d447c3d80ea931b6fa936` |
+| Staged copies | `%LOCALAPPDATA%\WinWslMcpBridge\releases\0.4.2-017f988\` and `~/.local/share/win-wsl-mcp-bridge/releases/0.4.2-017f988\`, each with a `SHA256SUMS` that verifies |
+| Requirements | Python >= 3.11, no third-party dependencies |
+| Console scripts | `win-wsl-mcp-win`, `win-wsl-mcp-wsl` |
+| Bridge protocol | `win-wsl-mcp-bridge/0.2`; older peers are rejected |
+| Runtime revision | `0170f156361c` (what `bridge_diagnostics` compares) |
+| Rollback | 0.4.1 wheel in `releases/0.4.1-ec65715/`; pre-0.4.1 restore point in `backups/20261002T120851Z-pre-0.4.1/` |
+
+Install on an additional machine:
+
+1. Copy the wheel and its `SHA256SUMS` there and verify the digest
+   (`sha256sum -c SHA256SUMS` on WSL, `Get-FileHash -Algorithm SHA256` on
+   Windows). This host also keeps a copy in the ignored `dist/` directory.
+2. Install the *same* wheel into a dedicated virtual environment on **both**
+   halves, with the commands in "Install on Windows" and "Install on WSL" below.
+   Each half must answer version `0.4.2`.
+3. Initialize that machine's own registries from its own manifests
+   (`win-bridge-mcp/registry.example.json`, `wsl-bridge-mcp/registry.example.json`;
+   the current four rows are recorded in
+   [the registration record](REGISTRATION_RECORD_20260930.md) §3). Never point a
+   registry at another host's database or at a shared filesystem.
+4. Start both halves and compare `bridge_diagnostics`: the revision check must
+   read `match` on the same `runtimeRevision`. The package version string alone
+   proves nothing, because a working tree answers with it too.
+5. Enroll that machine's clients (`projection scan` -> `enroll` -> `reconcile`);
+   see "Agent-environment projection" below.
+
+Both halves of this host were verified against this exact artifact on
+2026-10-03: fresh virtual environments on WSL (Python 3.12.3) and Windows
+(Python 3.14.6) installed the wheel and answered `doctor ok: true`,
+version `0.4.2`, runtime revision `0170f156361c`.
+
 ## Build once
 
 Build a wheel and source archive in CI, WSL, or Windows:
