@@ -7,7 +7,7 @@ are trusted. Every bridge listener and client must resolve only to loopback. Do
 not expose the bridge through a LAN bind, port proxy, container publish rule, or
 public tunnel.
 
-Both hosts must run the same bridge protocol release. Version 0.4.2 uses
+Both hosts must run the same bridge protocol release. Version 0.4.3 uses
 `win-wsl-mcp-bridge/0.2` and intentionally rejects older peers. The package
 version is not a compatibility check between halves; `bridge_diagnostics`
 reports the runtime revision each side actually loaded, because a working tree
@@ -24,15 +24,15 @@ Current release:
 
 | Item | Value |
 |---|---|
-| Version | 0.4.2 (`bridge_runtime.SERVER_VERSION`) |
-| Wheel | `win_wsl_mcp_bridge-0.4.2-py3-none-any.whl` |
-| sha256 | `9e1bb3f26c4ad42a3ffdddd421c0270d81cf6532848d447c3d80ea931b6fa936` |
-| Staged copies | `%LOCALAPPDATA%\WinWslMcpBridge\releases\0.4.2-017f988\` and `~/.local/share/win-wsl-mcp-bridge/releases/0.4.2-017f988\`, each with a `SHA256SUMS` that verifies |
+| Version | 0.4.3 (`bridge_runtime.SERVER_VERSION`) |
+| Wheel | `win_wsl_mcp_bridge-0.4.3-py3-none-any.whl` |
+| sha256 | `58790d8fba5f2d28317b30fda2e8d64c8fc9b70c7a506f86e74f507ce2c9336e` |
+| Staged copies | `%LOCALAPPDATA%\WinWslMcpBridge\releases\0.4.3-3567c1b\` and `~/.local/share/win-wsl-mcp-bridge/releases/0.4.3-3567c1b\`, each with a `SHA256SUMS` that verifies |
 | Requirements | Python >= 3.11, no third-party dependencies |
 | Console scripts | `win-wsl-mcp-win`, `win-wsl-mcp-wsl` |
 | Bridge protocol | `win-wsl-mcp-bridge/0.2`; older peers are rejected |
-| Runtime revision | `0170f156361c` (what `bridge_diagnostics` compares) |
-| Rollback | 0.4.1 wheel in `releases/0.4.1-ec65715/`; pre-0.4.1 restore point in `backups/20261002T120851Z-pre-0.4.1/` |
+| Runtime revision | `0bb0e41e41e2` (what `bridge_diagnostics` compares) |
+| Rollback | 0.4.2 wheel in `releases/0.4.2-017f988/`; pre-0.4.3 supervisor copy, wheel, and a `MIGRATION.md` in `backups/20261012T192000Z-pre-0.4.3/` |
 
 Install on an additional machine:
 
@@ -41,7 +41,7 @@ Install on an additional machine:
    Windows). This host also keeps a copy in the ignored `dist/` directory.
 2. Install the *same* wheel into a dedicated virtual environment on **both**
    halves, with the commands in "Install on Windows" and "Install on WSL" below.
-   Each half must answer version `0.4.2`.
+   Each half must answer version `0.4.3`.
 3. Initialize that machine's own registries from its own manifests
    (`win-bridge-mcp/registry.example.json`, `wsl-bridge-mcp/registry.example.json`;
    the current four rows are recorded in
@@ -54,9 +54,17 @@ Install on an additional machine:
    see "Agent-environment projection" below.
 
 Both halves of this host were verified against this exact artifact on
-2026-10-03: fresh virtual environments on WSL (Python 3.12.3) and Windows
-(Python 3.14.6) installed the wheel and answered `doctor ok: true`,
-version `0.4.2`, runtime revision `0170f156361c`.
+2026-10-12: the running virtual environments on WSL (Python 3.12.3) and Windows
+(Python 3.14.6) were upgraded from the staged wheel, both answer version
+`0.4.3`, the WSL node reports runtime revision `0bb0e41e41e2`, and its log shows
+the peer link negotiating the heartbeat
+(`peer link heartbeat negotiated: 5s ping interval, a silent peer is dropped
+after 15s`). End-to-end `connect cadq` answered `initialize` and `tools/list`,
+`lifecycle status` listed all four registrations, and a 40-second idle window
+added no log lines on either side. A client process that is still running the
+older code reports `revisionCheck: differs` until its own session restarts;
+the link itself only requires the protocol string. The 0.4.2 pair installed the
+same way on 2026-10-03 (revision `0170f156361c`).
 
 ## Build once
 
@@ -113,6 +121,36 @@ Initialize the WSL-local registry:
 
 The default database is beneath `$XDG_STATE_HOME/win-wsl-mcp-bridge` or
 `~/.local/state/win-wsl-mcp-bridge`. Never place it under `/mnt/c`.
+
+## Upgrade an existing pair
+
+A version switch restarts both nodes, so every client loses its bridge streams
+for a few seconds and reconnects. Do it in this order:
+
+1. Build and verify the wheel (see "Build once"), then stage it on both halves:
+   `%LOCALAPPDATA%\WinWslMcpBridge\releases\<version>-<rev>\` and
+   `~/.local/share/win-wsl-mcp-bridge/releases/<version>-<rev>/`, each with a
+   `SHA256SUMS` that verifies.
+2. Upgrade the running virtual environments with `pip install --upgrade` (both
+   halves) and confirm `--version` on each. Never rename a virtual environment
+   directory: the generated launchers embed absolute interpreter paths.
+3. Refresh the deployed supervisor copy if `installer/dsh_node_registry_entry.py`
+   changed: back up `~/.local/share/win-wsl-mcp-bridge/dsh_node_registry_entry.py`
+   into `backups/<timestamp>-<change>/` with a short `MIGRATION.md`, then copy the
+   new file over it. The DSH profiles execute that copy, not the wheel's.
+4. Keep the ownership declaration current (`windows-node-owner` beside the WSL
+   registry) so the supervisor never races the logon task for the peer ports.
+5. Restart the Windows node under the task (`Stop-ScheduledTask`, kill the node
+   tree, `Start-ScheduledTask`) and let the WSL side follow: stop its node with
+   SIGTERM and a client's supervisor start brings it back. Confirm the node log
+   reports the peer link and, from 0.4.3, the negotiated heartbeat.
+6. Verify as in "Start and verify": `bridge_diagnostics` (`peer: connected`,
+   `revisionCheck: match` once the querying client has also restarted),
+   `lifecycle status` for all registrations, and one end-to-end
+   `connect <target>` that answers `initialize` and `tools/list`.
+7. Roll back by reinstalling the previous wheel on both halves and restoring the
+   backed-up supervisor copy; drop `windows-node-owner` if the older supervisor
+   does not read it.
 
 ## Registration mode: the concurrency axis
 
