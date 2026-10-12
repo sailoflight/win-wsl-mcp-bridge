@@ -890,6 +890,13 @@ Two supervision traps make this failure quiet:
   registrations `exited`. Killing the orphan tree and starting the task restored
   service in about ten seconds; the end-to-end `connect cadq` check then answered
   `initialize` and `tools/list`.
+- Known wart, not a bridge defect: when a peer resets a connection, the Windows
+  proactor logs `Exception in callback _ProactorBasePipeTransport.
+  _call_connection_lost()` with `ConnectionResetError [WinError 10054]` and the
+  transport's socket is not closed on that path. The 0.4.2 log had none and the
+  0.4.3 switch produced three, all during the restart window, so expect a few
+  lines around a version switch or a node kill. The loop keeps running; treat a
+  steady stream of them (not a handful per restart) as worth investigating.
 
 ## Stop, rollback, and uninstall
 
