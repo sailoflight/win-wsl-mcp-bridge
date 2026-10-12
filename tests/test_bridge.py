@@ -11868,5 +11868,208 @@ class WindowsChildConsoleFlagsTest(unittest.TestCase):
                 setattr(subprocess, name, value)
 
 
+class _FrameRecorder:
+    """Minimal StreamWriter stand-in that records the frames a node writes."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+        self.closed = False
+        self._buffer = b""
+
+    def write(self, data: bytes) -> None:
+        self._buffer += data
+        while b"\n" in self._buffer:
+            line, _, self._buffer = self._buffer.partition(b"\n")
+            if line.strip():
+                self.frames.append(json.loads(line))
+
+    def kinds(self) -> list[str]:
+        return [frame.get("type") for frame in self.frames]
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class LinkHeartbeatTest(unittest.TestCase):
+    """A negotiated heartbeat lets a survivor drop a peer that went silent.
+
+    Without it, a peer that dies without closing its socket keeps the link
+    "ready" forever and every later handshake is refused as
+    "peer already connected".
+    """
+
+    def _node(self, temp: str) -> BridgeNode:
+        path = Path(temp) / "registry.sqlite3"
+        write_registry(path, "heartbeat", "Heartbeat Fixture")
+        return BridgeNode(
+            side="win",
+            registry=Registry(path),
+            local_host="127.0.0.1",
+            local_port=free_port(),
+            link_mode="listen",
+            link_host="127.0.0.1",
+            link_port=free_port(),
+        )
+
+    def test_silent_peer_is_dropped_after_the_miss_limit(self) -> None:
+        import bridge_runtime
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            bridge_runtime, "LINK_HEARTBEAT_INTERVAL_SECONDS", 0.05
+        ), mock.patch.object(bridge_runtime, "LINK_HEARTBEAT_MISS_LIMIT", 2):
+            node = self._node(temp)
+
+            async def exercise() -> None:
+                reader = asyncio.StreamReader()
+                writer = _FrameRecorder()
+                messages: list[str] = []
+                node.log = messages.append  # type: ignore[method-assign]
+                reader.feed_data(
+                    _json_bytes(
+                        {
+                            "type": "hello",
+                            "protocol": bridge_runtime.BRIDGE_PROTOCOL,
+                            "side": "wsl",
+                            "extensions": {
+                                bridge_runtime.LINK_HEARTBEAT_EXTENSION: {"version": 1}
+                            },
+                        }
+                    )
+                    + b"\n"
+                )
+                reader.feed_data(_json_bytes({"type": "link_ping"}) + b"\n")
+                task = asyncio.create_task(node._accept_link(reader, writer))  # type: ignore[arg-type]
+                await asyncio.sleep(0.02)
+                # The extension was negotiated and the ping was answered.
+                self.assertTrue(node.link_heartbeat)
+                self.assertIn("hello_ok", writer.kinds())
+                self.assertIn("link_pong", writer.kinds())
+                # Then the peer goes silent: the link must not stay "ready".
+                await asyncio.sleep(0.4)
+                self.assertTrue(writer.closed)
+                self.assertTrue(any("heartbeat timed out" in item for item in messages))
+                reader.feed_eof()
+                await task
+
+            asyncio.run(exercise())
+
+    def test_peer_without_the_extension_keeps_an_idle_link(self) -> None:
+        import bridge_runtime
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            bridge_runtime, "LINK_HEARTBEAT_INTERVAL_SECONDS", 0.05
+        ), mock.patch.object(bridge_runtime, "LINK_HEARTBEAT_MISS_LIMIT", 2):
+            node = self._node(temp)
+
+            async def exercise() -> None:
+                reader = asyncio.StreamReader()
+                writer = _FrameRecorder()
+                node.log = lambda _message: None  # type: ignore[method-assign]
+                reader.feed_data(
+                    _json_bytes(
+                        {
+                            "type": "hello",
+                            "protocol": bridge_runtime.BRIDGE_PROTOCOL,
+                            "side": "wsl",
+                            "extensions": {},
+                        }
+                    )
+                    + b"\n"
+                )
+                task = asyncio.create_task(node._accept_link(reader, writer))  # type: ignore[arg-type]
+                await asyncio.sleep(0.4)
+                # An older peer never negotiated the heartbeat, so silence is not
+                # a failure and the link stays up.
+                self.assertFalse(node.link_heartbeat)
+                self.assertFalse(writer.closed)
+                self.assertNotIn(
+                    bridge_runtime.LINK_HEARTBEAT_EXTENSION, json.dumps(writer.frames)
+                )
+                reader.feed_eof()
+                await task
+
+            asyncio.run(exercise())
+
+    def test_initiator_pings_a_peer_that_negotiated_the_heartbeat(self) -> None:
+        import bridge_runtime
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            bridge_runtime, "LINK_HEARTBEAT_INTERVAL_SECONDS", 0.05
+        ):
+            path = Path(temp) / "registry.sqlite3"
+            write_registry(path, "heartbeat", "Heartbeat Fixture")
+            received: list[dict] = []
+            negotiated: list[bool] = []
+            peer_writers: list[asyncio.StreamWriter] = []
+
+            async def peer(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+            ) -> None:
+                peer_writers.append(writer)
+                hello = json.loads(await reader.readline())
+                offered = hello.get("extensions", {}).get(
+                    bridge_runtime.LINK_HEARTBEAT_EXTENSION
+                )
+                negotiated.append(isinstance(offered, dict))
+                writer.write(
+                    _json_bytes(
+                        {
+                            "type": "hello_ok",
+                            "protocol": bridge_runtime.BRIDGE_PROTOCOL,
+                            "side": "win",
+                            "extensions": {
+                                bridge_runtime.LINK_HEARTBEAT_EXTENSION: {"version": 1}
+                            },
+                        }
+                    )
+                    + b"\n"
+                )
+                await writer.drain()
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        return
+                    frame = json.loads(line)
+                    received.append(frame)
+                    if frame.get("type") == "link_ping":
+                        writer.write(_json_bytes({"type": "link_pong"}) + b"\n")
+                        await writer.drain()
+
+            async def exercise() -> None:
+                server = await asyncio.start_server(peer, "127.0.0.1", 0)
+                port = server.sockets[0].getsockname()[1]
+                node = BridgeNode(
+                    side="wsl",
+                    registry=Registry(path),
+                    local_host="127.0.0.1",
+                    local_port=free_port(),
+                    link_mode="connect",
+                    link_host="127.0.0.1",
+                    link_port=port,
+                )
+                node.log = lambda _message: None  # type: ignore[method-assign]
+                connector = asyncio.create_task(node._connect_loop())
+                await asyncio.sleep(0.3)
+                self.assertTrue(node.link_heartbeat)
+                connector.cancel()
+                await asyncio.gather(connector, return_exceptions=True)
+                # ``Server.wait_closed`` waits for the handlers too (3.12), and a
+                # peer that is still reading would keep this test open forever.
+                for peer_writer in peer_writers:
+                    peer_writer.close()
+                server.close()
+                await asyncio.wait_for(server.wait_closed(), 5)
+
+            asyncio.run(exercise())
+            self.assertEqual(negotiated, [True])
+            self.assertIn("link_ping", [frame.get("type") for frame in received])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

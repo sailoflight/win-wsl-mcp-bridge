@@ -17,6 +17,14 @@ stack. Ownership is therefore decided per start:
     No listener answers on any of the three ports: start both nodes, wait until
     the peer registry exposes the expected remote ids, then serve
     ``registry-mcp``. Stopping this process stops the stack it started.
+``wsl-only``
+    Same free ports, but this host declared that a **logon task** owns the
+    Windows node (``windows-node-owner`` file or
+    ``WIN_WSL_MCP_BRIDGE_WINDOWS_NODE_OWNER=task``): start only the local node,
+    wait until it answers, and let the peer link attach when the task's node
+    appears. Starting a second Windows node here would race the task for the
+    ports; the loser exits cleanly, and the survivor is then outside the task's
+    restart policy -- exactly the unsupervised node this role avoids.
 ``attach``
     A ready stack already answers: start no node, stop no node, and just serve
     ``registry-mcp`` against the running local node. Every further DSH profile
@@ -72,6 +80,11 @@ WINDOWS_INTEROP_ROOT = Path("/mnt/c/Users")
 WINDOWS_INSTALL_TAIL = Path("AppData/Local/WinWslMcpBridge")
 WINDOWS_NODE_TAIL = Path("runtime/Scripts/win-wsl-mcp-win.exe")
 WINDOWS_REGISTRY_NAME = "registry.sqlite3"
+#: who may start the Windows node: this supervisor, or an interactive-session
+#: logon task. Declared by environment variable or by a one-line file with this
+#: name beside the WSL registry.
+WINDOWS_NODE_OWNERS = ("supervisor", "task")
+WINDOWS_NODE_OWNER_FILE = "windows-node-owner"
 
 _stopping = False
 
@@ -88,6 +101,10 @@ class SupervisorConfig:
     windows_local_port: int = DEFAULT_WINDOWS_LOCAL_PORT
     wsl_local_port: int = DEFAULT_WSL_LOCAL_PORT
     link_port: int = DEFAULT_LINK_PORT
+    #: ``supervisor`` (this process may own the Windows node) or ``task`` (an
+    #: interactive-session logon task owns it and this process must not start a
+    #: second one). Resolved by :func:`_windows_node_owner`.
+    windows_node_owner: str = "supervisor"
 
 
 def _request_stop(_signum: int, _frame: object) -> None:
@@ -104,11 +121,18 @@ def _port_accepts(port: int) -> bool:
 
 
 def _plan(
-    occupied: Sequence[int], stack_ready: bool, peer_ready: bool = False
+    occupied: Sequence[int],
+    stack_ready: bool,
+    peer_ready: bool = False,
+    windows_node_owner: str = "supervisor",
 ) -> str:
-    """Decide this start's role from the ports and node readiness."""
+    """Decide this start's role from the ports, readiness, and node ownership."""
     if not occupied:
-        return "own"
+        # With a logon task owning the Windows node, a free-port start owns only
+        # the local node: the peer link attaches by itself once the task's node
+        # answers, and racing it for the ports would leave the survivor outside
+        # the task's restart policy.
+        return "own" if windows_node_owner == "supervisor" else "wsl-only"
     if stack_ready:
         return "attach"
     if peer_ready:
@@ -185,6 +209,36 @@ def _wait_for_peer(
     raise RuntimeError("bridge peer did not become ready before the startup deadline")
 
 
+def _wait_for_local_node(
+    wsl_process: subprocess.Popen[bytes] | None, wsl_local_port: int
+) -> None:
+    """Wait until the local node answers its own registry.
+
+    Unlike :func:`_wait_for_peer` this makes no claim about the peer: with the
+    Windows node owned by a logon task, that node may not be up yet while the
+    local node still has to serve its clients. The peer link attaches on its own
+    once the task's node appears.
+    """
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline and not _stopping:
+        if wsl_process is not None and wsl_process.poll() is not None:
+            raise RuntimeError(
+                f"WSL bridge node exited during startup ({wsl_process.returncode})"
+            )
+        try:
+            value = local_registry_query(
+                "127.0.0.1", wsl_local_port, "remote", "list", {},
+            )
+            if isinstance(value, list):
+                return
+        except (BridgeError, OSError):
+            pass
+        time.sleep(0.1)
+    if _stopping:
+        raise RuntimeError("bridge node startup was cancelled")
+    raise RuntimeError("the local bridge node did not answer before the startup deadline")
+
+
 def _rotate_log(path: Path) -> None:
     try:
         if path.stat().st_size >= 5 * 1024 * 1024:
@@ -239,6 +293,36 @@ def _discover_windows_node() -> Path:
     return WINDOWS_INTEROP_ROOT / "Public" / WINDOWS_INSTALL_TAIL / WINDOWS_NODE_TAIL
 
 
+def _windows_node_owner(wsl_registry: Path, env: Mapping[str, str]) -> str:
+    """Resolve who starts the Windows node: this supervisor or a logon task.
+
+    ``supervisor`` (the default) keeps the historical behavior: a start that
+    finds every port free owns the whole stack, the Windows node included.
+    ``task`` means an interactive-session logon task owns that node, so this
+    supervisor starts only its own node and never races the task for the peer
+    ports. The declaration is either
+    ``WIN_WSL_MCP_BRIDGE_WINDOWS_NODE_OWNER`` or, to keep it out of every
+    client's environment, a one-line ``windows-node-owner`` file beside the WSL
+    registry. An unreadable file or an unknown value keeps the default.
+    """
+    raw = env.get("WIN_WSL_MCP_BRIDGE_WINDOWS_NODE_OWNER", "").strip()
+    if not raw:
+        try:
+            raw = (wsl_registry.parent / WINDOWS_NODE_OWNER_FILE).read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            return "supervisor"
+    if raw in WINDOWS_NODE_OWNERS:
+        return raw
+    print(
+        "bridge supervisor: ignoring unknown windows-node owner "
+        f"{raw!r}; expected one of {', '.join(WINDOWS_NODE_OWNERS)}",
+        file=sys.stderr,
+    )
+    return "supervisor"
+
+
 def resolve_config(environ: Mapping[str, str] | None = None) -> SupervisorConfig:
     """Resolve this host's paths and ports from defaults plus env overrides."""
     env = os.environ if environ is None else environ
@@ -253,6 +337,12 @@ def resolve_config(environ: Mapping[str, str] | None = None) -> SupervisorConfig
     windows_node = Path(
         _override("WIN_WSL_MCP_BRIDGE_WIN_NODE", str(_discover_windows_node()))
     )
+    wsl_registry = Path(
+        _override(
+            "WIN_WSL_MCP_BRIDGE_WSL_REGISTRY",
+            str(state_home / "win-wsl-mcp-bridge" / "registry.sqlite3"),
+        )
+    )
     return SupervisorConfig(
         windows_node=windows_node,
         wsl_node=Path(
@@ -265,12 +355,7 @@ def resolve_config(environ: Mapping[str, str] | None = None) -> SupervisorConfig
             "WIN_WSL_MCP_BRIDGE_WIN_REGISTRY",
             _windows_path(windows_node, WINDOWS_REGISTRY_NAME),
         ),
-        wsl_registry=Path(
-            _override(
-                "WIN_WSL_MCP_BRIDGE_WSL_REGISTRY",
-                str(state_home / "win-wsl-mcp-bridge" / "registry.sqlite3"),
-            )
-        ),
+        wsl_registry=wsl_registry,
         log_root=Path(
             _override(
                 "WIN_WSL_MCP_BRIDGE_LOG_ROOT",
@@ -284,6 +369,7 @@ def resolve_config(environ: Mapping[str, str] | None = None) -> SupervisorConfig
             _override("WIN_WSL_MCP_BRIDGE_WSL_LOCAL_PORT", str(DEFAULT_WSL_LOCAL_PORT))
         ),
         link_port=int(_override("WIN_WSL_MCP_BRIDGE_LINK_PORT", str(DEFAULT_LINK_PORT))),
+        windows_node_owner=_windows_node_owner(wsl_registry, env),
     )
 
 
@@ -373,7 +459,7 @@ def run(
     peer_replies = (
         bool(peer_answers()) if occupied and not stack_replies else False
     )
-    role = _plan(occupied, stack_replies, peer_replies)
+    role = _plan(occupied, stack_replies, peer_replies, config.windows_node_owner)
     if role == "fail":
         print(
             "bridge supervisor: required port already accepts connections but the "
@@ -445,6 +531,51 @@ def run(
                 # This process started only the local node; the surviving peer
                 # node is not ours to stop.
                 _terminate(reclaimed)
+
+    if role == "wsl-only":
+        wsl_log_path = config.log_root / "wsl-node.log"
+        _rotate_log(wsl_log_path)
+        local: subprocess.Popen[bytes] | None = None
+        with wsl_log_path.open("ab", buffering=0) as wsl_log:
+            try:
+                wsl_log.write(
+                    b"[supervisor] windows-node-owner=task: starting only the local "
+                    b"node; the interactive-session logon task owns the Windows node\n"
+                )
+                local = subprocess.Popen(
+                    [
+                        str(config.wsl_node),
+                        "serve",
+                        "--registry",
+                        str(config.wsl_registry),
+                        "--local-port",
+                        str(config.wsl_local_port),
+                        "--link-port",
+                        str(config.link_port),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=wsl_log,
+                    env=environment,
+                )
+                _wait_for_local_node(local, config.wsl_local_port)
+                if _stopping:
+                    return 0
+                return _serve_registry(
+                    config, environment,
+                    windows_process=None, wsl_process=local,
+                )
+            except Exception as exc:
+                if not _stopping:
+                    print(
+                        f"bridge supervisor: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                return 1
+            finally:
+                # The Windows node belongs to the logon task, and this process
+                # started only the local node, so only that node is stopped here.
+                _terminate(local)
 
     windows_log_path = config.log_root / "windows-node.log"
     wsl_log_path = config.log_root / "wsl-node.log"

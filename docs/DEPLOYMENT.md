@@ -681,12 +681,15 @@ the node through a hidden (never visible, never closable) console. Deploy
 '
 ' The third Run argument waits for the node, so the scheduled task action lives
 ' exactly as long as the node and its restart policy can retry a non-zero exit.
+' A node that exits within a minute either lost the port race to another node or
+' failed at startup, so that case exits non-zero: a clean exit would tell Task
+' Scheduler the run had finished and silently drop supervision.
 ' Stop it deliberately with: taskkill /PID <node pid> /T /F, or
 ' Stop-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode.
 ' Logs: %LOCALAPPDATA%\WinWslMcpBridge\logs\windows-node.log (.prev = last run).
 Option Explicit
 
-Dim shell, fso, root, logs, exePath, logPath, prevPath, args, q, cmd
+Dim shell, fso, root, logs, exePath, logPath, prevPath, args, q, cmd, startedAt
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 
@@ -707,7 +710,11 @@ End If
 On Error GoTo 0
 
 cmd = "cmd.exe /c " & q & q & exePath & q & " " & args & " >> " & q & logPath & q & " 2>&1" & q
+startedAt = Now
 shell.Run cmd, 0, True
+If DateDiff("s", startedAt, Now) < 60 Then
+  WScript.Quit 1
+End If
 ```
 
 Save it with CRLF line endings, then register the task:
@@ -720,6 +727,22 @@ Register-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode `
   -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited) `
   -Settings  (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1))
 ```
+
+Then declare that this task is the **single owner** of the Windows node, on the
+WSL side, so the DSH supervisor never races it for the peer ports (0.4.3 and
+later):
+
+```text
+printf 'task\n' > ~/.local/state/win-wsl-mcp-bridge/windows-node-owner
+```
+
+The supervisor reads that one-line file (or
+`WIN_WSL_MCP_BRIDGE_WINDOWS_NODE_OWNER=task` when a client's environment is the
+easier place) and then answers a free-port start with `wsl-only`: it starts its
+own node, waits for it to answer, and lets the link attach when the task's node
+appears. Without the declaration two owners race every time the ports are free,
+the loser exits cleanly, and the survivor is outside the task's restart policy --
+the failure mode recorded below.
 
 `ExecutionTimeLimit` must be unlimited (`PT0S`): the default three-day limit
 would kill a long-running node. Because the launcher waits for the node, the
@@ -778,10 +801,13 @@ Cause: the node that owns the peer link can hold a **half-open** connection to a
 peer that died without closing it (a killed node, a distro restart, a suspended
 VM). Its own bookkeeping still reads "ready", so it rejects the live peer's next
 handshake with `{'type': 'hello_error', 'message': 'peer already connected'}` and
-the two sides never converge. This release has no link heartbeat, so only a node
-restart clears it. A link that is genuinely healthy stays silent: 100 seconds of
-idle time on a working stack add zero log lines and keep exactly one
-`Established` row on the link port.
+the two sides never converge. From 0.4.3 the link carries a negotiated heartbeat
+(see the changelog): a silent peer is dropped after three intervals, about
+fifteen seconds, and the live peer's next retry attaches by itself. On a
+0.4.2-or-earlier node there is no heartbeat, so the manual recovery below is the
+only way out. A link that is genuinely healthy stays silent: 100 seconds of
+idle time on a working stack add zero log lines, keep exactly one
+`Established` row on the link port, and exchange only the heartbeat frames.
 
 Confirm, in this order:
 
@@ -810,13 +836,15 @@ Then verify: `bridge_diagnostics` reports `peer: connected` and
 Two supervision traps make this failure quiet:
 
 - The task's action is the node, so a **clean exit (code 0)** means "finished" for
-  Task Scheduler and it does not retry. A healthy task reads `State: Running` with
-  `LastTaskResult: 0x41301`; `Ready` with `0` means nothing is supervising the
-  node any more.
+  Task Scheduler and it does not retry. The documented launcher reports a
+  sub-minute exit as a failure instead, so a lost port race is retried; a healthy
+  task still reads `State: Running` with `LastTaskResult: 0x41301`, and `Ready`
+  means the run ended -- check `LastTaskResult` before restarting anything.
 - A node started by anything else (a client-driven supervisor `own`, a manual
-  run) owns the ports, and the task's own node then exits cleanly after losing the
-  port race — silently leaving an unsupervised node behind. After any takeover,
-  check `Get-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode | Select State`
+  run) owns the ports, and the task's own node then exits after losing the port
+  race -- leaving an unsupervised node behind. The `windows-node-owner` declaration
+  above removes that race on 0.4.3 and later. After any takeover, check
+  `Get-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode | Select State`
   and the node's `SessionId`.
 - Observed on 2026-10-12: a node started outside the task on 2026-10-10 held a
   stale link for two days. Every client saw `peer link disconnected`, the WSL side

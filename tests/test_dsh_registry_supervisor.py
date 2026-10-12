@@ -49,6 +49,16 @@ class SupervisorPlanTest(unittest.TestCase):
         # Free ports are never a reclaim: this start owns the whole stack.
         self.assertEqual(supervisor._plan([], False, True), "own")
 
+    def test_plan_never_owns_a_task_owned_windows_node(self) -> None:
+        # Free ports with a logon-task-owned Windows node: own the local node
+        # only, and let the peer link attach when the task's node appears.
+        self.assertEqual(supervisor._plan([], False, False, "task"), "wsl-only")
+        self.assertEqual(supervisor._plan([], True, False, "task"), "wsl-only")
+        # Occupied ports keep their existing meanings.
+        self.assertEqual(supervisor._plan([8769], True, False, "task"), "attach")
+        self.assertEqual(supervisor._plan([8768, 8770], False, True, "task"), "reclaim")
+        self.assertEqual(supervisor._plan([8768, 8770], False, False, "task"), "fail")
+
 
 class SupervisorPathTest(unittest.TestCase):
     def test_windows_path_renders_interop_mount_as_a_windows_path(self) -> None:
@@ -100,6 +110,40 @@ class SupervisorPathTest(unittest.TestCase):
                     root / "Public" / supervisor.WINDOWS_INSTALL_TAIL
                     / supervisor.WINDOWS_NODE_TAIL,
                 )
+
+    def test_resolve_config_reads_the_windows_node_owner_declaration(self) -> None:
+        self.assertEqual(
+            supervisor.resolve_config({
+                "WIN_WSL_MCP_BRIDGE_WSL_REGISTRY": "/state/registry.sqlite3",
+                "WIN_WSL_MCP_BRIDGE_WINDOWS_NODE_OWNER": "task",
+            }).windows_node_owner,
+            "task",
+        )
+        self.assertEqual(
+            supervisor.resolve_config({
+                "WIN_WSL_MCP_BRIDGE_WSL_REGISTRY": "/state/registry.sqlite3",
+            }).windows_node_owner,
+            "supervisor",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / supervisor.WINDOWS_NODE_OWNER_FILE).write_text(
+                "task\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                supervisor.resolve_config({
+                    "WIN_WSL_MCP_BRIDGE_WSL_REGISTRY": str(Path(temp) / "registry.sqlite3"),
+                }).windows_node_owner,
+                "task",
+            )
+
+    def test_unknown_windows_node_owner_keeps_the_default(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            config = supervisor.resolve_config({
+                "WIN_WSL_MCP_BRIDGE_WSL_REGISTRY": "/state/registry.sqlite3",
+                "WIN_WSL_MCP_BRIDGE_WINDOWS_NODE_OWNER": "somebody-else",
+            })
+        self.assertEqual(config.windows_node_owner, "supervisor")
+        self.assertIn("windows-node owner", stderr.getvalue())
 
     def test_resolve_config_honours_explicit_overrides(self) -> None:
         config = supervisor.resolve_config({
@@ -178,17 +222,52 @@ class SupervisorRunTest(unittest.TestCase):
         self.started.append(process)
         return process
 
-    def _run(self, *, port_accepts, stack_ready, peer_answers=None):
+    def _run(self, *, port_accepts, stack_ready, peer_answers=None, config=None):
         with mock.patch.object(
             supervisor.subprocess, "Popen", self._fake_popen
         ), contextlib.redirect_stderr(io.StringIO()) as stderr:
             code = supervisor.run(
-                self.config,
+                config or self.config,
                 port_accepts=port_accepts,
                 stack_ready=stack_ready,
                 peer_answers=peer_answers or (lambda: False),
             )
         return code, stderr.getvalue()
+
+    def test_task_owned_windows_node_starts_only_the_local_node(self) -> None:
+        with mock.patch.object(
+            supervisor,
+            "local_registry_query",
+            lambda *args, **kwargs: [{"id": "onshape"}, {"id": "taobao"}],
+        ):
+            code, stderr = self._run(
+                port_accepts=lambda _port: False,
+                stack_ready=lambda: False,
+                config=replace(self.config, windows_node_owner="task"),
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        # Only the local node and the registry frontend start. Starting a second
+        # Windows node would race the logon task for the ports, and the loser
+        # exits cleanly -- outside the task's restart policy.
+        self.assertEqual(
+            [process.argv[0] for process in self.started],
+            [str(self.wsl_node), str(self.wsl_node)],
+        )
+        self.assertEqual(
+            self.started[0].argv[1:],
+            [
+                "serve",
+                "--registry", str(self.wsl_registry),
+                "--local-port", "8769",
+                "--link-port", "8770",
+            ],
+        )
+        self.assertEqual(
+            self.started[1].argv,
+            [str(self.wsl_node), "registry-mcp", "--local-port", "8769"],
+        )
+        self.assertTrue(all(process.terminated for process in self.started))
 
     def test_owner_start_launches_both_nodes_then_the_registry(self) -> None:
         with mock.patch.object(

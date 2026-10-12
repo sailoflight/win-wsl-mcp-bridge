@@ -42,7 +42,7 @@ EVIDENCE_STATE_CAP = 64
 EVIDENCE_CATEGORY = "dataflow.correlation"
 
 BRIDGE_PROTOCOL = "win-wsl-mcp-bridge/0.2"
-SERVER_VERSION = "0.4.2"
+SERVER_VERSION = "0.4.3"
 MAX_FRAME_BYTES = 1024 * 1024
 BUFFER_SIZE = 65536
 STREAM_DATA_ACK_TIMEOUT_SECONDS = 30
@@ -122,6 +122,18 @@ INPUT_ENV_KEYS = {
 }
 #: negotiated artifact-inputs/1 extension key used in hello/hello_ok.
 ARTIFACT_INPUTS_EXTENSION = "artifactInputs"
+#: Negotiated peer-link heartbeat. The link is silent while both stacks are
+#: idle, so a peer that dies without closing its socket (a killed node, a distro
+#: restart, a suspended VM) leaves the survivor believing the link is up: it then
+#: rejects every later handshake as "peer already connected" and the two hosts
+#: never converge without an operator restart. When both peers offer this
+#: extension the initiator pings and either side closes the link after
+#: ``LINK_HEARTBEAT_MISS_LIMIT`` silent intervals, which lets the surviving side
+#: accept the live peer again. A peer that does not offer it keeps the previous
+#: behaviour, so an idle mixed-version link is never closed for being quiet.
+LINK_HEARTBEAT_EXTENSION = "linkHeartbeat"
+LINK_HEARTBEAT_INTERVAL_SECONDS = 5.0
+LINK_HEARTBEAT_MISS_LIMIT = 3
 #: tool-argument descriptor marker. Only literals minted by a staged input
 #: transfer are ever rewritten; path-looking text is never inferred.
 INPUT_DESCRIPTOR_MARKER = "bridge-input://"
@@ -5739,6 +5751,13 @@ class BridgeNode:
         self.publish_resume_tokens: dict[str, dict[str, Any]] = {}
         #: true only while the peer link is being torn down (drives parking).
         self._link_failing = False
+        #: peer-link heartbeat state (see ``LINK_HEARTBEAT_*``). Enabled only
+        #: when both peers offered the extension. ``link_last_rx`` is the
+        #: monotonic time of the last inbound frame, so either side can notice a
+        #: peer that stopped answering.
+        self.link_heartbeat = False
+        self.link_last_rx = 0.0
+        self.link_watchdog: asyncio.Task[Any] | None = None
         if max_artifact_bytes <= 0:
             raise BridgeError("max_artifact_bytes must be positive")
         self.max_artifact_bytes = max_artifact_bytes
@@ -6160,7 +6179,21 @@ class BridgeNode:
                 "maxChunk": ARTIFACT_CHUNK_BYTES,
             },
             ARTIFACT_INPUTS_EXTENSION: {"version": 1},
+            LINK_HEARTBEAT_EXTENSION: {
+                "version": 1,
+                "intervalSeconds": LINK_HEARTBEAT_INTERVAL_SECONDS,
+            },
         }
+
+        def peer_heartbeat(frame: Any) -> bool:
+            """True when a hello/hello_ok offers the link-heartbeat extension."""
+            if not isinstance(frame, dict):
+                return False
+            extensions = frame.get("extensions")
+            if not isinstance(extensions, dict):
+                return False
+            value = extensions.get(LINK_HEARTBEAT_EXTENSION)
+            return isinstance(value, dict) and value.get("version") == 1
 
         def inputs_valid(value: Any) -> bool:
             return isinstance(value, dict) and value.get("version") == 1
@@ -6211,6 +6244,7 @@ class BridgeNode:
                 artifact_extension, input_extension = peer_extensions(reply)
                 accept_artifacts(artifact_extension)
                 self.peer_artifact_inputs = inputs_valid(input_extension)
+                self.link_heartbeat = peer_heartbeat(reply)
             else:
                 hello = await self._read_frame(reader)
                 if hello.get("type") != "hello" or hello.get("protocol") != BRIDGE_PROTOCOL:
@@ -6218,6 +6252,7 @@ class BridgeNode:
                 artifact_extension, input_extension = peer_extensions(hello)
                 accept_artifacts(artifact_extension)
                 self.peer_artifact_inputs = inputs_valid(input_extension)
+                self.link_heartbeat = peer_heartbeat(hello)
                 extensions: dict[str, Any] = {}
                 if self.peer_artifacts:
                     extensions["artifacts"] = {
@@ -6226,6 +6261,11 @@ class BridgeNode:
                     }
                 if self.peer_artifact_inputs:
                     extensions[ARTIFACT_INPUTS_EXTENSION] = {"version": 1}
+                if self.link_heartbeat:
+                    extensions[LINK_HEARTBEAT_EXTENSION] = {
+                        "version": 1,
+                        "intervalSeconds": LINK_HEARTBEAT_INTERVAL_SECONDS,
+                    }
                 writer.write(
                     _json_bytes(
                         {
@@ -6241,10 +6281,26 @@ class BridgeNode:
             self.link_generation = uuid.uuid4().hex
             self.link_reader = reader
             self.link_writer = writer
+            self.link_last_rx = time.monotonic()
             self.link_ready.set()
             self.log("peer link established")
+            if self.link_heartbeat:
+                self.log(
+                    "peer link heartbeat negotiated: "
+                    f"{LINK_HEARTBEAT_INTERVAL_SECONDS:.0f}s ping interval, "
+                    "a silent peer is dropped after "
+                    f"{LINK_HEARTBEAT_INTERVAL_SECONDS * LINK_HEARTBEAT_MISS_LIMIT:.0f}s"
+                )
+                self.link_watchdog = asyncio.create_task(
+                    self._link_heartbeat_loop(writer, initiator=initiator)
+                )
             await self._link_read_loop(reader)
         finally:
+            if self.link_watchdog is not None:
+                self.link_watchdog.cancel()
+                await asyncio.gather(self.link_watchdog, return_exceptions=True)
+                self.link_watchdog = None
+            self.link_heartbeat = False
             if self.link_writer is writer:
                 self.link_ready.clear()
                 self.link_reader = None
@@ -6287,10 +6343,51 @@ class BridgeNode:
     async def _link_read_loop(self, reader: asyncio.StreamReader) -> None:
         while True:
             frame = await self._read_frame(reader)
+            self.link_last_rx = time.monotonic()
             await self._handle_frame(frame)
+
+    async def _link_heartbeat_loop(
+        self, writer: asyncio.StreamWriter, *, initiator: bool
+    ) -> None:
+        """Keep a negotiated peer link honest about a dead peer.
+
+        The initiator sends one ping per interval, and either side closes the
+        link once no frame has arrived for ``LINK_HEARTBEAT_MISS_LIMIT``
+        intervals. Closing the transport is what clears this node's link state,
+        so a peer that died without closing its socket stops blocking the live
+        peer's later handshakes.
+        """
+        interval = LINK_HEARTBEAT_INTERVAL_SECONDS
+        silence = interval * LINK_HEARTBEAT_MISS_LIMIT
+        while True:
+            await asyncio.sleep(interval)
+            if initiator:
+                try:
+                    await self._send_frame({"type": "link_ping"})
+                except (BridgeError, ConnectionError, OSError):
+                    return
+            if time.monotonic() - self.link_last_rx > silence:
+                self.log(
+                    "peer link heartbeat timed out: no frame for "
+                    f"{silence:.0f}s; closing the link"
+                )
+                writer.close()
+                return
 
     async def _handle_frame(self, frame: dict[str, Any]) -> None:
         kind = frame.get("type")
+        if kind == "link_ping":
+            # Answer the peer's probe so it can tell a live link from a dead one.
+            if self.link_ready.is_set():
+                try:
+                    await self._send_frame({"type": "link_pong"})
+                except (BridgeError, ConnectionError, OSError):
+                    pass
+            return
+        if kind == "link_pong":
+            # ``_link_read_loop`` already refreshed the receive timestamp; the
+            # pong itself carries no state of its own.
+            return
         if kind == "open":
             self._background(self._handle_remote_open(frame))
             return

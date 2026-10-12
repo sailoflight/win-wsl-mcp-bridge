@@ -2,7 +2,38 @@
 
 All notable changes to this project are recorded here.
 
-## Unreleased
+## 0.4.3 - Unreleased
+
+### Peer-link heartbeat
+
+- The link now negotiates a `linkHeartbeat` extension. When both peers offer it,
+  the initiator pings every five seconds and either side closes the link after
+  three silent intervals. A peer that dies without closing its socket -- a killed
+  node, a distro restart, a suspended VM -- can therefore no longer leave the
+  survivor believing it is connected and refusing every later handshake as
+  `peer already connected`; that state was unrecoverable without an operator
+  restarting the node, and it silently took the whole stack down. A peer that
+  does not offer the extension keeps the previous behaviour, so a mixed-version
+  link is never closed just for being idle.
+- `tests/test_bridge.py` pins the negotiated timeout, the answered ping, the
+  initiator's pings, and the idle mixed-version link that must stay up.
+
+### One owner for the Windows node
+
+- `installer/dsh_node_registry_entry.py` learns the `wsl-only` role. When the
+  host declares that an interactive-session logon task owns the Windows node
+  (`WIN_WSL_MCP_BRIDGE_WINDOWS_NODE_OWNER=task`, or a one-line
+  `windows-node-owner` file beside the WSL registry), a free-port start owns only
+  the local node and never races the task for the peer ports. Previously the two
+  owners raced, the loser exited cleanly, and the survivor was then outside the
+  task's restart policy -- which is how an unsupervised node came to hold a stale
+  link for two days.
+- The documented launcher now exits non-zero when the node exits within a minute,
+  so a lost port race or a failed start reaches Task Scheduler as a failure to
+  retry instead of a finished run.
+- `tests/test_dsh_registry_supervisor.py` covers the new role, the owner
+  declaration (environment, file, and unknown value), and an owner start that
+  must launch only the local node.
 
 ### Console-free downstream spawns
 
