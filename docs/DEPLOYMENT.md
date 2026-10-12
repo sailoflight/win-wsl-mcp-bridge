@@ -767,6 +767,64 @@ Consequences, alternatives, and rollback:
   console for the whole tree, no per-server window, and the launcher's wait keeps
   the task action alive as long as the node.
 
+### Recovering a wedged peer link
+
+Symptom: every client fails with `peer link disconnected` (a control call returns
+`control_failed: peer link disconnected`), no business MCP answers, and the
+Windows node log alternates `peer link established` / `peer link ended: peer
+closed` while the WSL side restarts its node in a loop.
+
+Cause: the node that owns the peer link can hold a **half-open** connection to a
+peer that died without closing it (a killed node, a distro restart, a suspended
+VM). Its own bookkeeping still reads "ready", so it rejects the live peer's next
+handshake with `{'type': 'hello_error', 'message': 'peer already connected'}` and
+the two sides never converge. This release has no link heartbeat, so only a node
+restart clears it. A link that is genuinely healthy stays silent: 100 seconds of
+idle time on a working stack add zero log lines and keep exactly one
+`Established` row on the link port.
+
+Confirm, in this order:
+
+```text
+# 1. the control plane cannot reach the peer
+win-wsl-mcp-win lifecycle status --local-port 8768      # -> control_failed: peer link disconnected
+# 2. no established link on the Windows side
+Get-NetTCPConnection -LocalPort 8770 | Group-Object State    # only Listen / TimeWait
+# 3. a throwaway node proves the listener is holding a stale peer
+win-wsl-mcp-wsl serve --registry /tmp/diag.sqlite3 --local-port 8879 \
+  --link-mode connect --link-host 127.0.0.1 --link-port 8770 --side wsl
+#    stderr: peer rejected bridge handshake: ... 'peer already connected'
+```
+
+Recover by replacing the node, not by touching the peer:
+
+```text
+taskkill /PID <win-wsl-mcp-win.exe pid> /T /F      # stops the node and its backends
+Start-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode
+```
+
+Then verify: `bridge_diagnostics` reports `peer: connected` and
+`revisionCheck: match`, `lifecycle status` lists all registrations, and one
+`win-wsl-mcp-wsl connect <target>` answers `initialize` and `tools/list`.
+
+Two supervision traps make this failure quiet:
+
+- The task's action is the node, so a **clean exit (code 0)** means "finished" for
+  Task Scheduler and it does not retry. A healthy task reads `State: Running` with
+  `LastTaskResult: 0x41301`; `Ready` with `0` means nothing is supervising the
+  node any more.
+- A node started by anything else (a client-driven supervisor `own`, a manual
+  run) owns the ports, and the task's own node then exits cleanly after losing the
+  port race — silently leaving an unsupervised node behind. After any takeover,
+  check `Get-ScheduledTask -TaskName WinWslMcpBridgeWindowsNode | Select State`
+  and the node's `SessionId`.
+- Observed on 2026-10-12: a node started outside the task on 2026-10-10 held a
+  stale link for two days. Every client saw `peer link disconnected`, the WSL side
+  restarted its node roughly once a minute, and `lifecycle status` showed all four
+  registrations `exited`. Killing the orphan tree and starting the task restored
+  service in about ten seconds; the end-to-end `connect cadq` check then answered
+  `initialize` and `tools/list`.
+
 ## Stop, rollback, and uninstall
 
 Foreground nodes stop with Ctrl+C. On POSIX, SIGTERM performs bounded stream,
